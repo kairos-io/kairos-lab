@@ -1,0 +1,46 @@
+name: E2E Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      iso_url:
+        description: Downloadable Kairos ISO URL
+        required: true
+        type: string
+
+jobs:
+  e2e-linux:
+    runs-on: kvm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install dependencies and enable KVM access
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils dnsmasq iproute2 acl
+          sudo setfacl -m u:runner:rwx /dev/kvm
+
+      - name: Build binary
+        run: go build -o ./bin/kairos-lab ./cmd/kairos-lab
+
+      - name: Run e2e tests
+        env:
+          KAIROS_LAB_E2E: "1"
+          ISO_URL: ${{ inputs.iso_url }}
+          KAIROS_LAB_BIN: ${{ github.workspace }}/bin/kairos-lab
+        run: go test -tags=e2e -v ./test/e2e/...
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kairos-lab-e2e-logs
+          path: |
+            /home/runner/.cache/kairos-lab
+            /home/runner/.config/kairos-lab
+          if-no-files-found: ignore
