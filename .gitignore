@@ -1,0 +1,9 @@
+bin/
+dist/
+/kairos-lab
+*.log
+*.out
+*.qcow2
+*.img
+*.iso
+.DS_Store
