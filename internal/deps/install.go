@@ -2,6 +2,7 @@ package deps
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -83,11 +84,13 @@ func uninstallCommand(pm string, pkgs []string, useSudo bool) ([]string, error) 
 }
 
 func run(name string, args ...string) error {
+	fmt.Printf("Running: %s %s\n", name, strings.Join(args, " "))
 	cmd := exec.Command(name, args...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("command failed: %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command failed: %s %s: %w", name, strings.Join(args, " "), err)
 	}
 	return nil
 }

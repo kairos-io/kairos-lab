@@ -186,11 +186,8 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
 		"-bios", cfg.MacOSBiosPath,
-		"-device", "virtio-gpu-pci",
-		"-display", "default,show-cursor=on",
-		"-device", "qemu-xhci",
-		"-device", "usb-kbd",
-		"-device", "usb-tablet",
+		"-nographic",
+		"-serial", "mon:stdio",
 	}
 	if cfg.NetworkMode == "bridged" {
 		args = append(args,

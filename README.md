@@ -8,7 +8,7 @@ It helps you:
 - boot a Kairos ISO in a local VM (`start`)
 - inspect state (`status`)
 - clean VM artifacts (`reset`)
-- clean everything created by the tool (`implode`)
+- clean everything created by the tool (`cleanup`)
 
 This project is intentionally an MVP for local experimentation, not production deployment.
 
@@ -66,6 +66,7 @@ Default disk size is `60G`.
 - Creates/uses managed disk image under cache directory
 - Boots QEMU with workshop-oriented defaults
 - Default network mode: `bridged`
+- Runs QEMU attached to your terminal so you can interact with the boot console
 - Stores runtime metadata (pid, args, disk/iso paths, log path)
 
 Useful flags:
@@ -98,7 +99,7 @@ Shows:
   - runtime metadata files
 - Keeps setup/dependency tracking
 
-### `implode`
+### `cleanup`
 
 - Removes everything created by `kairos-lab`
 - Removes only dependencies installed by `kairos-lab`

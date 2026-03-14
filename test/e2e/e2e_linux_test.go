@@ -49,7 +49,7 @@ func TestLifecycleLinux(t *testing.T) {
 	}
 
 	defer func() {
-		_ = exec.Command(bin, "implode", "--yes").Run()
+		_ = exec.Command(bin, "cleanup", "--yes").Run()
 	}()
 
 	run("setup", "--yes")
@@ -58,5 +58,5 @@ func TestLifecycleLinux(t *testing.T) {
 	run("status")
 	run("stop")
 	run("reset")
-	run("implode", "--yes")
+	run("cleanup", "--yes")
 }
