@@ -270,8 +270,15 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	} else {
 		command.Stdin = os.Stdin
 	}
-	command.Stdout = io.MultiWriter(stdout, logFile)
-	command.Stderr = io.MultiWriter(stderr, logFile)
+	if cmdName == "sudo" {
+		// sudo on macOS may fail with "unable to allocate pty" when stdio is
+		// proxied through pipes. Keep stdio attached directly to the terminal.
+		command.Stdout = stdout
+		command.Stderr = stderr
+	} else {
+		command.Stdout = io.MultiWriter(stdout, logFile)
+		command.Stderr = io.MultiWriter(stderr, logFile)
+	}
 	if err := command.Start(); err != nil {
 		st.VM.LastError = err.Error()
 		_ = store.Save(st)
