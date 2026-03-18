@@ -44,7 +44,7 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	case "cleanup":
 		return runCleanup(args[1:], stdin, stdout, store)
 	case "version", "-v", "--version":
-		fmt.Fprintln(stdout, version)
+		writeLine(stdout, version)
 		return nil
 	case "help", "-h", "--help":
 		printUsage(stdout)
@@ -62,7 +62,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 		return err
 	}
 
-	fmt.Fprintln(stdout, "[1/4] Detecting platform and package manager")
+	writeLine(stdout, "[1/4] Detecting platform and package manager")
 	st, err := store.Load()
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 	p := platform.Detect()
 	st.Platform = state.Platform{OS: p.OS, Arch: p.Arch, PackageManager: p.PackageManager}
 
-	fmt.Fprintln(stdout, "[2/4] Checking required dependencies")
+	writeLine(stdout, "[2/4] Checking required dependencies")
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
@@ -81,7 +81,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 			return fmt.Errorf("missing dependencies and no package manager detected")
 		}
 		missingNames := depNames(missing)
-		fmt.Fprintf(stdout, "missing dependencies: %s\n", strings.Join(missingNames, ", "))
+		writef(stdout, "missing dependencies: %s\n", strings.Join(missingNames, ", "))
 		ok, err := confirm(stdin, stdout, *autoYes, "install missing dependencies now")
 		if err != nil {
 			return err
@@ -103,22 +103,22 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 				return fmt.Errorf("sudo permission denied")
 			}
 		}
-		fmt.Fprintln(stdout, "[3/4] Installing missing dependencies")
+		writeLine(stdout, "[3/4] Installing missing dependencies")
 		if err := deps.Install(p.PackageManager, pkgs, useSudo); err != nil {
 			return err
 		}
 		st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, missingNames)
 	} else {
-		fmt.Fprintln(stdout, "[3/4] All dependencies already present")
+		writeLine(stdout, "[3/4] All dependencies already present")
 	}
 
-	fmt.Fprintln(stdout, "[4/4] Writing state")
+	writeLine(stdout, "[4/4] Writing state")
 	st.Setup.DependencyCheckPassed = true
 	st.Setup.CompletedAt = state.NowRFC3339()
 	if err := store.Save(st); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "setup complete (%s/%s, pkg manager: %s)\n", p.OS, p.Arch, p.PackageManager)
+	writef(stdout, "setup complete (%s/%s, pkg manager: %s)\n", p.OS, p.Arch, p.PackageManager)
 	return nil
 }
 
@@ -152,7 +152,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return fmt.Errorf("a vm is already running with pid %d", st.VM.PID)
 	}
 
-	fmt.Fprintln(stdout, "[1/5] Resolving ISO source")
+	writeLine(stdout, "[1/5] Resolving ISO source")
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
 	res, err := iso.Resolve(*isoPath, *isoURL, downloadsDir)
 	if err != nil {
@@ -163,7 +163,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		state.AddManagedFile(st, res.LocalPath)
 	}
 
-	fmt.Fprintln(stdout, "[2/5] Preparing directories and disk")
+	writeLine(stdout, "[2/5] Preparing directories and disk")
 	vmDir := filepath.Join(store.CacheDir, "vm")
 	runtimeDir := filepath.Join(store.CacheDir, "runtime")
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
@@ -177,14 +177,14 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	diskPath := filepath.Join(vmDir, "kairos.qcow2")
 	if _, err := os.Stat(diskPath); errors.Is(err, os.ErrNotExist) {
-		fmt.Fprintf(stdout, "Running: qemu-img create -f qcow2 %s %s\n", diskPath, *diskSize)
+		writef(stdout, "Running: qemu-img create -f qcow2 %s %s\n", diskPath, *diskSize)
 	}
 	if err := vm.EnsureDisk(diskPath, *diskSize); err != nil {
 		return err
 	}
 	state.AddManagedFile(st, diskPath)
 
-	fmt.Fprintln(stdout, "[3/5] Preparing networking")
+	writeLine(stdout, "[3/5] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
 		ok, err := confirm(stdin, stdout, *autoYes, "bridged networking needs sudo to create bridge/tap and dnsmasq")
 		if err != nil {
@@ -237,7 +237,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		cmdArgs = append([]string{binary}, qemuArgs...)
 	}
 
-	fmt.Fprintln(stdout, "[4/5] Recording VM state")
+	writeLine(stdout, "[4/5] Recording VM state")
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = *bridgeIface
 	st.VM.ISOSource = res.Source
@@ -258,10 +258,10 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
-	fmt.Fprintln(stdout, "[5/5] Starting VM (attached)")
-	fmt.Fprintf(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
+	writeLine(stdout, "[5/5] Starting VM (attached)")
+	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
 	if *network == "user" {
-		fmt.Fprintln(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")
+		writeLine(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -310,7 +310,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if err := store.Save(st); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "vm exited")
+	writeLine(stdout, "vm exited")
 	return nil
 }
 
@@ -324,7 +324,7 @@ func runStop(args []string, stdout io.Writer, store *state.Store) error {
 	}
 	running, _ := vm.IsRunning(st.VM.PID)
 	if !running {
-		fmt.Fprintln(stdout, "no running vm tracked")
+		writeLine(stdout, "no running vm tracked")
 		st.VM.PID = 0
 		st.VM.StoppedAt = state.NowRFC3339()
 		return store.Save(st)
@@ -337,7 +337,7 @@ func runStop(args []string, stdout io.Writer, store *state.Store) error {
 	if err := store.Save(st); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "vm stopped")
+	writeLine(stdout, "vm stopped")
 	return nil
 }
 
@@ -360,27 +360,27 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 		pm = p.PackageManager + " (detected)"
 	}
 
-	fmt.Fprintf(stdout, "platform: %s\n", platformLabel)
-	fmt.Fprintf(stdout, "package manager: %s\n", pm)
-	fmt.Fprintf(stdout, "dependencies present now: %s\n", joinOrNone(present))
-	fmt.Fprintf(stdout, "dependencies pre-existing: %s\n", joinOrNone(st.Setup.PreExistingDeps))
-	fmt.Fprintf(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
-	fmt.Fprintf(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
-	fmt.Fprintf(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
-	fmt.Fprintf(stdout, "iso source: %s\n", emptyAsNone(st.VM.ISOSource))
-	fmt.Fprintf(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
-	fmt.Fprintf(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
-	fmt.Fprintf(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
+	writef(stdout, "platform: %s\n", platformLabel)
+	writef(stdout, "package manager: %s\n", pm)
+	writef(stdout, "dependencies present now: %s\n", joinOrNone(present))
+	writef(stdout, "dependencies pre-existing: %s\n", joinOrNone(st.Setup.PreExistingDeps))
+	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
+	writef(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
+	writef(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
+	writef(stdout, "iso source: %s\n", emptyAsNone(st.VM.ISOSource))
+	writef(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
+	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
+	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
 	if st.Network.Mode == "bridged" {
-		fmt.Fprintf(stdout, "bridge iface: %s\n", emptyAsNone(st.Network.BridgeInterface))
-		fmt.Fprintf(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
+		writef(stdout, "bridge iface: %s\n", emptyAsNone(st.Network.BridgeInterface))
+		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
 	}
-	fmt.Fprintf(stdout, "vm running: %t\n", running)
+	writef(stdout, "vm running: %t\n", running)
 	if running {
-		fmt.Fprintf(stdout, "vm pid: %d\n", st.VM.PID)
+		writef(stdout, "vm pid: %d\n", st.VM.PID)
 	}
 	if st.VM.LastError != "" {
-		fmt.Fprintf(stdout, "last vm error: %s\n", st.VM.LastError)
+		writef(stdout, "last vm error: %s\n", st.VM.LastError)
 	}
 	return nil
 }
@@ -407,12 +407,12 @@ func runReset(args []string, stdout io.Writer, store *state.Store) error {
 
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
 	if *dryRun {
-		fmt.Fprintln(stdout, "dry-run only, no changes made")
+		writeLine(stdout, "dry-run only, no changes made")
 		return nil
 	}
 
 	for _, p := range toRemove {
-		fmt.Fprintf(stdout, "Removing: %s\n", p)
+		writef(stdout, "Removing: %s\n", p)
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
@@ -423,7 +423,7 @@ func runReset(args []string, stdout io.Writer, store *state.Store) error {
 	if err := store.Save(st); err != nil {
 		return err
 	}
-	fmt.Fprintln(stdout, "reset complete")
+	writeLine(stdout, "reset complete")
 	return nil
 }
 
@@ -458,7 +458,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	filesToRemove, filesToSkip := splitRemovalPaths(st.ManagedFiles, st)
 	dirsToRemove, dirsToSkip := splitRemovalPaths(st.ManagedDirs, st)
 
-	fmt.Fprintln(stdout, "cleanup plan:")
+	writeLine(stdout, "cleanup plan:")
 	printList(stdout, "Will remove files", filesToRemove)
 	printListWithReasons(stdout, "Will skip files", filesToSkip)
 	printList(stdout, "Will remove directories", dirsToRemove)
@@ -475,7 +475,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 
 	if *dryRun {
-		fmt.Fprintln(stdout, "dry-run only, no changes made")
+		writeLine(stdout, "dry-run only, no changes made")
 		return nil
 	}
 
@@ -519,14 +519,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 
 	for _, p := range filesToRemove {
-		fmt.Fprintf(stdout, "Removing file: %s\n", p)
+		writef(stdout, "Removing file: %s\n", p)
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove file %s: %w", p, err)
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(dirsToRemove)))
 	for _, d := range dirsToRemove {
-		fmt.Fprintf(stdout, "Removing directory: %s\n", d)
+		writef(stdout, "Removing directory: %s\n", d)
 		if err := os.RemoveAll(d); err != nil {
 			return fmt.Errorf("remove directory %s: %w", d, err)
 		}
@@ -534,28 +534,36 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	if err := store.RemoveStateFile(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	fmt.Fprintln(stdout, "cleanup complete")
+	writeLine(stdout, "cleanup complete")
 	return nil
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "kairos-lab: local Kairos workshop CLI")
-	fmt.Fprintln(w, "")
-	fmt.Fprintln(w, "Commands:")
-	fmt.Fprintln(w, "  setup                Detect/install dependencies")
-	fmt.Fprintln(w, "  start [flags]        Create disk and boot ISO in QEMU console")
-	fmt.Fprintln(w, "  stop                 Stop running VM (fallback helper)")
-	fmt.Fprintln(w, "  status               Show state and runtime information")
-	fmt.Fprintln(w, "  reset [--dry-run]    Remove VM artifacts (keep setup)")
-	fmt.Fprintln(w, "  cleanup              Remove everything created by tool")
-	fmt.Fprintln(w, "  version              Print CLI version")
+	writeLine(w, "kairos-lab: local Kairos workshop CLI")
+	writeLine(w, "")
+	writeLine(w, "Commands:")
+	writeLine(w, "  setup                Detect/install dependencies")
+	writeLine(w, "  start [flags]        Create disk and boot ISO in QEMU console")
+	writeLine(w, "  stop                 Stop running VM (fallback helper)")
+	writeLine(w, "  status               Show state and runtime information")
+	writeLine(w, "  reset [--dry-run]    Remove VM artifacts (keep setup)")
+	writeLine(w, "  cleanup              Remove everything created by tool")
+	writeLine(w, "  version              Print CLI version")
+}
+
+func writeLine(w io.Writer, a ...any) {
+	_, _ = fmt.Fprintln(w, a...)
+}
+
+func writef(w io.Writer, format string, a ...any) {
+	_, _ = fmt.Fprintf(w, format, a...)
 }
 
 func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, prompt string) (bool, error) {
 	if autoYes {
 		return true, nil
 	}
-	fmt.Fprintf(stdout, "%s [y/N]: ", prompt)
+	writef(stdout, "%s [y/N]: ", prompt)
 	var answer string
 	if _, err := fmt.Fscanln(stdin, &answer); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -667,26 +675,26 @@ func splitRemovalPaths(paths []string, st *state.State) ([]string, map[string]st
 }
 
 func printRemovalPlan(stdout io.Writer, label string, remove []string, skip map[string]string) {
-	fmt.Fprintf(stdout, "%s plan:\n", label)
+	writef(stdout, "%s plan:\n", label)
 	printList(stdout, "Will remove", remove)
 	printListWithReasons(stdout, "Will skip", skip)
 }
 
 func printList(w io.Writer, title string, values []string) {
-	fmt.Fprintf(w, "- %s:\n", title)
+	writef(w, "- %s:\n", title)
 	if len(values) == 0 {
-		fmt.Fprintln(w, "  - none")
+		writeLine(w, "  - none")
 		return
 	}
 	for _, v := range values {
-		fmt.Fprintf(w, "  - %s\n", v)
+		writef(w, "  - %s\n", v)
 	}
 }
 
 func printListWithReasons(w io.Writer, title string, values map[string]string) {
-	fmt.Fprintf(w, "- %s:\n", title)
+	writef(w, "- %s:\n", title)
 	if len(values) == 0 {
-		fmt.Fprintln(w, "  - none")
+		writeLine(w, "  - none")
 		return
 	}
 	keys := make([]string, 0, len(values))
@@ -695,7 +703,7 @@ func printListWithReasons(w io.Writer, title string, values map[string]string) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		fmt.Fprintf(w, "  - %s (%s)\n", k, values[k])
+		writef(w, "  - %s (%s)\n", k, values[k])
 	}
 }
 
