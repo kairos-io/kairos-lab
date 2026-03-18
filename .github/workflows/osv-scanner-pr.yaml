@@ -1,6 +1,7 @@
+---
 name: OSV-Scanner PR Scan
 
-on:
+"on":
   pull_request:
     branches:
       - main
@@ -15,4 +16,5 @@ permissions:
 
 jobs:
   scan-pr:
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.3
+    uses: >-
+     google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.3
