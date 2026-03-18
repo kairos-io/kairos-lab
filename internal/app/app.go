@@ -21,7 +21,7 @@ import (
 	"github.com/kairos-io/kairos-lab/internal/vm"
 )
 
-func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version string) error {
 	if len(args) == 0 {
 		printUsage(stdout)
 		return nil
@@ -43,6 +43,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runReset(args[1:], stdout, store)
 	case "cleanup":
 		return runCleanup(args[1:], stdin, stdout, store)
+	case "version", "-v", "--version":
+		fmt.Fprintln(stdout, version)
+		return nil
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
@@ -545,6 +548,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  status               Show state and runtime information")
 	fmt.Fprintln(w, "  reset [--dry-run]    Remove VM artifacts (keep setup)")
 	fmt.Fprintln(w, "  cleanup              Remove everything created by tool")
+	fmt.Fprintln(w, "  version              Print CLI version")
 }
 
 func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, prompt string) (bool, error) {

@@ -38,3 +38,49 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch Homebrew formula update
+        if: startsWith(github.ref_name, 'test-goreleaser') != true
+        env:
+          HOMEBREW_KAIROS_DISPATCH_TOKEN: ${{ secrets.HOMEBREW_KAIROS_DISPATCH_TOKEN }}
+          HOMEBREW_KAIROS_REPO: kairos-io/homebrew-kairos
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HOMEBREW_KAIROS_DISPATCH_TOKEN:-}" ]; then
+            echo "HOMEBREW_KAIROS_DISPATCH_TOKEN secret is required"
+            exit 1
+          fi
+
+          CHECKSUM_FILE="dist/checksums.txt"
+          if [ ! -f "$CHECKSUM_FILE" ]; then
+            echo "missing $CHECKSUM_FILE"
+            exit 1
+          fi
+
+          sha_darwin_arm64=$(awk '/kairos-lab_'"$VERSION"'_darwin_arm64\.tar\.gz$/ { print $1 }' "$CHECKSUM_FILE")
+          sha_linux_amd64=$(awk '/kairos-lab_'"$VERSION"'_linux_amd64\.tar\.gz$/ { print $1 }' "$CHECKSUM_FILE")
+          sha_linux_arm64=$(awk '/kairos-lab_'"$VERSION"'_linux_arm64\.tar\.gz$/ { print $1 }' "$CHECKSUM_FILE")
+
+          if [ -z "$sha_darwin_arm64" ] || [ -z "$sha_linux_amd64" ] || [ -z "$sha_linux_arm64" ]; then
+            echo "failed to resolve one or more checksums from $CHECKSUM_FILE"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $HOMEBREW_KAIROS_DISPATCH_TOKEN" \
+            "https://api.github.com/repos/$HOMEBREW_KAIROS_REPO/dispatches" \
+            -d @- <<EOF
+          {
+            "event_type": "kairos-lab-release",
+            "client_payload": {
+              "version": "$VERSION",
+              "sha256_darwin_arm64": "$sha_darwin_arm64",
+              "sha256_linux_amd64": "$sha_linux_amd64",
+              "sha256_linux_arm64": "$sha_linux_arm64"
+            }
+          }
+          EOF
