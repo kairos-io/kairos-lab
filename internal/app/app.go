@@ -127,6 +127,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	memory := fs.Int("memory", defaultMemoryMB(), "memory in MB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
 	network := fs.String("network", "bridged", "network mode: bridged|user")
+	display := fs.String("display", "serial", "display mode: serial|window")
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet only)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
 	if err := fs.Parse(args); err != nil {
@@ -134,6 +135,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	if *network != "bridged" && *network != "user" {
 		return fmt.Errorf("invalid network mode: %s", *network)
+	}
+	if *display != "serial" && *display != "window" {
+		return fmt.Errorf("invalid display mode: %s", *display)
 	}
 
 	st, err := store.Load()
@@ -207,6 +211,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		CPUs:          *cpus,
 		MemoryMB:      *memory,
 		NetworkMode:   *network,
+		DisplayMode:   *display,
 		BridgeIface:   *bridgeIface,
 		LinuxTapName:  st.Network.TapName,
 		MacOSBiosPath: biosPath,
@@ -250,7 +255,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
-	fmt.Fprintln(stdout, "[5/5] Starting VM console (attached)")
+	fmt.Fprintln(stdout, "[5/5] Starting VM (attached)")
 	fmt.Fprintf(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
 	if *network == "user" {
 		fmt.Fprintln(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")

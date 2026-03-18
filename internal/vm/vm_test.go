@@ -37,3 +37,47 @@ func TestBuildLinuxCommandFailsWithoutTapInBridgeMode(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
+
+func TestBuildLinuxCommandSerialDisplayUsesNographic(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
+	}
+	_, args, err := buildLinux(StartConfig{
+		ISOPath:       "/tmp/kairos.iso",
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "user",
+		DisplayMode:   "serial",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-nographic") {
+		t.Fatalf("expected -nographic for serial display mode: %s", joined)
+	}
+}
+
+func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
+	}
+	_, args, err := buildLinux(StartConfig{
+		ISOPath:       "/tmp/kairos.iso",
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "user",
+		DisplayMode:   "window",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "-nographic") {
+		t.Fatalf("did not expect -nographic for window display mode: %s", joined)
+	}
+}

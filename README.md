@@ -66,12 +66,14 @@ Default disk size is `60G`.
 - Creates/uses managed disk image under cache directory
 - Boots QEMU with workshop-oriented defaults
 - Default network mode: `bridged`
+- Default display mode: `serial` (use `window` to see tty1 graphical installer output)
 - Runs QEMU attached to your terminal so you can interact with the boot console
 - Stores runtime metadata (pid, args, disk/iso paths, log path)
 
 Useful flags:
 
 - `--network bridged|user` (default: `bridged`)
+- `--display serial|window` (default: `serial`)
 - `--disk-size 60G`
 - `--memory 4096` / `--cpus 2`
 - `--yes` (auto-confirm prompts)

@@ -21,6 +21,7 @@ type StartConfig struct {
 	CPUs          int
 	MemoryMB      int
 	NetworkMode   string
+	DisplayMode   string
 	BridgeIface   string
 	LinuxTapName  string
 	MacOSBiosPath string
@@ -131,13 +132,22 @@ func buildLinux(cfg StartConfig) (string, []string, error) {
 	if runtime.GOARCH == "arm64" {
 		binary = "qemu-system-aarch64"
 	}
+	if cfg.DisplayMode == "" {
+		cfg.DisplayMode = "serial"
+	}
 	args := []string{}
 	if runtime.GOARCH == "amd64" {
 		args = append(args, "-enable-kvm", "-cpu", "host")
 	}
+	switch cfg.DisplayMode {
+	case "serial":
+		args = append(args, "-nographic", "-serial", "mon:stdio")
+	case "window":
+		args = append(args, "-serial", "mon:stdio")
+	default:
+		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
+	}
 	args = append(args,
-		"-nographic",
-		"-serial", "mon:stdio",
 		"-m", strconv.Itoa(cfg.MemoryMB),
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-rtc", "base=utc,clock=rt",
@@ -173,6 +183,9 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	if runtime.GOARCH != "arm64" {
 		return "", nil, fmt.Errorf("macOS is only supported on Apple Silicon")
 	}
+	if cfg.DisplayMode == "" {
+		cfg.DisplayMode = "serial"
+	}
 	binary := "qemu-system-aarch64"
 	if cfg.MacOSBiosPath == "" {
 		return "", nil, fmt.Errorf("missing macOS qemu firmware path")
@@ -186,8 +199,14 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
 		"-bios", cfg.MacOSBiosPath,
-		"-nographic",
-		"-serial", "mon:stdio",
+	}
+	switch cfg.DisplayMode {
+	case "serial":
+		args = append(args, "-nographic", "-serial", "mon:stdio")
+	case "window":
+		args = append(args, "-serial", "mon:stdio")
+	default:
+		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
 	}
 	if cfg.NetworkMode == "bridged" {
 		args = append(args,
