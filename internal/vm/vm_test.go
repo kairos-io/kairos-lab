@@ -80,4 +80,10 @@ func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
 	if strings.Contains(joined, "-nographic") {
 		t.Fatalf("did not expect -nographic for window display mode: %s", joined)
 	}
+	if !strings.Contains(joined, "-display default") {
+		t.Fatalf("expected explicit display backend for window display mode: %s", joined)
+	}
+	if runtime.GOARCH == "arm64" && !strings.Contains(joined, "virtio-gpu-pci") {
+		t.Fatalf("expected virtio-gpu-pci for arm64 window display mode: %s", joined)
+	}
 }

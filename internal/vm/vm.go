@@ -143,7 +143,10 @@ func buildLinux(cfg StartConfig) (string, []string, error) {
 	case "serial":
 		args = append(args, "-nographic", "-serial", "mon:stdio")
 	case "window":
-		args = append(args, "-serial", "mon:stdio")
+		args = append(args, "-display", "default", "-serial", "mon:stdio")
+		if runtime.GOARCH == "arm64" {
+			args = append(args, "-device", "virtio-gpu-pci")
+		}
 	default:
 		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
 	}
@@ -204,7 +207,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	case "serial":
 		args = append(args, "-nographic", "-serial", "mon:stdio")
 	case "window":
-		args = append(args, "-serial", "mon:stdio")
+		args = append(args, "-display", "default", "-serial", "mon:stdio", "-device", "virtio-gpu-pci")
 	default:
 		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
 	}
