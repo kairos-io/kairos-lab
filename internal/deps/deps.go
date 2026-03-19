@@ -31,18 +31,6 @@ func Required(info platform.Info) []Dependency {
 				"apk":    {"iproute2"},
 			},
 		})
-		deps = append(deps, Dependency{
-			Name:     "dnsmasq",
-			Binaries: []string{"dnsmasq"},
-			InstallPackages: map[string][]string{
-				"apt":    {"dnsmasq"},
-				"dnf":    {"dnsmasq"},
-				"yum":    {"dnsmasq"},
-				"zypper": {"dnsmasq"},
-				"pacman": {"dnsmasq"},
-				"apk":    {"dnsmasq"},
-			},
-		})
 	}
 	return deps
 }

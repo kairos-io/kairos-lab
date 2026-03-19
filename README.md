@@ -73,10 +73,17 @@ Default disk size is `60G`.
 Useful flags:
 
 - `--network bridged|user` (default: `bridged`)
+- `--bridge-if <iface>` (macOS: host iface like `en0`; Linux: uplink iface like `eth0`)
 - `--display serial|window` (default: `serial`)
 - `--disk-size 60G`
 - `--memory 4096` / `--cpus 2`
 - `--yes` (auto-confirm prompts)
+
+Linux bridged behavior:
+
+- `setup` creates a managed Linux bridge/tap so guests can obtain LAN DHCP in bridged mode.
+- `start --network bridged` reuses and refreshes those network resources.
+- `cleanup` removes Linux bridged resources only if they were created by `kairos-lab`.
 
 ### `stop`
 

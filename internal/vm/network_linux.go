@@ -7,9 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/kairos-io/kairos-lab/internal/state"
 )
@@ -17,8 +15,6 @@ import (
 const (
 	DefaultBridgeName = "kairoslab0"
 	DefaultTapName    = "kairoslab-tap0"
-	DefaultBridgeCIDR = "192.168.76.1/24"
-	DefaultDHCPRange  = "192.168.76.50,192.168.76.150,12h"
 )
 
 func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
@@ -32,17 +28,27 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
+	uplink := st.Network.BridgeInterface
+	if uplink == "" {
+		u, err := detectDefaultUplink()
+		if err != nil {
+			return err
+		}
+		uplink = u
+	}
+	if uplink == bridge {
+		return fmt.Errorf("uplink interface and bridge cannot be the same: %s", uplink)
+	}
+	if !linkExists(uplink) {
+		return fmt.Errorf("uplink interface does not exist: %s", uplink)
+	}
+	if IsLinuxBridge(uplink) {
+		return fmt.Errorf("uplink interface must be a physical host iface, got bridge: %s", uplink)
+	}
+
 	tap := st.Network.TapName
 	if tap == "" {
 		tap = DefaultTapName
-	}
-	pidFile := st.Network.DHCPPIDFile
-	if pidFile == "" {
-		pidFile = filepath.Join(runtimeDir, "dnsmasq.pid")
-	}
-	leaseFile := st.Network.DHCPLeaseFile
-	if leaseFile == "" {
-		leaseFile = filepath.Join(runtimeDir, "dnsmasq.leases")
 	}
 
 	created := []string{}
@@ -51,16 +57,25 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 			return err
 		}
 		created = append(created, "bridge:"+bridge)
-		if err := sudo("ip", "addr", "add", DefaultBridgeCIDR, "dev", bridge); err != nil {
+	}
+	if err := sudo("ip", "link", "set", bridge, "up"); err != nil {
+		return err
+	}
+	if master, _ := currentMaster(uplink); master != bridge {
+		if err := sudo("ip", "link", "set", uplink, "master", bridge); err != nil {
 			return err
 		}
-		if err := sudo("ip", "link", "set", bridge, "up"); err != nil {
-			return err
-		}
+		created = append(created, "uplink:"+uplink)
+	}
+	if err := sudo("ip", "link", "set", uplink, "up"); err != nil {
+		return err
 	}
 
 	if !linkExists(tap) {
-		user := os.Getenv("USER")
+		user := os.Getenv("SUDO_USER")
+		if user == "" {
+			user = os.Getenv("USER")
+		}
 		if user == "" {
 			user = "root"
 		}
@@ -68,33 +83,20 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 			return err
 		}
 		created = append(created, "tap:"+tap)
-		if err := sudo("ip", "link", "set", tap, "master", bridge); err != nil {
-			return err
-		}
-		if err := sudo("ip", "link", "set", tap, "up"); err != nil {
-			return err
-		}
 	}
-
-	if !dnsmasqRunning(pidFile) {
-		if err := sudo("dnsmasq",
-			"--interface="+bridge,
-			"--bind-interfaces",
-			"--except-interface=lo",
-			"--dhcp-range="+DefaultDHCPRange,
-			"--dhcp-leasefile="+leaseFile,
-			"--pid-file="+pidFile,
-		); err != nil {
-			return err
-		}
-		created = append(created, "dnsmasq:"+pidFile)
+	if err := sudo("ip", "link", "set", tap, "master", bridge); err != nil {
+		return err
+	}
+	if err := sudo("ip", "link", "set", tap, "up"); err != nil {
+		return err
 	}
 
 	st.Network.Mode = "bridged"
 	st.Network.BridgeName = bridge
+	st.Network.BridgeInterface = uplink
 	st.Network.TapName = tap
-	st.Network.DHCPPIDFile = pidFile
-	st.Network.DHCPLeaseFile = leaseFile
+	st.Network.DHCPPIDFile = ""
+	st.Network.DHCPLeaseFile = ""
 	st.Network.CleanupRequired = true
 	st.Network.CreatedByKairosLab = true
 	st.Network.CreatedResources = unique(append(st.Network.CreatedResources, created...))
@@ -110,21 +112,16 @@ func CleanupLinuxBridge(st *state.State) error {
 		return nil
 	}
 	var errs []string
-	if st.Network.DHCPPIDFile != "" {
-		pidBytes, err := os.ReadFile(st.Network.DHCPPIDFile)
-		if err == nil {
-			pid := strings.TrimSpace(string(pidBytes))
-			if pid != "" {
-				_ = sudo("kill", pid)
-			}
-		}
-		_ = os.Remove(st.Network.DHCPPIDFile)
-	}
-	if st.Network.DHCPLeaseFile != "" {
-		_ = os.Remove(st.Network.DHCPLeaseFile)
-	}
 	if st.Network.TapName != "" {
 		if err := sudo("ip", "link", "delete", st.Network.TapName); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if st.Network.BridgeInterface != "" && linkExists(st.Network.BridgeInterface) {
+		if err := sudo("ip", "link", "set", st.Network.BridgeInterface, "nomaster"); err != nil {
+			errs = append(errs, err.Error())
+		}
+		if err := sudo("ip", "link", "set", st.Network.BridgeInterface, "up"); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -150,28 +147,6 @@ func linkExists(name string) bool {
 	}
 	cmd := exec.Command("ip", "link", "show", name)
 	if err := cmd.Run(); err != nil {
-		return false
-	}
-	return true
-}
-
-func dnsmasqRunning(pidFile string) bool {
-	if pidFile == "" {
-		return false
-	}
-	b, err := os.ReadFile(pidFile)
-	if err != nil {
-		return false
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil || pid <= 0 {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if err := p.Signal(syscall.Signal(0)); err != nil {
 		return false
 	}
 	return true
@@ -204,4 +179,41 @@ func unique(values []string) []string {
 func IsPathGone(path string) bool {
 	_, err := os.Stat(path)
 	return errors.Is(err, os.ErrNotExist)
+}
+
+func IsLinuxBridge(name string) bool {
+	if runtime.GOOS != "linux" || name == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge"))
+	return err == nil
+}
+
+func currentMaster(iface string) (string, bool) {
+	masterPath := filepath.Join("/sys/class/net", iface, "master")
+	target, err := os.Readlink(masterPath)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Base(target), true
+}
+
+func detectDefaultUplink() (string, error) {
+	out, err := exec.Command("ip", "route", "show", "default").Output()
+	if err != nil {
+		return "", fmt.Errorf("detect default uplink: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				iface := fields[i+1]
+				if iface != "" && iface != "lo" {
+					return iface, nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("could not determine default uplink interface")
 }

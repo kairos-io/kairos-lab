@@ -62,7 +62,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 		return err
 	}
 
-	writeLine(stdout, "[1/4] Detecting platform and package manager")
+	writeLine(stdout, "[1/5] Detecting platform and package manager")
 	st, err := store.Load()
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 	p := platform.Detect()
 	st.Platform = state.Platform{OS: p.OS, Arch: p.Arch, PackageManager: p.PackageManager}
 
-	writeLine(stdout, "[2/4] Checking required dependencies")
+	writeLine(stdout, "[2/5] Checking required dependencies")
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
@@ -103,16 +103,33 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 				return fmt.Errorf("sudo permission denied")
 			}
 		}
-		writeLine(stdout, "[3/4] Installing missing dependencies")
+		writeLine(stdout, "[3/5] Installing missing dependencies")
 		if err := deps.Install(p.PackageManager, pkgs, useSudo); err != nil {
 			return err
 		}
 		st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, missingNames)
 	} else {
-		writeLine(stdout, "[3/4] All dependencies already present")
+		writeLine(stdout, "[3/5] All dependencies already present")
 	}
 
-	writeLine(stdout, "[4/4] Writing state")
+	if runtime.GOOS == "linux" {
+		writeLine(stdout, "[4/5] Preparing bridged network")
+		ok, err := confirm(stdin, stdout, *autoYes, "create managed bridge/tap for LAN bridged mode")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("sudo permission denied")
+		}
+		runtimeDir := filepath.Join(store.CacheDir, "runtime")
+		if err := vm.PrepareLinuxBridge(st, runtimeDir); err != nil {
+			return err
+		}
+	} else {
+		writeLine(stdout, "[4/5] Skipping Linux-only network setup")
+	}
+
+	writeLine(stdout, "[5/5] Writing state")
 	st.Setup.DependencyCheckPassed = true
 	st.Setup.CompletedAt = state.NowRFC3339()
 	if err := store.Save(st); err != nil {
@@ -131,7 +148,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
 	network := fs.String("network", "bridged", "network mode: bridged|user")
 	display := fs.String("display", "serial", "display mode: serial|window")
-	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet only)")
+	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -186,7 +203,10 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[3/5] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
-		ok, err := confirm(stdin, stdout, *autoYes, "bridged networking needs sudo to create bridge/tap and dnsmasq")
+		if *bridgeIface != "" {
+			st.Network.BridgeInterface = *bridgeIface
+		}
+		ok, err := confirm(stdin, stdout, *autoYes, "bridged networking needs sudo to prepare bridge/tap")
 		if err != nil {
 			return err
 		}
@@ -614,6 +634,9 @@ func defaultMemoryMB() int {
 func defaultBridgeIface() string {
 	if runtime.GOOS == "darwin" {
 		return "en0"
+	}
+	if runtime.GOOS == "linux" {
+		return ""
 	}
 	return ""
 }

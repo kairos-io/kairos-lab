@@ -11,3 +11,7 @@ func PrepareLinuxBridge(_ *state.State, _ string) error {
 func CleanupLinuxBridge(_ *state.State) error {
 	return nil
 }
+
+func IsLinuxBridge(_ string) bool {
+	return false
+}
