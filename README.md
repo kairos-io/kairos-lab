@@ -84,6 +84,7 @@ Linux bridged behavior:
 - `setup` creates a managed Linux bridge/tap so guests can obtain LAN DHCP in bridged mode.
 - `start --network bridged` reuses and refreshes those network resources.
 - `cleanup` removes Linux bridged resources only if they were created by `kairos-lab`.
+- If NetworkManager is active, bridge/tap/uplink are managed through `nmcli`.
 
 ### `stop`
 
