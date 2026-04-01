@@ -170,22 +170,6 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return fmt.Errorf("invalid display mode: %s", *display)
 	}
 
-	writeLine(stdout, "")
-	writeLine(stdout, "A VM will start and attach to this terminal.")
-	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
-	writeLine(stdout, "")
-	if !*autoYes {
-		writef(stdout, "Press Enter to continue (or Ctrl-c to cancel)...")
-		var buf [1]byte
-		if _, err := stdin.Read(buf[:]); err != nil {
-			return fmt.Errorf("cancelled")
-		}
-		if buf[0] != '\n' && buf[0] != '\r' {
-			return fmt.Errorf("cancelled")
-		}
-		writeLine(stdout, "")
-	}
-
 	st, err := store.Load()
 	if err != nil {
 		return err
@@ -202,6 +186,22 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 	state.AddManagedDir(st, downloadsDir)
+
+	writeLine(stdout, "")
+	writeLine(stdout, "A VM will start and attach to this terminal.")
+	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
+	writeLine(stdout, "")
+	if !*autoYes {
+		writef(stdout, "Press Enter to continue (or Ctrl-c to cancel)...")
+		var buf [1]byte
+		if _, err := stdin.Read(buf[:]); err != nil {
+			return fmt.Errorf("cancelled")
+		}
+		if buf[0] != '\n' && buf[0] != '\r' {
+			return fmt.Errorf("cancelled")
+		}
+		writeLine(stdout, "")
+	}
 
 	writeLine(stdout, "[2/5] Preparing directories and disk")
 	vmDir := filepath.Join(store.CacheDir, "vm")
