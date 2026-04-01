@@ -171,16 +171,14 @@ func createNewDisk(st *state.State, vmDir, name, size string, stdout io.Writer) 
 	return &disk, nil
 }
 
-func selectDisk(st *state.State, stdin io.Reader, stdout io.Writer) (*state.Disk, error) {
+// selectOrCreateDisk prompts user to select existing disk or create new one
+// Returns: disk, isoPath (only if new disk created), error
+func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, stdin io.Reader, stdout io.Writer) (*state.Disk, string, error) {
 	if len(st.Disks) == 0 {
-		return nil, fmt.Errorf("no disks found")
+		return nil, "", fmt.Errorf("no disks found")
 	}
 
-	if len(st.Disks) == 1 {
-		return &st.Disks[0], nil
-	}
-
-	writeLine(stdout, "Select a disk:")
+	writeLine(stdout, "Existing disks:")
 	for i, d := range st.Disks {
 		isoInfo := ""
 		if d.ISOName != "" {
@@ -192,21 +190,43 @@ func selectDisk(st *state.State, stdin io.Reader, stdout io.Writer) (*state.Disk
 		}
 		writef(stdout, "  [%d] %s - created %s%s\n", i+1, d.Name, createdAt, isoInfo)
 	}
-	writef(stdout, "Choice [1-%d]: ", len(st.Disks))
+	writef(stdout, "  [n] Create new disk\n")
+	writeLine(stdout, "")
+	writef(stdout, "Choice [1-%d or n]: ", len(st.Disks))
 
 	reader := bufio.NewReader(stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, fmt.Errorf("cancelled")
+		return nil, "", fmt.Errorf("cancelled")
 	}
 
-	choice := strings.TrimSpace(line)
+	choice := strings.TrimSpace(strings.ToLower(line))
+
+	if choice == "n" || choice == "new" {
+		// User wants new disk - need to select ISO first
+		writeLine(stdout, "")
+		res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
+		if err != nil {
+			return nil, "", err
+		}
+		isoLocal := res.LocalPath
+		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
+		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		disk, err := createNewDisk(st, vmDir, generatedName, diskSize, stdout)
+		if err != nil {
+			return nil, "", err
+		}
+		disk.ISOName = filepath.Base(isoLocal)
+		return disk, isoLocal, nil
+	}
+
 	idx, err := strconv.Atoi(choice)
 	if err != nil || idx < 1 || idx > len(st.Disks) {
-		return nil, fmt.Errorf("invalid choice: %s", choice)
+		return nil, "", fmt.Errorf("invalid choice: %s", choice)
 	}
 
-	return &st.Disks[idx-1], nil
+	// Existing disk selected - no ISO needed
+	return &st.Disks[idx-1], "", nil
 }
 
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
@@ -254,31 +274,46 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	state.AddManagedDir(st, runtimeDir)
 	state.AddManagedDir(st, downloadsDir)
 
-	// Resolve disk
+	// Resolve disk and ISO
 	var disk *state.Disk
 	var isoLocal string
 
-	if *diskName != "" {
-		// User specified a disk name
-		disk = state.FindDiskByName(st, *diskName)
-		if disk == nil {
-			// Create new disk with this name
-			disk, err = createNewDisk(st, vmDir, *diskName, *diskSize, stdout)
-			if err != nil {
-				return err
-			}
-		}
-	} else if *newDisk || len(st.Disks) == 0 {
-		// Create new disk (forced or no disks exist)
-		// Need ISO for new disk
-		if *noISO {
-			return fmt.Errorf("cannot create new disk without ISO")
-		}
+	// Handle explicit -iso flag
+	if *isoPath != "" {
 		res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
 		if err != nil {
 			return err
 		}
 		isoLocal = res.LocalPath
+	}
+
+	if *diskName != "" {
+		// User specified a disk name
+		disk = state.FindDiskByName(st, *diskName)
+		if disk == nil {
+			// Create new disk with this name - needs ISO
+			if isoLocal == "" {
+				res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
+				if err != nil {
+					return err
+				}
+				isoLocal = res.LocalPath
+			}
+			disk, err = createNewDisk(st, vmDir, *diskName, *diskSize, stdout)
+			if err != nil {
+				return err
+			}
+			disk.ISOName = filepath.Base(isoLocal)
+		}
+	} else if *newDisk || len(st.Disks) == 0 {
+		// Create new disk (forced or no disks exist) - needs ISO
+		if isoLocal == "" {
+			res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
+			if err != nil {
+				return err
+			}
+			isoLocal = res.LocalPath
+		}
 
 		// Generate disk name from ISO
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
@@ -289,36 +324,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		}
 		disk.ISOName = filepath.Base(isoLocal)
 	} else {
-		// Select from existing disks
-		disk, err = selectDisk(st, stdin, stdout)
+		// Existing disks available - ask what to do
+		var err error
+		disk, isoLocal, err = selectOrCreateDisk(st, vmDir, downloadsDir, *diskSize, stdin, stdout)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Resolve ISO (if not already resolved and not --no-iso)
-	if isoLocal == "" && !*noISO {
-		if *isoPath != "" {
-			res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
-			if err != nil {
-				return err
-			}
-			isoLocal = res.LocalPath
-		} else {
-			// Ask if user wants to attach ISO
-			isos, _ := iso.ListDownloaded(downloadsDir)
-			if len(isos) > 0 {
-				writeLine(stdout, "")
-				ok, err := confirm(stdin, stdout, false, "attach an ISO (for install/recovery)")
-				if err == nil && ok {
-					res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
-					if err != nil {
-						return err
-					}
-					isoLocal = res.LocalPath
-				}
-			}
-		}
+	// Apply -no-iso flag (user explicitly doesn't want ISO even for new disk)
+	if *noISO {
+		isoLocal = ""
 	}
 
 	// Show summary and confirm
