@@ -30,6 +30,14 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
+
+	// Clean up stale bridge from previous run if it exists and is causing issues
+	if IsLinuxBridge(bridge) && st.Network.CreatedByKairosLab {
+		if err := CleanupLinuxBridge(st); err != nil {
+			return fmt.Errorf("cleanup stale bridge: %w", err)
+		}
+	}
+
 	uplink := st.Network.BridgeInterface
 	if uplink == "" {
 		u, err := detectDefaultUplink()
@@ -366,13 +374,13 @@ func detectDefaultUplink() (string, error) {
 		for i := 0; i < len(fields)-1; i++ {
 			if fields[i] == "dev" {
 				iface := fields[i+1]
-				if iface != "" && iface != "lo" {
+				if iface != "" && iface != "lo" && !IsLinuxBridge(iface) {
 					return iface, nil
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("could not determine default uplink interface")
+	return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges or loopback)")
 }
 
 func ipv4AddrsOnInterface(iface string) ([]string, error) {

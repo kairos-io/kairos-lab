@@ -345,19 +345,27 @@ func runStop(args []string, stdout io.Writer, store *state.Store) error {
 	running, _ := vm.IsRunning(st.VM.PID)
 	if !running {
 		writeLine(stdout, "no running vm tracked")
-		st.VM.PID = 0
-		st.VM.StoppedAt = state.NowRFC3339()
-		return store.Save(st)
-	}
-	if err := vm.Stop(st.VM.PID, 10*time.Second); err != nil {
-		return err
+	} else {
+		if err := vm.Stop(st.VM.PID, 10*time.Second); err != nil {
+			return err
+		}
+		writeLine(stdout, "vm stopped")
 	}
 	st.VM.PID = 0
 	st.VM.StoppedAt = state.NowRFC3339()
+
+	if runtime.GOOS == "linux" && st.Network.Mode == "bridged" && st.Network.CreatedByKairosLab {
+		writeLine(stdout, "cleaning up bridged network...")
+		if err := vm.CleanupLinuxBridge(st); err != nil {
+			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		} else {
+			writeLine(stdout, "bridge cleaned up")
+		}
+	}
+
 	if err := store.Save(st); err != nil {
 		return err
 	}
-	writeLine(stdout, "vm stopped")
 	return nil
 }
 
