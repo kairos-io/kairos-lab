@@ -2,7 +2,6 @@ package iso
 
 import (
 	"bufio"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -164,9 +163,8 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		return "", fmt.Errorf("url does not look like an iso: %s", rawURL)
 	}
 
-	h := sha256.Sum256([]byte(rawURL))
 	base := filepath.Base(u.Path)
-	target := filepath.Join(downloadsDir, fmt.Sprintf("%x-%s", h[:6], base))
+	target := filepath.Join(downloadsDir, base)
 	if _, err := os.Stat(target); err == nil {
 		fmt.Fprintf(stdout, "Using cached ISO: %s\n", base)
 		return target, nil
