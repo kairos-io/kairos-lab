@@ -64,7 +64,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 		return err
 	}
 
-	writeLine(stdout, "[1/5] Detecting platform and package manager")
+	writeLine(stdout, "[1/4] Detecting platform and package manager")
 	st, err := store.Load()
 	if err != nil {
 		return err
@@ -72,7 +72,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 	p := platform.Detect()
 	st.Platform = state.Platform{OS: p.OS, Arch: p.Arch, PackageManager: p.PackageManager}
 
-	writeLine(stdout, "[2/5] Checking required dependencies")
+	writeLine(stdout, "[2/4] Checking required dependencies")
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
@@ -105,33 +105,16 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 				return fmt.Errorf("sudo permission denied")
 			}
 		}
-		writeLine(stdout, "[3/5] Installing missing dependencies")
+		writeLine(stdout, "[3/4] Installing missing dependencies")
 		if err := deps.Install(p.PackageManager, pkgs, useSudo); err != nil {
 			return err
 		}
 		st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, missingNames)
 	} else {
-		writeLine(stdout, "[3/5] All dependencies already present")
+		writeLine(stdout, "[3/4] All dependencies already present")
 	}
 
-	if runtime.GOOS == "linux" {
-		writeLine(stdout, "[4/5] Preparing bridged network")
-		ok, err := confirm(stdin, stdout, *autoYes, "create managed bridge/tap for LAN bridged mode")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("sudo permission denied")
-		}
-		runtimeDir := filepath.Join(store.CacheDir, "runtime")
-		if err := vm.PrepareLinuxBridge(st, runtimeDir); err != nil {
-			return err
-		}
-	} else {
-		writeLine(stdout, "[4/5] Skipping Linux-only network setup")
-	}
-
-	writeLine(stdout, "[5/5] Writing state")
+	writeLine(stdout, "[4/4] Writing state")
 	st.Setup.DependencyCheckPassed = true
 	st.Setup.CompletedAt = state.NowRFC3339()
 	if err := store.Save(st); err != nil {
