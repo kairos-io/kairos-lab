@@ -175,10 +175,14 @@ func buildLinux(cfg StartConfig) (string, []string, error) {
 	args = append(args,
 		"-drive", "id=disk1,if=none,media=disk,file="+cfg.DiskPath,
 		"-device", "virtio-blk-pci,drive=disk1,bootindex=0",
-		"-drive", "id=cdrom1,if=none,media=cdrom,file="+cfg.ISOPath,
-		"-device", "ide-cd,drive=cdrom1,bootindex=1",
-		"-boot", "menu=on",
 	)
+	if cfg.ISOPath != "" {
+		args = append(args,
+			"-drive", "id=cdrom1,if=none,media=cdrom,file="+cfg.ISOPath,
+			"-device", "ide-cd,drive=cdrom1,bootindex=1",
+		)
+	}
+	args = append(args, "-boot", "menu=on")
 	return binary, args, nil
 }
 
@@ -224,8 +228,10 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	}
 	args = append(args,
 		"-drive", "file="+cfg.DiskPath+",if=virtio,format=qcow2",
-		"-cdrom", cfg.ISOPath,
-		"-boot", "menu=on",
 	)
+	if cfg.ISOPath != "" {
+		args = append(args, "-cdrom", cfg.ISOPath)
+	}
+	args = append(args, "-boot", "menu=on")
 	return binary, args, nil
 }

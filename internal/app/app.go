@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/deps"
@@ -150,10 +153,69 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	return nil
 }
 
+func createNewDisk(st *state.State, vmDir, name, size string, stdout io.Writer) (*state.Disk, error) {
+	diskPath := filepath.Join(vmDir, name+".qcow2")
+	writef(stdout, "Creating disk: %s (%s)\n", name, size)
+	if err := vm.EnsureDisk(diskPath, size); err != nil {
+		return nil, err
+	}
+
+	disk := state.Disk{
+		Name:      name,
+		Path:      diskPath,
+		CreatedAt: state.NowRFC3339(),
+		Size:      size,
+	}
+	state.AddDisk(st, disk)
+	state.AddManagedFile(st, diskPath)
+	return &disk, nil
+}
+
+func selectDisk(st *state.State, stdin io.Reader, stdout io.Writer) (*state.Disk, error) {
+	if len(st.Disks) == 0 {
+		return nil, fmt.Errorf("no disks found")
+	}
+
+	if len(st.Disks) == 1 {
+		return &st.Disks[0], nil
+	}
+
+	writeLine(stdout, "Select a disk:")
+	for i, d := range st.Disks {
+		isoInfo := ""
+		if d.ISOName != "" {
+			isoInfo = fmt.Sprintf(" (from %s)", d.ISOName)
+		}
+		createdAt := d.CreatedAt
+		if t, err := time.Parse(time.RFC3339, d.CreatedAt); err == nil {
+			createdAt = t.Local().Format("2006-01-02 15:04")
+		}
+		writef(stdout, "  [%d] %s - created %s%s\n", i+1, d.Name, createdAt, isoInfo)
+	}
+	writef(stdout, "Choice [1-%d]: ", len(st.Disks))
+
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("cancelled")
+	}
+
+	choice := strings.TrimSpace(line)
+	idx, err := strconv.Atoi(choice)
+	if err != nil || idx < 1 || idx > len(st.Disks) {
+		return nil, fmt.Errorf("invalid choice: %s", choice)
+	}
+
+	return &st.Disks[idx-1], nil
+}
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	isoPath := fs.String("iso", "", "path to local ISO (or uses downloaded ISO)")
-	diskSize := fs.String("disk-size", "60G", "disk image size")
+	isoPath := fs.String("iso", "", "path to ISO file")
+	diskName := fs.String("name", "", "disk name (creates new if doesn't exist)")
+	diskSize := fs.String("disk-size", "60G", "disk image size for new disks")
+	newDisk := fs.Bool("new", false, "create a new disk (even if others exist)")
+	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB(), "memory in MB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
 	network := fs.String("network", "bridged", "network mode: bridged|user")
@@ -179,15 +241,94 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return fmt.Errorf("a vm is already running with pid %d", st.VM.PID)
 	}
 
+	vmDir := filepath.Join(store.CacheDir, "vm")
+	runtimeDir := filepath.Join(store.CacheDir, "runtime")
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
-	res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
-	if err != nil {
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return err
+	}
+	state.AddManagedDir(st, vmDir)
+	state.AddManagedDir(st, runtimeDir)
 	state.AddManagedDir(st, downloadsDir)
 
+	// Resolve disk
+	var disk *state.Disk
+	var isoLocal string
+
+	if *diskName != "" {
+		// User specified a disk name
+		disk = state.FindDiskByName(st, *diskName)
+		if disk == nil {
+			// Create new disk with this name
+			disk, err = createNewDisk(st, vmDir, *diskName, *diskSize, stdout)
+			if err != nil {
+				return err
+			}
+		}
+	} else if *newDisk || len(st.Disks) == 0 {
+		// Create new disk (forced or no disks exist)
+		// Need ISO for new disk
+		if *noISO {
+			return fmt.Errorf("cannot create new disk without ISO")
+		}
+		res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
+		if err != nil {
+			return err
+		}
+		isoLocal = res.LocalPath
+
+		// Generate disk name from ISO
+		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
+		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		disk, err = createNewDisk(st, vmDir, generatedName, *diskSize, stdout)
+		if err != nil {
+			return err
+		}
+		disk.ISOName = filepath.Base(isoLocal)
+	} else {
+		// Select from existing disks
+		disk, err = selectDisk(st, stdin, stdout)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Resolve ISO (if not already resolved and not --no-iso)
+	if isoLocal == "" && !*noISO {
+		if *isoPath != "" {
+			res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
+			if err != nil {
+				return err
+			}
+			isoLocal = res.LocalPath
+		} else {
+			// Ask if user wants to attach ISO
+			isos, _ := iso.ListDownloaded(downloadsDir)
+			if len(isos) > 0 {
+				writeLine(stdout, "")
+				ok, err := confirm(stdin, stdout, false, "attach an ISO (for install/recovery)")
+				if err == nil && ok {
+					res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
+					if err != nil {
+						return err
+					}
+					isoLocal = res.LocalPath
+				}
+			}
+		}
+	}
+
+	// Show summary and confirm
 	writeLine(stdout, "")
-	writef(stdout, "ISO: %s\n", filepath.Base(res.LocalPath))
+	writef(stdout, "Disk: %s\n", disk.Name)
+	if isoLocal != "" {
+		writef(stdout, "ISO:  %s\n", filepath.Base(isoLocal))
+	} else {
+		writeLine(stdout, "ISO:  (none - booting from disk)")
+	}
 	writeLine(stdout, "")
 	writeLine(stdout, "A VM will start and attach to this terminal.")
 	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
@@ -204,28 +345,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		writeLine(stdout, "")
 	}
 
-	writeLine(stdout, "[1/4] Preparing directories and disk")
-	vmDir := filepath.Join(store.CacheDir, "vm")
-	runtimeDir := filepath.Join(store.CacheDir, "runtime")
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return err
-	}
-	state.AddManagedDir(st, vmDir)
-	state.AddManagedDir(st, runtimeDir)
-
-	diskPath := filepath.Join(vmDir, "kairos.qcow2")
-	if _, err := os.Stat(diskPath); errors.Is(err, os.ErrNotExist) {
-		writef(stdout, "Running: qemu-img create -f qcow2 %s %s\n", diskPath, *diskSize)
-	}
-	if err := vm.EnsureDisk(diskPath, *diskSize); err != nil {
-		return err
-	}
-	state.AddManagedFile(st, diskPath)
-
-	writeLine(stdout, "[2/4] Preparing networking")
+	writeLine(stdout, "[1/3] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
 		if *bridgeIface != "" {
 			st.Network.BridgeInterface = *bridgeIface
@@ -249,11 +369,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			return err
 		}
 	}
-	qgaSock := filepath.Join(runtimeDir, "kairos.sock")
-	logPath := filepath.Join(runtimeDir, "qemu.log")
+	qgaSock := filepath.Join(runtimeDir, fmt.Sprintf("%s.sock", disk.Name))
+	logPath := filepath.Join(runtimeDir, fmt.Sprintf("%s.log", disk.Name))
 	binary, qemuArgs, err := vm.BuildQEMUCommand(vm.StartConfig{
-		ISOPath:       res.LocalPath,
-		DiskPath:      diskPath,
+		ISOPath:       isoLocal,
+		DiskPath:      disk.Path,
 		QGASocketPath: qgaSock,
 		CPUs:          *cpus,
 		MemoryMB:      *memory,
@@ -281,13 +401,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		cmdArgs = append([]string{binary}, qemuArgs...)
 	}
 
-	writeLine(stdout, "[3/4] Recording VM state")
+	writeLine(stdout, "[2/3] Recording VM state")
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = *bridgeIface
-	st.VM.ISOSource = res.Source
-	st.VM.ISOInput = res.Input
-	st.VM.ISOLocal = res.LocalPath
-	st.VM.DiskPath = diskPath
+	st.VM.ISOLocal = isoLocal
+	st.VM.DiskPath = disk.Path
+	st.VM.DiskName = disk.Name
 	st.VM.LogPath = logPath
 	st.VM.QemuBinary = cmdName
 	st.VM.QemuArgs = cmdArgs
@@ -302,7 +421,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
-	writeLine(stdout, "[4/4] Starting VM")
+	writeLine(stdout, "[3/3] Starting VM")
 	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
 	if *network == "user" {
 		writeLine(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")
@@ -406,6 +525,7 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "show what would be removed")
 	autoYes := fs.Bool("yes", false, "auto-confirm destructive operations")
+	diskToRemove := fs.String("disk", "", "remove specific disk by name (default: all)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -420,12 +540,38 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
 	}
 
-	paths := []string{st.VM.DiskPath, st.VM.LogPath, st.VM.QGASockPath}
-	if st.VM.ISOSource == "url" {
-		paths = append(paths, st.VM.ISOLocal)
+	// Collect paths to remove
+	var paths []string
+	var disksToRemove []state.Disk
+
+	if *diskToRemove != "" {
+		// Remove specific disk
+		disk := state.FindDiskByName(st, *diskToRemove)
+		if disk == nil {
+			return fmt.Errorf("disk not found: %s", *diskToRemove)
+		}
+		disksToRemove = append(disksToRemove, *disk)
+		paths = append(paths, disk.Path)
+	} else {
+		// Remove all disks
+		for _, d := range st.Disks {
+			disksToRemove = append(disksToRemove, d)
+			paths = append(paths, d.Path)
+		}
 	}
+
+	// Add runtime files
+	paths = append(paths, st.VM.LogPath, st.VM.QGASockPath)
+
 	toRemove, toSkip := splitRemovalPaths(paths, st)
 
+	writeLine(stdout, "reset plan:")
+	if len(disksToRemove) > 0 {
+		writeLine(stdout, "Will remove disks:")
+		for _, d := range disksToRemove {
+			writef(stdout, "  - %s\n", d.Name)
+		}
+	}
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Will clean up bridged network")
@@ -450,6 +596,11 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
 		state.RemoveManagedFile(st, p)
+	}
+
+	// Remove disks from state
+	for _, d := range disksToRemove {
+		state.RemoveDisk(st, d.Name)
 	}
 
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
@@ -576,16 +727,23 @@ func printUsage(w io.Writer) {
 	writeLine(w, "")
 	writeLine(w, "Quick start:")
 	writeLine(w, "  kairos-lab download             Download a Kairos ISO")
-	writeLine(w, "  kairos-lab start                Boot the downloaded ISO")
+	writeLine(w, "  kairos-lab start                Create disk and boot ISO")
+	writeLine(w, "  kairos-lab start                Boot existing disk (after install)")
 	writeLine(w, "")
 	writeLine(w, "Commands:")
 	writeLine(w, "  setup                Detect/install dependencies")
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
-	writeLine(w, "  start [flags]        Boot ISO (uses downloaded ISO, or -iso <path>)")
+	writeLine(w, "  start [flags]        Boot VM (select/create disk, optionally attach ISO)")
 	writeLine(w, "  status               Show state and runtime information")
-	writeLine(w, "  reset                Remove VM artifacts and network (keep setup)")
+	writeLine(w, "  reset [--disk name]  Remove disks and network (keep setup/ISOs)")
 	writeLine(w, "  cleanup              Remove everything created by tool")
 	writeLine(w, "  version              Print CLI version")
+	writeLine(w, "")
+	writeLine(w, "Start flags:")
+	writeLine(w, "  -name <name>         Use/create disk with this name")
+	writeLine(w, "  -new                 Create new disk (even if others exist)")
+	writeLine(w, "  -no-iso              Boot without ISO (installed system)")
+	writeLine(w, "  -iso <path>          Use specific ISO file")
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }

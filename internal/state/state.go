@@ -39,11 +39,20 @@ type Network struct {
 	LastCleanupAttemptAt string   `json:"last_cleanup_attempt_at,omitempty"`
 }
 
+type Disk struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	ISOName   string `json:"iso_name,omitempty"`
+	CreatedAt string `json:"created_at"`
+	Size      string `json:"size"`
+}
+
 type VM struct {
 	ISOSource   string   `json:"iso_source,omitempty"`
 	ISOInput    string   `json:"iso_input,omitempty"`
 	ISOLocal    string   `json:"iso_local_path,omitempty"`
 	DiskPath    string   `json:"disk_path,omitempty"`
+	DiskName    string   `json:"disk_name,omitempty"`
 	LogPath     string   `json:"log_path,omitempty"`
 	QemuBinary  string   `json:"qemu_binary,omitempty"`
 	QemuArgs    []string `json:"qemu_args,omitempty"`
@@ -61,6 +70,7 @@ type State struct {
 	Setup        Setup    `json:"setup"`
 	Network      Network  `json:"network"`
 	VM           VM       `json:"vm"`
+	Disks        []Disk   `json:"disks,omitempty"`
 	ManagedDirs  []string `json:"managed_dirs,omitempty"`
 	ManagedFiles []string `json:"managed_files,omitempty"`
 }
@@ -170,6 +180,33 @@ func RemoveManagedFile(st *State, path string) {
 
 func NowRFC3339() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func NowTimestamp() string {
+	return time.Now().Format("20060102-150405")
+}
+
+func AddDisk(st *State, disk Disk) {
+	st.Disks = append(st.Disks, disk)
+}
+
+func FindDiskByName(st *State, name string) *Disk {
+	for i := range st.Disks {
+		if st.Disks[i].Name == name {
+			return &st.Disks[i]
+		}
+	}
+	return nil
+}
+
+func RemoveDisk(st *State, name string) {
+	out := make([]Disk, 0, len(st.Disks))
+	for _, d := range st.Disks {
+		if d.Name != name {
+			out = append(out, d)
+		}
+	}
+	st.Disks = out
 }
 
 func uniqueSorted(values []string) []string {
