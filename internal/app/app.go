@@ -385,8 +385,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			return err
 		}
 	}
-	qgaSock := filepath.Join(runtimeDir, fmt.Sprintf("%s.sock", disk.Name))
-	logPath := filepath.Join(runtimeDir, fmt.Sprintf("%s.log", disk.Name))
+	// Use short names for socket (Unix socket path limit is ~108 chars)
+	qgaSock := filepath.Join(runtimeDir, "qemu.sock")
+	logPath := filepath.Join(runtimeDir, "qemu.log")
 	binary, qemuArgs, err := vm.BuildQEMUCommand(vm.StartConfig{
 		ISOPath:       isoLocal,
 		DiskPath:      disk.Path,

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/kairos-io/kairos-lab/internal/state"
 )
@@ -32,17 +33,39 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 		bridge = DefaultBridgeName
 	}
 
-	// Clean up stale bridge from previous run if it exists
-	// This handles cases where state was lost (crash, manual cleanup, etc.)
-	if IsLinuxBridge(bridge) {
-		if err := cleanupNMConnections(bridge); err != nil {
-			return fmt.Errorf("cleanup stale bridge: %w", err)
+	// Check for stale bridge from previous run
+	if IsLinuxBridge(bridge) || nmConnectionExists(bridge) {
+		fmt.Println("Found stale network configuration, cleaning up...")
+		
+		// First, find the physical interface that's enslaved to the bridge
+		uplinkIface := findBridgeSlave(bridge)
+		
+		// Delete our NM connections
+		cleanupNMConnections(bridge)
+		
+		// If we found an enslaved interface, reconnect it
+		if uplinkIface != "" {
+			fmt.Printf("Reconnecting %s...\n", uplinkIface)
+			// Try to bring up the device - NM will auto-connect or we trigger DHCP
+			_ = sudo("nmcli", "device", "connect", uplinkIface)
+			time.Sleep(3 * time.Second)
+		} else {
+			time.Sleep(2 * time.Second)
 		}
 	}
 
 	uplink := st.Network.BridgeInterface
 	if uplink == "" {
-		u, err := detectDefaultUplink()
+		// Retry a few times in case NM is still restoring the connection
+		var u string
+		var err error
+		for i := 0; i < 5; i++ {
+			u, err = detectDefaultUplink()
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Second)
+		}
 		if err != nil {
 			return err
 		}
@@ -158,17 +181,16 @@ func cleanupNMConnections(bridgeConn string) error {
 	uplinkConn := bridgeConn + "-uplink"
 	tapConn := bridgeConn + "-tap"
 
-	var errs []string
+	// Delete all connections with these names (there might be duplicates)
+	// We try multiple times to catch duplicates, ignoring errors (connection might not exist)
 	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
-		if !nmConnectionExists(conn) {
-			continue
+		// Try deleting up to 10 times to handle duplicates
+		for i := 0; i < 10; i++ {
+			err := sudo("nmcli", "connection", "delete", conn)
+			if err != nil {
+				break // No more connections with this name
+			}
 		}
-		if err := sudo("nmcli", "connection", "delete", conn); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("bridge cleanup failed: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -184,11 +206,39 @@ func linkExists(name string) bool {
 	return true
 }
 
+// findBridgeSlave finds a physical interface enslaved to the given bridge
+func findBridgeSlave(bridge string) string {
+	// List interfaces that have this bridge as master
+	out, err := exec.Command("ip", "-o", "link", "show", "master", bridge).Output()
+	if err != nil {
+		return ""
+	}
+	// Parse output to find non-tap interfaces
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		// Format: "3: enp0s31f6: <...>"
+		iface := strings.TrimSuffix(fields[1], ":")
+		// Skip tap interfaces
+		if strings.Contains(iface, "tap") {
+			continue
+		}
+		return iface
+	}
+	return ""
+}
+
 func sudo(name string, args ...string) error {
 	argv := append([]string{name}, args...)
 	cmd := exec.Command("sudo", argv...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("sudo command failed: sudo %s: %w: %s", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sudo command failed: sudo %s: %w", strings.Join(argv, " "), err)
 	}
 	return nil
 }
