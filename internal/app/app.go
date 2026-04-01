@@ -33,6 +33,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	switch args[0] {
 	case "setup":
 		return runSetup(args[1:], stdin, stdout, stderr, store)
+	case "download":
+		return runDownload(args[1:], stdin, stdout, store)
 	case "start":
 		return runStart(args[1:], stdin, stdout, stderr, store)
 	case "stop":
@@ -139,6 +141,39 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 	return nil
 }
 
+func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.Store) error {
+	if len(args) > 0 {
+		return fmt.Errorf("download does not accept arguments")
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		return err
+	}
+
+	downloadsDir := filepath.Join(store.CacheDir, "downloads")
+	res, err := iso.ResolveWithConfig(iso.ResolveConfig{
+		DownloadsDir: downloadsDir,
+		Stdin:        stdin,
+		Stdout:       stdout,
+	})
+	if err != nil {
+		return err
+	}
+
+	state.AddManagedDir(st, downloadsDir)
+	if res.Downloaded {
+		state.AddManagedFile(st, res.LocalPath)
+	}
+
+	if err := store.Save(st); err != nil {
+		return err
+	}
+
+	writef(stdout, "ISO ready: %s\n", res.LocalPath)
+	return nil
+}
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to local ISO")
@@ -171,7 +206,13 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[1/5] Resolving ISO source")
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
-	res, err := iso.Resolve(*isoPath, *isoURL, downloadsDir)
+	res, err := iso.ResolveWithConfig(iso.ResolveConfig{
+		LocalPath:    *isoPath,
+		SourceURL:    *isoURL,
+		DownloadsDir: downloadsDir,
+		Stdin:        stdin,
+		Stdout:       stdout,
+	})
 	if err != nil {
 		return err
 	}
@@ -570,10 +611,12 @@ func printUsage(w io.Writer) {
 	writeLine(w, "kairos-lab: local Kairos workshop CLI")
 	writeLine(w, "")
 	writeLine(w, "Usage:")
-	writeLine(w, "  kairos-lab start -iso <path>    Boot ISO in a window with bridged networking")
+	writeLine(w, "  kairos-lab start                Boot with interactive ISO selection")
+	writeLine(w, "  kairos-lab start -iso <path>    Boot a specific ISO file")
 	writeLine(w, "")
 	writeLine(w, "Commands:")
 	writeLine(w, "  setup                Detect/install dependencies")
+	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
 	writeLine(w, "  start [flags]        Create disk and boot ISO (window + bridged by default)")
 	writeLine(w, "  stop                 Stop running VM and clean up networking")
 	writeLine(w, "  status               Show state and runtime information")
