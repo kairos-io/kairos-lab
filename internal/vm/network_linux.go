@@ -182,14 +182,10 @@ func cleanupNMConnections(bridgeConn string) error {
 	tapConn := bridgeConn + "-tap"
 
 	// Delete all connections with these names (there might be duplicates)
-	// We try multiple times to catch duplicates, ignoring errors (connection might not exist)
 	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
-		// Try deleting up to 10 times to handle duplicates
-		for i := 0; i < 10; i++ {
-			err := sudo("nmcli", "connection", "delete", conn)
-			if err != nil {
-				break // No more connections with this name
-			}
+		// Keep deleting while connection exists
+		for nmConnectionExists(conn) {
+			_ = sudoQuiet("nmcli", "connection", "delete", conn)
 		}
 	}
 	return nil
@@ -237,6 +233,17 @@ func sudo(name string, args ...string) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("sudo command failed: sudo %s: %w", strings.Join(argv, " "), err)
+	}
+	return nil
+}
+
+// sudoQuiet runs a sudo command without showing output (for cleanup operations)
+func sudoQuiet(name string, args ...string) error {
+	argv := append([]string{name}, args...)
+	cmd := exec.Command("sudo", argv...)
+	cmd.Stdin = os.Stdin
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("sudo command failed: sudo %s: %w", strings.Join(argv, " "), err)
 	}
