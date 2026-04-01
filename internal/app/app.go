@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/deps"
@@ -37,12 +36,10 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 		return runDownload(args[1:], stdin, stdout, store)
 	case "start":
 		return runStart(args[1:], stdin, stdout, stderr, store)
-	case "stop":
-		return runStop(args[1:], stdout, store)
 	case "status":
 		return runStatus(stdout, store)
 	case "reset":
-		return runReset(args[1:], stdout, store)
+		return runReset(args[1:], stdin, stdout, store)
 	case "cleanup":
 		return runCleanup(args[1:], stdin, stdout, store)
 	case "version", "-v", "--version":
@@ -176,6 +173,22 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	if *display != "serial" && *display != "window" {
 		return fmt.Errorf("invalid display mode: %s", *display)
+	}
+
+	writeLine(stdout, "")
+	writeLine(stdout, "A VM will start and attach to this terminal.")
+	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
+	writeLine(stdout, "")
+	if !*autoYes {
+		writef(stdout, "Press Enter to continue (or Ctrl-c to cancel)...")
+		var buf [1]byte
+		if _, err := stdin.Read(buf[:]); err != nil {
+			return fmt.Errorf("cancelled")
+		}
+		if buf[0] != '\n' && buf[0] != '\r' {
+			return fmt.Errorf("cancelled")
+		}
+		writeLine(stdout, "")
 	}
 
 	st, err := store.Load()
@@ -358,41 +371,6 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	return nil
 }
 
-func runStop(args []string, stdout io.Writer, store *state.Store) error {
-	if len(args) > 0 {
-		return fmt.Errorf("stop does not accept arguments")
-	}
-	st, err := store.Load()
-	if err != nil {
-		return err
-	}
-	running, _ := vm.IsRunning(st.VM.PID)
-	if !running {
-		writeLine(stdout, "no running vm tracked")
-	} else {
-		if err := vm.Stop(st.VM.PID, 10*time.Second); err != nil {
-			return err
-		}
-		writeLine(stdout, "vm stopped")
-	}
-	st.VM.PID = 0
-	st.VM.StoppedAt = state.NowRFC3339()
-
-	if runtime.GOOS == "linux" && st.Network.Mode == "bridged" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "cleaning up bridged network...")
-		if err := vm.CleanupLinuxBridge(st); err != nil {
-			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
-		} else {
-			writeLine(stdout, "bridge cleaned up")
-		}
-	}
-
-	if err := store.Save(st); err != nil {
-		return err
-	}
-	return nil
-}
-
 func runStatus(stdout io.Writer, store *state.Store) error {
 	st, err := store.Load()
 	if err != nil {
@@ -437,9 +415,10 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	return nil
 }
 
-func runReset(args []string, stdout io.Writer, store *state.Store) error {
+func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "show what would be removed")
+	autoYes := fs.Bool("yes", false, "auto-confirm destructive operations")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -448,8 +427,11 @@ func runReset(args []string, stdout io.Writer, store *state.Store) error {
 	if err != nil {
 		return err
 	}
-	_ = vm.Stop(st.VM.PID, 5*time.Second)
-	st.VM.PID = 0
+
+	running, _ := vm.IsRunning(st.VM.PID)
+	if running {
+		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+	}
 
 	paths := []string{st.VM.DiskPath, st.VM.LogPath, st.VM.QGASockPath}
 	if st.VM.ISOSource == "url" {
@@ -458,9 +440,21 @@ func runReset(args []string, stdout io.Writer, store *state.Store) error {
 	toRemove, toSkip := splitRemovalPaths(paths, st)
 
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
+	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		writeLine(stdout, "Will clean up bridged network")
+	}
+
 	if *dryRun {
 		writeLine(stdout, "dry-run only, no changes made")
 		return nil
+	}
+
+	ok, err := confirm(stdin, stdout, *autoYes, "proceed with reset")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("reset cancelled")
 	}
 
 	for _, p := range toRemove {
@@ -469,6 +463,13 @@ func runReset(args []string, stdout io.Writer, store *state.Store) error {
 			return fmt.Errorf("remove %s: %w", p, err)
 		}
 		state.RemoveManagedFile(st, p)
+	}
+
+	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		writeLine(stdout, "Cleaning up bridged network...")
+		if err := vm.CleanupLinuxBridge(st); err != nil {
+			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		}
 	}
 
 	st.VM = state.VM{}
@@ -518,12 +519,8 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
-	if runtime.GOOS == "linux" && st.Network.Mode == "bridged" {
-		if st.Network.CreatedByKairosLab {
-			printList(stdout, "Will remove bridged network resources", st.Network.CreatedResources)
-		} else {
-			printList(stdout, "Will keep bridged network resources", []string{"not created by kairos-lab"})
-		}
+	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		writeLine(stdout, "Will clean up bridged network")
 	}
 
 	if *dryRun {
@@ -539,18 +536,15 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		return fmt.Errorf("cleanup cancelled")
 	}
 
-	_ = vm.Stop(st.VM.PID, 5*time.Second)
+	running, _ := vm.IsRunning(st.VM.PID)
+	if running {
+		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+	}
 
-	if runtime.GOOS == "linux" && st.Network.Mode == "bridged" && st.Network.CreatedByKairosLab {
-		ok, err := confirm(stdin, stdout, *autoYes, "remove bridged network resources with sudo")
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("cannot guarantee safe cleanup without bridge removal")
-		}
+	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
+		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
-			return err
+			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 		}
 	}
 
@@ -601,11 +595,12 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  setup                Detect/install dependencies")
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
 	writeLine(w, "  start [flags]        Create disk and boot ISO (window + bridged by default)")
-	writeLine(w, "  stop                 Stop running VM and clean up networking")
 	writeLine(w, "  status               Show state and runtime information")
-	writeLine(w, "  reset [--dry-run]    Remove VM artifacts (keep setup)")
+	writeLine(w, "  reset                Remove VM artifacts and network (keep setup)")
 	writeLine(w, "  cleanup              Remove everything created by tool")
 	writeLine(w, "  version              Print CLI version")
+	writeLine(w, "")
+	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }
 
 func writeLine(w io.Writer, a ...any) {
