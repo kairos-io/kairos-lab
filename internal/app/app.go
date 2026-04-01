@@ -132,7 +132,7 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	}
 
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
-	res, err := iso.ResolveWithConfig(iso.ResolveConfig{
+	localPath, err := iso.Download(iso.DownloadConfig{
 		DownloadsDir: downloadsDir,
 		Stdin:        stdin,
 		Stdout:       stdout,
@@ -142,22 +142,17 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	}
 
 	state.AddManagedDir(st, downloadsDir)
-	if res.Downloaded {
-		state.AddManagedFile(st, res.LocalPath)
-	}
+	state.AddManagedFile(st, localPath)
 
 	if err := store.Save(st); err != nil {
 		return err
 	}
-
-	writef(stdout, "ISO ready: %s\n", res.LocalPath)
 	return nil
 }
 
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
-	isoPath := fs.String("iso", "", "path to local ISO")
-	isoURL := fs.String("url", "", "URL to ISO")
+	isoPath := fs.String("iso", "", "path to local ISO (or uses downloaded ISO)")
 	diskSize := fs.String("disk-size", "60G", "disk image size")
 	memory := fs.Int("memory", defaultMemoryMB(), "memory in MB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
@@ -202,20 +197,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[1/5] Resolving ISO source")
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
-	res, err := iso.ResolveWithConfig(iso.ResolveConfig{
-		LocalPath:    *isoPath,
-		SourceURL:    *isoURL,
-		DownloadsDir: downloadsDir,
-		Stdin:        stdin,
-		Stdout:       stdout,
-	})
+	res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
 	if err != nil {
 		return err
 	}
 	state.AddManagedDir(st, downloadsDir)
-	if res.Downloaded {
-		state.AddManagedFile(st, res.LocalPath)
-	}
 
 	writeLine(stdout, "[2/5] Preparing directories and disk")
 	vmDir := filepath.Join(store.CacheDir, "vm")
@@ -587,14 +573,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 func printUsage(w io.Writer) {
 	writeLine(w, "kairos-lab: local Kairos workshop CLI")
 	writeLine(w, "")
-	writeLine(w, "Usage:")
-	writeLine(w, "  kairos-lab start                Boot with interactive ISO selection")
-	writeLine(w, "  kairos-lab start -iso <path>    Boot a specific ISO file")
+	writeLine(w, "Quick start:")
+	writeLine(w, "  kairos-lab download             Download a Kairos ISO")
+	writeLine(w, "  kairos-lab start                Boot the downloaded ISO")
 	writeLine(w, "")
 	writeLine(w, "Commands:")
 	writeLine(w, "  setup                Detect/install dependencies")
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
-	writeLine(w, "  start [flags]        Create disk and boot ISO (window + bridged by default)")
+	writeLine(w, "  start [flags]        Boot ISO (uses downloaded ISO, or -iso <path>)")
 	writeLine(w, "  status               Show state and runtime information")
 	writeLine(w, "  reset                Remove VM artifacts and network (keep setup)")
 	writeLine(w, "  cleanup              Remove everything created by tool")

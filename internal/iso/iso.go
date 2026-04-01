@@ -21,54 +21,133 @@ type Result struct {
 	Downloaded bool
 }
 
-type ResolveConfig struct {
-	LocalPath    string
-	SourceURL    string
+type DownloadConfig struct {
 	DownloadsDir string
 	Stdin        io.Reader
 	Stdout       io.Writer
 }
 
-func Resolve(localPath, sourceURL, downloadsDir string) (*Result, error) {
-	return ResolveWithConfig(ResolveConfig{
-		LocalPath:    localPath,
-		SourceURL:    sourceURL,
-		DownloadsDir: downloadsDir,
-		Stdin:        os.Stdin,
-		Stdout:       os.Stdout,
-	})
+// Download interactively selects and downloads an ISO, returning the path
+func Download(cfg DownloadConfig) (string, error) {
+	selected, err := interactivePicker(cfg.Stdin, cfg.Stdout)
+	if err != nil {
+		return "", err
+	}
+
+	if err := os.MkdirAll(cfg.DownloadsDir, 0o755); err != nil {
+		return "", fmt.Errorf("create downloads directory: %w", err)
+	}
+
+	localPath, err := downloadISO(selected.DownloadURL, cfg.DownloadsDir, cfg.Stdout)
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Fprintf(cfg.Stdout, "\nISO saved to: %s\n", localPath)
+	return localPath, nil
 }
 
-func ResolveWithConfig(cfg ResolveConfig) (*Result, error) {
-	if cfg.LocalPath != "" && cfg.SourceURL != "" {
-		return nil, fmt.Errorf("provide only one of --iso or --url, not both")
+// ListDownloaded returns all ISO files in the downloads directory
+func ListDownloaded(downloadsDir string) ([]string, error) {
+	entries, err := os.ReadDir(downloadsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 
-	if cfg.LocalPath == "" && cfg.SourceURL == "" {
-		selected, err := interactivePicker(cfg.Stdin, cfg.Stdout)
-		if err != nil {
-			return nil, err
+	var isos []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
 		}
-		cfg.SourceURL = selected.DownloadURL
+		if strings.HasSuffix(strings.ToLower(e.Name()), ".iso") {
+			isos = append(isos, filepath.Join(downloadsDir, e.Name()))
+		}
 	}
-	if cfg.LocalPath != "" {
-		abs, err := filepath.Abs(cfg.LocalPath)
+	return isos, nil
+}
+
+type SelectConfig struct {
+	DownloadsDir string
+	Stdin        io.Reader
+	Stdout       io.Writer
+}
+
+// SelectDownloaded prompts user to select from downloaded ISOs
+// Returns error if no ISOs available
+func SelectDownloaded(cfg SelectConfig) (string, error) {
+	isos, err := ListDownloaded(cfg.DownloadsDir)
+	if err != nil {
+		return "", err
+	}
+
+	if len(isos) == 0 {
+		return "", fmt.Errorf("no ISOs found. Run 'kairos-lab download' first")
+	}
+
+	if len(isos) == 1 {
+		name := filepath.Base(isos[0])
+		fmt.Fprintf(cfg.Stdout, "Found ISO: %s\n", name)
+		fmt.Fprint(cfg.Stdout, "Press Enter to use this ISO (or Ctrl-c to cancel and download a different one): ")
+
+		reader := bufio.NewReader(cfg.Stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("cancelled")
+		}
+		if strings.TrimSpace(line) != "" {
+			return "", fmt.Errorf("cancelled")
+		}
+		return isos[0], nil
+	}
+
+	fmt.Fprintln(cfg.Stdout, "Multiple ISOs found. Select one:")
+	for i, iso := range isos {
+		fmt.Fprintf(cfg.Stdout, "  [%d] %s\n", i+1, filepath.Base(iso))
+	}
+	fmt.Fprintf(cfg.Stdout, "Choice [1-%d] (or Ctrl-c to cancel and download a different one): ", len(isos))
+
+	reader := bufio.NewReader(cfg.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("cancelled")
+	}
+
+	choice := strings.TrimSpace(line)
+	idx, err := strconv.Atoi(choice)
+	if err != nil || idx < 1 || idx > len(isos) {
+		return "", fmt.Errorf("invalid choice: %s", choice)
+	}
+
+	return isos[idx-1], nil
+}
+
+// ResolveForStart resolves an ISO for starting a VM
+// If localPath is provided, uses that. Otherwise selects from downloaded ISOs.
+func ResolveForStart(localPath, downloadsDir string, stdin io.Reader, stdout io.Writer) (*Result, error) {
+	if localPath != "" {
+		abs, err := filepath.Abs(localPath)
 		if err != nil {
 			return nil, fmt.Errorf("resolve iso path: %w", err)
 		}
 		if err := validateLocalISO(abs); err != nil {
 			return nil, err
 		}
-		return &Result{Source: "local", Input: cfg.LocalPath, LocalPath: abs, Downloaded: false}, nil
+		return &Result{Source: "local", Input: localPath, LocalPath: abs, Downloaded: false}, nil
 	}
-	if err := os.MkdirAll(cfg.DownloadsDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create downloads directory: %w", err)
-	}
-	local, err := downloadISO(cfg.SourceURL, cfg.DownloadsDir, cfg.Stdout)
+
+	selected, err := SelectDownloaded(SelectConfig{
+		DownloadsDir: downloadsDir,
+		Stdin:        stdin,
+		Stdout:       stdout,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Source: "url", Input: cfg.SourceURL, LocalPath: local, Downloaded: true}, nil
+
+	return &Result{Source: "downloaded", Input: selected, LocalPath: selected, Downloaded: false}, nil
 }
 
 func validateLocalISO(path string) error {
