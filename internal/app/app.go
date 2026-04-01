@@ -179,7 +179,6 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return fmt.Errorf("a vm is already running with pid %d", st.VM.PID)
 	}
 
-	writeLine(stdout, "[1/5] Resolving ISO source")
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
 	res, err := iso.ResolveForStart(*isoPath, downloadsDir, stdin, stdout)
 	if err != nil {
@@ -188,11 +187,13 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	state.AddManagedDir(st, downloadsDir)
 
 	writeLine(stdout, "")
+	writef(stdout, "ISO: %s\n", filepath.Base(res.LocalPath))
+	writeLine(stdout, "")
 	writeLine(stdout, "A VM will start and attach to this terminal.")
 	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
 	writeLine(stdout, "")
 	if !*autoYes {
-		writef(stdout, "Press Enter to continue (or Ctrl-c to cancel)...")
+		writef(stdout, "Press Enter to start (or Ctrl-c to cancel): ")
 		var buf [1]byte
 		if _, err := stdin.Read(buf[:]); err != nil {
 			return fmt.Errorf("cancelled")
@@ -203,7 +204,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		writeLine(stdout, "")
 	}
 
-	writeLine(stdout, "[2/5] Preparing directories and disk")
+	writeLine(stdout, "[1/4] Preparing directories and disk")
 	vmDir := filepath.Join(store.CacheDir, "vm")
 	runtimeDir := filepath.Join(store.CacheDir, "runtime")
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
@@ -224,7 +225,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 	state.AddManagedFile(st, diskPath)
 
-	writeLine(stdout, "[3/5] Preparing networking")
+	writeLine(stdout, "[2/4] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
 		if *bridgeIface != "" {
 			st.Network.BridgeInterface = *bridgeIface
@@ -280,7 +281,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		cmdArgs = append([]string{binary}, qemuArgs...)
 	}
 
-	writeLine(stdout, "[4/5] Recording VM state")
+	writeLine(stdout, "[3/4] Recording VM state")
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = *bridgeIface
 	st.VM.ISOSource = res.Source
@@ -301,7 +302,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return err
 	}
 
-	writeLine(stdout, "[5/5] Starting VM (attached)")
+	writeLine(stdout, "[4/4] Starting VM")
 	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
 	if *network == "user" {
 		writeLine(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")

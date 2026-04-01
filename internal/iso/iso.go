@@ -75,7 +75,7 @@ type SelectConfig struct {
 	Stdout       io.Writer
 }
 
-// SelectDownloaded prompts user to select from downloaded ISOs
+// SelectDownloaded prompts user to select from downloaded ISOs if multiple exist
 // Returns error if no ISOs available
 func SelectDownloaded(cfg SelectConfig) (string, error) {
 	isos, err := ListDownloaded(cfg.DownloadsDir)
@@ -88,18 +88,6 @@ func SelectDownloaded(cfg SelectConfig) (string, error) {
 	}
 
 	if len(isos) == 1 {
-		name := filepath.Base(isos[0])
-		fmt.Fprintf(cfg.Stdout, "Found ISO: %s\n", name)
-		fmt.Fprint(cfg.Stdout, "Press Enter to use this ISO (or Ctrl-c to cancel and download a different one): ")
-
-		reader := bufio.NewReader(cfg.Stdin)
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return "", fmt.Errorf("cancelled")
-		}
-		if strings.TrimSpace(line) != "" {
-			return "", fmt.Errorf("cancelled")
-		}
 		return isos[0], nil
 	}
 
