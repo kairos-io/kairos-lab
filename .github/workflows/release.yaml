@@ -60,9 +60,12 @@ jobs:
             exit 1
           fi
 
-          artifact_darwin_arm64="kairos-lab_${VERSION}_darwin_arm64.tar.gz"
-          artifact_linux_amd64="kairos-lab_${VERSION}_linux_amd64.tar.gz"
-          artifact_linux_arm64="kairos-lab_${VERSION}_linux_arm64.tar.gz"
+          # goreleaser strips the 'v' prefix from version in artifact names
+          VERSION_NO_V="${VERSION#v}"
+
+          artifact_darwin_arm64="kairos-lab_${VERSION_NO_V}_darwin_arm64.tar.gz"
+          artifact_linux_amd64="kairos-lab_${VERSION_NO_V}_linux_amd64.tar.gz"
+          artifact_linux_arm64="kairos-lab_${VERSION_NO_V}_linux_arm64.tar.gz"
 
           checksum_for() {
             awk -v name="$1" '$2 == name { print $1 }' "$CHECKSUM_FILE"
