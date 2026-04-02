@@ -41,7 +41,7 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 		uplinkIface := findBridgeSlave(bridge)
 		
 		// Delete our NM connections
-		cleanupNMConnections(bridge)
+		_ = cleanupNMConnections(bridge)
 		
 		// If we found an enslaved interface, reconnect it
 		if uplinkIface != "" {
