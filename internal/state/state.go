@@ -209,6 +209,10 @@ func RemoveDisk(st *State, name string) {
 	st.Disks = out
 }
 
+func IsSetupComplete(st *State) bool {
+	return st.Setup.CompletedAt != "" && st.Setup.DependencyCheckPassed
+}
+
 func uniqueSorted(values []string) []string {
 	set := map[string]struct{}{}
 	for _, v := range values {

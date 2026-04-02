@@ -133,6 +133,9 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	if err != nil {
 		return err
 	}
+	if err := requireSetup(st); err != nil {
+		return err
+	}
 
 	downloadsDir := filepath.Join(store.CacheDir, "downloads")
 	localPath, err := iso.Download(iso.DownloadConfig{
@@ -254,6 +257,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	st, err := store.Load()
 	if err != nil {
+		return err
+	}
+	if err := requireSetup(st); err != nil {
 		return err
 	}
 	running, _ := vm.IsRunning(st.VM.PID)
@@ -499,6 +505,9 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	if err != nil {
 		return err
 	}
+	if err := requireSetup(st); err != nil {
+		return err
+	}
 	p := platform.Detect()
 	req := deps.Required(p)
 	present := deps.PresentNames(req)
@@ -549,6 +558,9 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 
 	st, err := store.Load()
 	if err != nil {
+		return err
+	}
+	if err := requireSetup(st); err != nil {
 		return err
 	}
 
@@ -645,6 +657,9 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 
 	st, err := store.Load()
 	if err != nil {
+		return err
+	}
+	if err := requireSetup(st); err != nil {
 		return err
 	}
 
@@ -936,4 +951,13 @@ func emptyAsNone(v string) string {
 		return "none"
 	}
 	return v
+}
+
+var errSetupRequired = errors.New("setup has not been completed. Please run 'kairos-lab setup' first")
+
+func requireSetup(st *state.State) error {
+	if !state.IsSetupComplete(st) {
+		return errSetupRequired
+	}
+	return nil
 }
