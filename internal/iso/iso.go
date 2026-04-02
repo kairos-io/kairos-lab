@@ -42,7 +42,7 @@ func Download(cfg DownloadConfig) (string, error) {
 		return "", err
 	}
 
-	fmt.Fprintf(cfg.Stdout, "\nISO saved to: %s\n", localPath)
+	_, _ = fmt.Fprintf(cfg.Stdout, "\nISO saved to: %s\n", localPath)
 	return localPath, nil
 }
 
@@ -90,11 +90,11 @@ func SelectDownloaded(cfg SelectConfig) (string, error) {
 		return isos[0], nil
 	}
 
-	fmt.Fprintln(cfg.Stdout, "Multiple ISOs found. Select one:")
+	_, _ = fmt.Fprintln(cfg.Stdout, "Multiple ISOs found. Select one:")
 	for i, iso := range isos {
-		fmt.Fprintf(cfg.Stdout, "  [%d] %s\n", i+1, filepath.Base(iso))
+		_, _ = fmt.Fprintf(cfg.Stdout, "  [%d] %s\n", i+1, filepath.Base(iso))
 	}
-	fmt.Fprintf(cfg.Stdout, "Choice [1-%d] (or Ctrl-c to cancel and download a different one): ", len(isos))
+	_, _ = fmt.Fprintf(cfg.Stdout, "Choice [1-%d] (or Ctrl-c to cancel and download a different one): ", len(isos))
 
 	reader := bufio.NewReader(cfg.Stdin)
 	line, err := reader.ReadString('\n')
@@ -166,11 +166,11 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 	base := filepath.Base(u.Path)
 	target := filepath.Join(downloadsDir, base)
 	if _, err := os.Stat(target); err == nil {
-		fmt.Fprintf(stdout, "Using cached ISO: %s\n", base)
+		_, _ = fmt.Fprintf(stdout, "Using cached ISO: %s\n", base)
 		return target, nil
 	}
 
-	fmt.Fprintf(stdout, "Downloading %s...\n", base)
+	_, _ = fmt.Fprintf(stdout, "Downloading %s...\n", base)
 
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Get(rawURL)
@@ -201,7 +201,7 @@ func downloadISO(rawURL, downloadsDir string, stdout io.Writer) (string, error) 
 		if _, err := io.Copy(f, io.TeeReader(resp.Body, pw)); err != nil {
 			return "", fmt.Errorf("write iso file: %w", err)
 		}
-		fmt.Fprintln(stdout)
+		_, _ = fmt.Fprintln(stdout)
 	} else {
 		if _, err := io.Copy(f, resp.Body); err != nil {
 			return "", fmt.Errorf("write iso file: %w", err)
@@ -223,7 +223,7 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	pct := int(pw.written * 100 / pw.total)
 	if pct != pw.lastPct {
 		pw.lastPct = pct
-		fmt.Fprintf(pw.stdout, "\rDownloading... %d%% (%s / %s)", pct, humanSize(pw.written), humanSize(pw.total))
+		_, _ = fmt.Fprintf(pw.stdout, "\rDownloading... %d%% (%s / %s)", pct, humanSize(pw.written), humanSize(pw.total))
 	}
 	return n, nil
 }
@@ -242,7 +242,7 @@ func humanSize(b int64) string {
 }
 
 func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
-	fmt.Fprintln(stdout, "No ISO specified. Fetching latest Kairos releases...")
+	_, _ = fmt.Fprintln(stdout, "No ISO specified. Fetching latest Kairos releases...")
 
 	release, err := FetchLatestRelease()
 	if err != nil {
@@ -256,10 +256,10 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 		return nil, fmt.Errorf("no compatible ISOs found for your architecture")
 	}
 
-	fmt.Fprintf(stdout, "\nKairos %s - Select image type:\n", release.TagName)
-	fmt.Fprintln(stdout, "  [1] core     - Base OS only (no Kubernetes)")
-	fmt.Fprintln(stdout, "  [2] standard - Includes K3s Kubernetes")
-	fmt.Fprint(stdout, "Choice [1-2]: ")
+	_, _ = fmt.Fprintf(stdout, "\nKairos %s - Select image type:\n", release.TagName)
+	_, _ = fmt.Fprintln(stdout, "  [1] core     - Base OS only (no Kubernetes)")
+	_, _ = fmt.Fprintln(stdout, "  [2] standard - Includes K3s Kubernetes")
+	_, _ = fmt.Fprint(stdout, "Choice [1-2]: ")
 
 	reader := bufio.NewReader(stdin)
 	line, err := reader.ReadString('\n')
@@ -274,7 +274,7 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 			return nil, fmt.Errorf("no core ISO found")
 		}
 		selected := &coreOptions[0]
-		fmt.Fprintf(stdout, "\nSelected: %s\n", selected.Name)
+		_, _ = fmt.Fprintf(stdout, "\nSelected: %s\n", selected.Name)
 		return selected, nil
 	}
 
@@ -292,15 +292,15 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 		return nil, fmt.Errorf("no K3s versions found")
 	}
 
-	fmt.Fprintln(stdout, "\nSelect K3s version:")
+	_, _ = fmt.Fprintln(stdout, "\nSelect K3s version:")
 	for i, v := range k3sVersions {
 		label := v
 		if i == 0 {
 			label += " (latest)"
 		}
-		fmt.Fprintf(stdout, "  [%d] %s\n", i+1, label)
+		_, _ = fmt.Fprintf(stdout, "  [%d] %s\n", i+1, label)
 	}
-	fmt.Fprintf(stdout, "Choice [1-%d]: ", len(k3sVersions))
+	_, _ = fmt.Fprintf(stdout, "Choice [1-%d]: ", len(k3sVersions))
 
 	line, err = reader.ReadString('\n')
 	if err != nil {
@@ -317,6 +317,6 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 		return nil, fmt.Errorf("ISO not found for selected version")
 	}
 
-	fmt.Fprintf(stdout, "\nSelected: %s\n", selected.Name)
+	_, _ = fmt.Fprintf(stdout, "\nSelected: %s\n", selected.Name)
 	return selected, nil
 }

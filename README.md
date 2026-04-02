@@ -4,8 +4,9 @@
 
 It helps you:
 
-- prepare your machine (`setup`)
-- boot a Kairos ISO in a local VM (`start`)
+- download a Kairos ISO (`download`)
+- boot a Kairos VM with bridged networking (`start`)
+- manage multiple VM disks
 - inspect state (`status`)
 - clean VM artifacts (`reset`)
 - clean everything created by the tool (`cleanup`)
@@ -14,9 +15,11 @@ This project is intentionally an MVP for local experimentation, not production d
 
 ## Supported Platforms
 
-- Linux (primary workshop target)
-- macOS Apple Silicon (manual testing path)
-- Windows: not supported
+- macOS
+- Linux
+
+
+Windows is not supported, use your preferred virtualization software to spin up a Kairos VM e.g. VirtualBox. You might be able to run inside WSL but it's not recommended because without KVM support the experience will be terribly slow.
 
 ## Install / Build
 
@@ -26,120 +29,129 @@ go build -o kairos-lab ./cmd/kairos-lab
 
 ## Quick Start
 
-### 1) Setup dependencies
+### 1) Setup dependencies (optional)
 
 ```bash
 ./kairos-lab setup
 ```
 
-The command detects your package manager and checks required tools (`qemu`, and Linux bridge tools).
-If anything is missing, it asks before installing.
+Detects your package manager and installs required tools (`qemu`) if missing.
 
-### 2) Start a VM from local ISO
-
-```bash
-./kairos-lab start --iso /path/to/kairos.iso
-```
-
-### 3) Or start from URL
+### 2) Download a Kairos ISO
 
 ```bash
-./kairos-lab start --url https://example.org/kairos.iso
+./kairos-lab download
 ```
 
-Default disk size is `60G`.
+Interactive selection of:
+- Image type: `core` (base OS) or `standard` (with K3s)
+- K3s version (if standard)
+
+The ISO is saved to the cache directory and tracked for cleanup.
+
+### 3) Start a VM
+
+```bash
+./kairos-lab start
+```
+
+This will:
+- Create a new disk (named after the ISO + timestamp)
+- Boot the VM with the ISO attached
+- Use bridged networking (VM gets a LAN IP you can SSH to)
+- Open a graphical window
+
+**Exit the VM with `Ctrl-a x`**
+
+### 4) Boot an installed system
+
+After installing Kairos to the disk, start again:
+
+```bash
+./kairos-lab start
+```
+
+Select your existing disk - it will boot from disk without the ISO.
 
 ## Commands
 
-### `setup`
+### `download`
 
-- Detects OS/architecture and package manager
-- Checks dependencies
-- Installs missing dependencies only with confirmation
-- Records dependency provenance:
-  - pre-existing dependencies
-  - dependencies installed by `kairos-lab`
+Downloads a Kairos ISO with interactive selection:
+- Fetches latest release from GitHub
+- Filters by your architecture (amd64/arm64)
+- Prompts for core vs standard, K3s version
 
 ### `start`
 
-- Accepts exactly one source: `--iso` or `--url`
-- Creates/uses managed disk image under cache directory
-- Boots QEMU with workshop-oriented defaults
-- Default network mode: `bridged`
-- Default display mode: `serial` (use `window` to see tty1 graphical installer output)
-- Runs QEMU attached to your terminal so you can interact with the boot console
-- Stores runtime metadata (pid, args, disk/iso paths, log path)
+Boots a VM with sensible defaults:
+- **Display**: `window` (graphical) by default
+- **Network**: `bridged` by default (VM gets LAN IP)
+- **Disk**: Select existing or create new
 
-Useful flags:
-
-- `--network bridged|user` (default: `bridged`)
-- `--bridge-if <iface>` (macOS: host iface like `en0`; Linux: uplink iface like `eth0`)
-- `--display serial|window` (default: `serial`)
-- `--disk-size 60G`
-- `--memory 4096` / `--cpus 2`
-- `--yes` (auto-confirm prompts)
-
-Linux bridged behavior:
-
-- `setup` creates a managed Linux bridge/tap so guests can obtain LAN DHCP in bridged mode.
-- `start --network bridged` reuses and refreshes those network resources.
-- `cleanup` removes Linux bridged resources only if they were created by `kairos-lab`.
-- If NetworkManager is active, bridge/tap/uplink are managed through `nmcli`.
-
-### `stop`
-
-- Stops the tracked VM process if running
+Flags:
+- `-name <name>` - Use/create disk with specific name
+- `-new` - Force create new disk
+- `-no-iso` - Boot without ISO (installed system)
+- `-iso <path>` - Use specific ISO file
+- `-display serial|window` - Display mode (default: window)
+- `-network bridged|user` - Network mode (default: bridged)
+- `-disk-size 60G` - Disk size for new disks
+- `-memory 4096` / `-cpus 2` - VM resources
+- `-yes` - Auto-confirm prompts
 
 ### `status`
 
-Shows:
-
-- platform and package manager
-- dependencies present and provenance
-- managed files/directories
-- ISO source/path
-- VM status and pid
-- network mode/resources
+Shows current state:
+- Platform and dependencies
+- Downloaded ISOs
+- Disks and their associated ISOs
+- Network configuration
+- Running VM info
 
 ### `reset`
 
-- Removes VM artifacts created by tool:
-  - disk image
-  - downloaded ISO (if tool-managed)
-  - runtime metadata files
-- Keeps setup/dependency tracking
+Removes VM artifacts:
+- Disks (all or specific with `--disk <name>`)
+- Network configuration
+- Keeps downloaded ISOs and setup
 
 ### `cleanup`
 
-- Removes everything created by `kairos-lab`
-- Removes only dependencies installed by `kairos-lab`
-- Never removes dependencies that existed before setup
-- On Linux, removes bridged network resources only if created by `kairos-lab`
+Removes everything created by `kairos-lab`:
+- All disks and runtime files
+- Downloaded ISOs
+- Network configuration
+- Dependencies installed by the tool (not pre-existing ones)
 
-## Safety Model
+## Networking
 
-Cleanup is conservative and provenance-based.
+### macOS
 
-- The state file tracks what was pre-existing vs installed by the tool.
-- Managed file/dir paths are tracked explicitly.
-- Destructive operations only target tracked and safe paths.
-- If safe cleanup cannot be guaranteed, command fails with an explanation.
+Uses QEMU's `vmnet-bridged` mode. Requires sudo for QEMU to access vmnet.
 
-## State and Artifact Paths
+### Linux
+
+Requires **NetworkManager** for bridged networking. The tool:
+- Creates a bridge (`kairoslab0`) and tap device
+- Enslaves your physical interface to the bridge
+- VM gets DHCP from your LAN
+
+If NetworkManager is not available, use `--network user` for port-forwarded access (SSH via `localhost:2222`).
+
+## State and Paths
 
 By default:
+- Config/state: `$XDG_CONFIG_HOME/kairos-lab/` (or `~/.config/kairos-lab/`)
+- Cache/artifacts: `$XDG_CACHE_HOME/kairos-lab/` (or `~/.cache/kairos-lab/`)
 
-- state: `$XDG_CONFIG_HOME/kairos-lab/state.json`
-- artifacts: `$XDG_CACHE_HOME/kairos-lab/`
-
-You can override for testing:
-
+Override with environment variables:
 - `KAIROS_LAB_CONFIG_DIR`
 - `KAIROS_LAB_CACHE_DIR`
 
-## CI
+## Safety
 
-- Unit tests + build on Linux/macOS: `.github/workflows/ci.yml`
-- Linux E2E (manual, kvm runner): `.github/workflows/e2e.yml`
-
-E2E tests are tag-gated and not run by default.
+- Cleanup only removes what the tool created
+- Dependencies that existed before setup are never removed
+- Network cleanup restores original interface connection
+- Destructive operations require confirmation (use `-yes` to skip)
