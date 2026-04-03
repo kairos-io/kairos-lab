@@ -1,6 +1,12 @@
 # kairos-lab
 
-`kairos-lab` is a small Go CLI for a first-time local Kairos experience in workshops and quick testing.
+`kairos-lab` is a small Go CLI for a first-time local Kairos experience.
+
+This project is not meant to replace virtualization software like virt-manager or UTM. It's aimed at users who don't run virtualization software in their day-to-day and want to give Kairos a try.
+
+The second goal of this project is to help the Kairos team deliver workshops and keep the focus on topics related to Kairos, not on the glitches between different host operating systems or different virtualization software out there.
+
+After you've played with kairos-lab, whether you choose to continue your Kairos journey or not, you can run the `cleanup` command to remove any configuration, downloaded packages, or ISO images.
 
 It helps you:
 
@@ -10,8 +16,6 @@ It helps you:
 - inspect state (`status`)
 - clean VM artifacts (`reset`)
 - clean everything created by the tool (`cleanup`)
-
-This project is intentionally an MVP for local experimentation, not production deployment.
 
 ## Supported Platforms
 
