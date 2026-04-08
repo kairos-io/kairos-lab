@@ -80,6 +80,9 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	if IsLinuxBridge(uplink) {
 		return fmt.Errorf("uplink interface must be a physical host iface, got bridge: %s", uplink)
 	}
+	if isVirtualInterface(uplink) {
+		return fmt.Errorf("uplink interface must be a physical host iface, got virtual interface: %s (use -bridge-if to specify a physical interface like eth0, enp*, or wlan*)", uplink)
+	}
 
 	tap := st.Network.TapName
 	if tap == "" {
@@ -274,13 +277,37 @@ func detectDefaultUplink() (string, error) {
 		for i := 0; i < len(fields)-1; i++ {
 			if fields[i] == "dev" {
 				iface := fields[i+1]
-				if iface != "" && iface != "lo" && !IsLinuxBridge(iface) {
+				if iface != "" && iface != "lo" && !IsLinuxBridge(iface) && !isVirtualInterface(iface) {
 					return iface, nil
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges or loopback)")
+	return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges, virtual, or loopback)")
+}
+
+func isVirtualInterface(name string) bool {
+	virtualPrefixes := []string{
+		"docker",  // Docker default bridge
+		"br-",     // Docker custom networks
+		"veth",    // Virtual ethernet (container endpoints)
+		"virbr",   // libvirt bridges
+		"vnet",    // libvirt VM interfaces
+		"lxcbr",   // LXC bridges
+		"lxdbr",   // LXD bridges
+		"cni",     // Kubernetes CNI
+		"flannel", // Kubernetes flannel
+		"calico",  // Kubernetes calico
+		"weave",   // Kubernetes weave
+		"tunl",    // IPIP tunnels
+		"podman",  // Podman networks
+	}
+	for _, prefix := range virtualPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func networkManagerActive() bool {
