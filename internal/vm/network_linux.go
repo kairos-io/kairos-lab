@@ -289,17 +289,6 @@ func sudo(name string, args ...string) error {
 	return nil
 }
 
-// sudoQuiet runs a sudo command without showing output (for cleanup operations)
-func sudoQuiet(name string, args ...string) error {
-	argv := append([]string{name}, args...)
-	cmd := exec.Command("sudo", argv...)
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("sudo command failed: sudo %s: %w", strings.Join(argv, " "), err)
-	}
-	return nil
-}
-
 func IsPathGone(path string) bool {
 	_, err := os.Stat(path)
 	return errors.Is(err, os.ErrNotExist)
@@ -322,7 +311,7 @@ func detectDefaultUplink() (string, error) {
 }
 
 // DetectUplinkCandidates returns all valid physical interfaces from the default routes.
-// The list is ordered by route metric (lowest/best first).
+// The list preserves the order returned by `ip route show default` after filtering and de-duplication.
 func DetectUplinkCandidates() []string {
 	out, err := exec.Command("ip", "route", "show", "default").Output()
 	if err != nil {

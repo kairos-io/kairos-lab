@@ -4,6 +4,11 @@ package vm
 
 import "github.com/kairos-io/kairos-lab/internal/state"
 
+const (
+	DefaultBridgeName = "kairoslab0"
+	DefaultTapName    = "kairoslab-tap0"
+)
+
 func PrepareLinuxBridge(_ *state.State, _ string) error {
 	return nil
 }

@@ -343,14 +343,62 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		isoLocal = ""
 	}
 
-	// Show summary and confirm
-	writeLine(stdout, "")
-	writef(stdout, "Disk: %s\n", disk.Name)
-	if isoLocal != "" {
-		writef(stdout, "ISO:  %s\n", filepath.Base(isoLocal))
-	} else {
-		writeLine(stdout, "ISO:  (none - booting from disk)")
+	// Determine network interface for bridged mode
+	networkIface := *bridgeIface
+	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
+		candidates := vm.DetectUplinkCandidates()
+		if len(candidates) == 0 {
+			return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
+		} else if len(candidates) == 1 {
+			networkIface = candidates[0]
+		} else {
+			// Multiple candidates - will prompt in config review
+			networkIface = candidates[0] // default to first, user can change
+		}
 	}
+
+	// Build VM configuration
+	vmConfig := &vmStartConfig{
+		DiskName:    disk.Name,
+		DiskPath:    disk.Path,
+		DiskSize:    disk.Size,
+		ISOPath:     isoLocal,
+		MemoryMB:    *memory,
+		CPUs:        *cpus,
+		NetworkMode: *network,
+		NetworkIface: networkIface,
+		Display:     *display,
+	}
+
+	// Show configuration and allow editing
+	if !*autoYes {
+		var err error
+		vmConfig, err = reviewVMConfig(vmConfig, vmDir, stdin, stdout)
+		if err != nil {
+			return err
+		}
+		// Update values that may have changed
+		if vmConfig.DiskName != disk.Name {
+			// User changed disk name - need to rename or create new
+			newDisk, err := createNewDisk(st, vmDir, vmConfig.DiskName, vmConfig.DiskSize, stdout)
+			if err != nil {
+				return err
+			}
+			// Remove old disk file if it was just created
+			if disk.Path != newDisk.Path {
+				_ = os.Remove(disk.Path)
+				state.RemoveDisk(st, disk.Name)
+			}
+			disk = newDisk
+			disk.ISOName = filepath.Base(isoLocal)
+		}
+		*memory = vmConfig.MemoryMB
+		*cpus = vmConfig.CPUs
+		*network = vmConfig.NetworkMode
+		networkIface = vmConfig.NetworkIface
+		*display = vmConfig.Display
+	}
+
 	writeLine(stdout, "")
 	writeLine(stdout, "A VM will start and attach to this terminal.")
 	writeLine(stdout, "To exit the VM, press: Ctrl-a x")
@@ -369,32 +417,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[1/3] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
-		if *bridgeIface == "" {
-			// Auto-detect uplink interface, prompt if multiple candidates
-			candidates := vm.DetectUplinkCandidates()
-			if len(candidates) == 0 {
-				return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
-			} else if len(candidates) == 1 {
-				st.Network.BridgeInterface = candidates[0]
-			} else {
-				// Multiple candidates - let user choose
-				writeLine(stdout, "Multiple network interfaces detected:")
-				for i, iface := range candidates {
-					writef(stdout, "  %d) %s\n", i+1, iface)
-				}
-				choice, err := prompt(stdin, stdout, fmt.Sprintf("Select interface for bridged networking [1-%d]", len(candidates)))
-				if err != nil {
-					return err
-				}
-				idx := 0
-				if _, err := fmt.Sscanf(choice, "%d", &idx); err != nil || idx < 1 || idx > len(candidates) {
-					return fmt.Errorf("invalid selection: %s", choice)
-				}
-				st.Network.BridgeInterface = candidates[idx-1]
-			}
-		} else {
-			st.Network.BridgeInterface = *bridgeIface
-		}
+		st.Network.BridgeInterface = networkIface
 		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("bridged networking needs sudo to prepare bridge/tap (uplink: %s)", st.Network.BridgeInterface))
 		if err != nil {
 			return err
@@ -449,7 +472,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[2/3] Recording VM state")
 	st.Network.Mode = *network
-	st.Network.BridgeInterface = *bridgeIface
+	st.Network.BridgeInterface = networkIface
 	st.VM.ISOLocal = isoLocal
 	st.VM.DiskPath = disk.Path
 	st.VM.DiskName = disk.Name
@@ -857,14 +880,169 @@ func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, msg string) (bool,
 
 func prompt(stdin io.Reader, stdout io.Writer, msg string) (string, error) {
 	writef(stdout, "%s: ", msg)
-	var answer string
-	if _, err := fmt.Fscanln(stdin, &answer); err != nil {
-		if errors.Is(err, io.EOF) {
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) && line == "" {
 			return "", fmt.Errorf("no input")
+		} else if !errors.Is(err, io.EOF) {
+			return "", err
 		}
-		return "", err
 	}
-	return strings.TrimSpace(answer), nil
+	return strings.TrimSpace(line), nil
+}
+
+type vmStartConfig struct {
+	DiskName     string
+	DiskPath     string
+	DiskSize     string
+	ISOPath      string
+	MemoryMB     int
+	CPUs         int
+	NetworkMode  string
+	NetworkIface string
+	Display      string
+}
+
+func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io.Writer) (*vmStartConfig, error) {
+	for {
+		writeLine(stdout, "")
+		writeLine(stdout, "VM Configuration:")
+		writef(stdout, "  1) Disk name:    %s\n", cfg.DiskName)
+		writef(stdout, "  2) Disk path:    %s\n", cfg.DiskPath)
+		writef(stdout, "  3) Disk size:    %s\n", cfg.DiskSize)
+		if cfg.ISOPath != "" {
+			writef(stdout, "  4) ISO:          %s\n", filepath.Base(cfg.ISOPath))
+		} else {
+			writeLine(stdout, "  4) ISO:          (none - booting from disk)")
+		}
+		writef(stdout, "  5) Memory:       %d MB\n", cfg.MemoryMB)
+		writef(stdout, "  6) CPUs:         %d\n", cfg.CPUs)
+		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
+		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
+			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
+		}
+		writef(stdout, "  9) Display:      %s\n", cfg.Display)
+		writeLine(stdout, "")
+		writef(stdout, "Press Enter to continue, or enter a number to edit: ")
+
+		reader := bufio.NewReader(stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("cancelled")
+		}
+		line = strings.TrimSpace(line)
+
+		if line == "" {
+			return cfg, nil
+		}
+
+		choice := 0
+		if _, err := fmt.Sscanf(line, "%d", &choice); err != nil {
+			writeLine(stdout, "Invalid input, please enter a number or press Enter to continue")
+			continue
+		}
+
+		switch choice {
+		case 1:
+			val, err := prompt(stdin, stdout, "Enter new disk name")
+			if err != nil {
+				return nil, err
+			}
+			if val != "" {
+				cfg.DiskName = val
+				cfg.DiskPath = filepath.Join(vmDir, val+".qcow2")
+			}
+		case 2:
+			writeLine(stdout, "(Disk path is derived from disk name)")
+		case 3:
+			val, err := prompt(stdin, stdout, "Enter disk size (e.g., 60G, 100G)")
+			if err != nil {
+				return nil, err
+			}
+			if val != "" {
+				cfg.DiskSize = val
+			}
+		case 4:
+			writeLine(stdout, "(ISO cannot be changed here, use -iso flag)")
+		case 5:
+			val, err := prompt(stdin, stdout, "Enter memory in MB (e.g., 4096, 8192)")
+			if err != nil {
+				return nil, err
+			}
+			if val != "" {
+				var mb int
+				if _, err := fmt.Sscanf(val, "%d", &mb); err == nil && mb > 0 {
+					cfg.MemoryMB = mb
+				} else {
+					writeLine(stdout, "Invalid memory value")
+				}
+			}
+		case 6:
+			val, err := prompt(stdin, stdout, "Enter number of CPUs (e.g., 2, 4)")
+			if err != nil {
+				return nil, err
+			}
+			if val != "" {
+				var cpus int
+				if _, err := fmt.Sscanf(val, "%d", &cpus); err == nil && cpus > 0 {
+					cfg.CPUs = cpus
+				} else {
+					writeLine(stdout, "Invalid CPU value")
+				}
+			}
+		case 7:
+			val, err := prompt(stdin, stdout, "Enter network mode (bridged or user)")
+			if err != nil {
+				return nil, err
+			}
+			if val == "bridged" || val == "user" {
+				cfg.NetworkMode = val
+			} else if val != "" {
+				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
+			}
+		case 8:
+			if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
+				candidates := vm.DetectUplinkCandidates()
+				if len(candidates) > 1 {
+					writeLine(stdout, "Available interfaces:")
+					for i, iface := range candidates {
+						writef(stdout, "  %d) %s\n", i+1, iface)
+					}
+					val, err := prompt(stdin, stdout, fmt.Sprintf("Select interface [1-%d]", len(candidates)))
+					if err != nil {
+						return nil, err
+					}
+					var idx int
+					if _, err := fmt.Sscanf(val, "%d", &idx); err == nil && idx >= 1 && idx <= len(candidates) {
+						cfg.NetworkIface = candidates[idx-1]
+					} else {
+						writeLine(stdout, "Invalid selection")
+					}
+				} else {
+					val, err := prompt(stdin, stdout, "Enter interface name")
+					if err != nil {
+						return nil, err
+					}
+					if val != "" {
+						cfg.NetworkIface = val
+					}
+				}
+			}
+		case 9:
+			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
+			if err != nil {
+				return nil, err
+			}
+			if val == "window" || val == "serial" {
+				cfg.Display = val
+			} else if val != "" {
+				writeLine(stdout, "Invalid display mode, use 'window' or 'serial'")
+			}
+		default:
+			writeLine(stdout, "Invalid option")
+		}
+	}
 }
 
 func depNames(ds []deps.Dependency) []string {
