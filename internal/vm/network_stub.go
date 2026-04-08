@@ -15,3 +15,15 @@ func CleanupLinuxBridge(_ *state.State) error {
 func IsLinuxBridge(_ string) bool {
 	return false
 }
+
+func HasStaleNetworkResources(_ *state.State) bool {
+	return false
+}
+
+func CleanupStaleNetworkResources(_ *state.State) error {
+	return nil
+}
+
+func DetectUplinkCandidates() []string {
+	return nil
+}

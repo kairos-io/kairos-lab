@@ -36,22 +36,8 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	// Check for stale bridge from previous run
 	if IsLinuxBridge(bridge) || nmConnectionExists(bridge) {
 		fmt.Println("Found stale network configuration, cleaning up...")
-		
-		// First, find the physical interface that's enslaved to the bridge
-		uplinkIface := findBridgeSlave(bridge)
-		
-		// Delete our NM connections
 		_ = cleanupNMConnections(bridge)
-		
-		// If we found an enslaved interface, reconnect it
-		if uplinkIface != "" {
-			fmt.Printf("Reconnecting %s...\n", uplinkIface)
-			// Try to bring up the device - NM will auto-connect or we trigger DHCP
-			_ = sudo("nmcli", "device", "connect", uplinkIface)
-			time.Sleep(3 * time.Second)
-		} else {
-			time.Sleep(2 * time.Second)
-		}
+		time.Sleep(2 * time.Second)
 	}
 
 	uplink := st.Network.BridgeInterface
@@ -180,17 +166,78 @@ func CleanupLinuxBridge(st *state.State) error {
 	return nil
 }
 
+// HasStaleNetworkResources checks if there are kairos-lab network resources
+// that exist but aren't tracked in state (e.g., from a failed setup).
+func HasStaleNetworkResources(st *state.State) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if st.Network.CreatedByKairosLab {
+		return false
+	}
+	bridge := st.Network.BridgeName
+	if bridge == "" {
+		bridge = DefaultBridgeName
+	}
+	return IsLinuxBridge(bridge) || nmConnectionExists(bridge) ||
+		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap")
+}
+
+// CleanupStaleNetworkResources removes kairos-lab network resources that aren't
+// tracked in state, typically from a failed or interrupted setup.
+func CleanupStaleNetworkResources(st *state.State) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	bridge := st.Network.BridgeName
+	if bridge == "" {
+		bridge = DefaultBridgeName
+	}
+	return cleanupNMConnections(bridge)
+}
+
 func cleanupNMConnections(bridgeConn string) error {
 	uplinkConn := bridgeConn + "-uplink"
 	tapConn := bridgeConn + "-tap"
+	tap := DefaultTapName
 
-	// Delete all connections with these names (there might be duplicates)
+	// Find the physical interface enslaved to the bridge before we delete anything
+	var uplinkIface string
+	if IsLinuxBridge(bridgeConn) {
+		uplinkIface = findBridgeSlave(bridgeConn)
+	}
+
+	// Delete all NM connections - use sudo (not sudoQuiet) so user can see
+	// what's happening and errors are visible
 	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
-		// Keep deleting while connection exists
-		for nmConnectionExists(conn) {
-			_ = sudoQuiet("nmcli", "connection", "delete", conn)
+		if nmConnectionExists(conn) {
+			if err := sudo("nmcli", "connection", "delete", conn); err != nil {
+				fmt.Printf("warning: failed to delete connection %s: %v\n", conn, err)
+			}
 		}
 	}
+
+	// Now clean up any lingering interfaces that NM didn't remove
+	if linkExists(tap) {
+		if err := sudo("ip", "link", "delete", tap); err != nil {
+			fmt.Printf("warning: failed to delete interface %s: %v\n", tap, err)
+		}
+	}
+	if linkExists(bridgeConn) {
+		if err := sudo("ip", "link", "delete", bridgeConn); err != nil {
+			fmt.Printf("warning: failed to delete interface %s: %v\n", bridgeConn, err)
+		}
+	}
+
+	// Reconnect the physical interface (NM connections are gone, so this
+	// will use a fresh/default connection, not the bridge slave profile)
+	if uplinkIface != "" {
+		fmt.Printf("Reconnecting %s...\n", uplinkIface)
+		if err := sudo("nmcli", "device", "connect", uplinkIface); err != nil {
+			fmt.Printf("warning: failed to reconnect %s: %v\n", uplinkIface, err)
+		}
+	}
+
 	return nil
 }
 
@@ -267,23 +314,36 @@ func IsLinuxBridge(name string) bool {
 }
 
 func detectDefaultUplink() (string, error) {
+	candidates := DetectUplinkCandidates()
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges, virtual, or loopback)")
+	}
+	return candidates[0], nil
+}
+
+// DetectUplinkCandidates returns all valid physical interfaces from the default routes.
+// The list is ordered by route metric (lowest/best first).
+func DetectUplinkCandidates() []string {
 	out, err := exec.Command("ip", "route", "show", "default").Output()
 	if err != nil {
-		return "", fmt.Errorf("detect default uplink: %w", err)
+		return nil
 	}
+	seen := make(map[string]bool)
+	var candidates []string
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	for _, line := range lines {
 		fields := strings.Fields(line)
 		for i := 0; i < len(fields)-1; i++ {
 			if fields[i] == "dev" {
 				iface := fields[i+1]
-				if iface != "" && iface != "lo" && !IsLinuxBridge(iface) && !isVirtualInterface(iface) {
-					return iface, nil
+				if iface != "" && iface != "lo" && !IsLinuxBridge(iface) && !isVirtualInterface(iface) && !seen[iface] {
+					seen[iface] = true
+					candidates = append(candidates, iface)
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges, virtual, or loopback)")
+	return candidates
 }
 
 func isVirtualInterface(name string) bool {

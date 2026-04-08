@@ -369,10 +369,33 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[1/3] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "linux" {
-		if *bridgeIface != "" {
+		if *bridgeIface == "" {
+			// Auto-detect uplink interface, prompt if multiple candidates
+			candidates := vm.DetectUplinkCandidates()
+			if len(candidates) == 0 {
+				return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
+			} else if len(candidates) == 1 {
+				st.Network.BridgeInterface = candidates[0]
+			} else {
+				// Multiple candidates - let user choose
+				writeLine(stdout, "Multiple network interfaces detected:")
+				for i, iface := range candidates {
+					writef(stdout, "  %d) %s\n", i+1, iface)
+				}
+				choice, err := prompt(stdin, stdout, fmt.Sprintf("Select interface for bridged networking [1-%d]", len(candidates)))
+				if err != nil {
+					return err
+				}
+				idx := 0
+				if _, err := fmt.Sscanf(choice, "%d", &idx); err != nil || idx < 1 || idx > len(candidates) {
+					return fmt.Errorf("invalid selection: %s", choice)
+				}
+				st.Network.BridgeInterface = candidates[idx-1]
+			}
+		} else {
 			st.Network.BridgeInterface = *bridgeIface
 		}
-		ok, err := confirm(stdin, stdout, *autoYes, "bridged networking needs sudo to prepare bridge/tap")
+		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf("bridged networking needs sudo to prepare bridge/tap (uplink: %s)", st.Network.BridgeInterface))
 		if err != nil {
 			return err
 		}
@@ -602,8 +625,17 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 	}
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
+	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Will clean up bridged network")
+		printList(stdout, "Will clean up network resources", []string{
+			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+		})
+	} else if hasStaleNetwork {
+		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
+			"bridge: " + vm.DefaultBridgeName,
+			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+		})
 	}
 
 	if *dryRun {
@@ -636,6 +668,11 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		}
+	} else if hasStaleNetwork {
+		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		if err := vm.CleanupStaleNetworkResources(st); err != nil {
+			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 		}
 	}
 
@@ -689,8 +726,17 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
+	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Will clean up bridged network")
+		printList(stdout, "Will clean up network resources", []string{
+			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+		})
+	} else if hasStaleNetwork {
+		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
+			"bridge: " + vm.DefaultBridgeName,
+			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+		})
 	}
 
 	if *dryRun {
@@ -715,6 +761,11 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		writeLine(stdout, "Cleaning up bridged network...")
 		if err := vm.CleanupLinuxBridge(st); err != nil {
 			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		}
+	} else if hasStaleNetwork {
+		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		if err := vm.CleanupStaleNetworkResources(st); err != nil {
+			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 		}
 	}
 
@@ -788,11 +839,11 @@ func writef(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
 }
 
-func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, prompt string) (bool, error) {
+func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, msg string) (bool, error) {
 	if autoYes {
 		return true, nil
 	}
-	writef(stdout, "%s [y/N]: ", prompt)
+	writef(stdout, "%s [y/N]: ", msg)
 	var answer string
 	if _, err := fmt.Fscanln(stdin, &answer); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -802,6 +853,18 @@ func confirm(stdin io.Reader, stdout io.Writer, autoYes bool, prompt string) (bo
 	}
 	answer = strings.ToLower(strings.TrimSpace(answer))
 	return answer == "y" || answer == "yes", nil
+}
+
+func prompt(stdin io.Reader, stdout io.Writer, msg string) (string, error) {
+	writef(stdout, "%s: ", msg)
+	var answer string
+	if _, err := fmt.Fscanln(stdin, &answer); err != nil {
+		if errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("no input")
+		}
+		return "", err
+	}
+	return strings.TrimSpace(answer), nil
 }
 
 func depNames(ds []deps.Dependency) []string {
@@ -949,6 +1012,13 @@ func joinOrNone(values []string) string {
 func emptyAsNone(v string) string {
 	if v == "" {
 		return "none"
+	}
+	return v
+}
+
+func nonEmpty(v, fallback string) string {
+	if v == "" {
+		return fallback
 	}
 	return v
 }
