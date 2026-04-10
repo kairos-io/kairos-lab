@@ -176,6 +176,23 @@ func createNewDisk(st *state.State, vmDir, name, size string, stdout io.Writer) 
 
 // selectOrCreateDisk prompts user to select existing disk or create new one
 // Returns: disk, isoPath (only if new disk created), error
+func promptDiskName(suggestedName string, stdin io.Reader, stdout io.Writer) (string, error) {
+	writeLine(stdout, "")
+	writef(stdout, "Suggested disk name: %s\n", suggestedName)
+	writef(stdout, "Press Enter to accept, or type a new name: ")
+
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("cancelled")
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return suggestedName, nil
+	}
+	return line, nil
+}
+
 func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, stdin io.Reader, stdout io.Writer) (*state.Disk, string, error) {
 	if len(st.Disks) == 0 {
 		return nil, "", fmt.Errorf("no disks found")
@@ -214,8 +231,12 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 		}
 		isoLocal := res.LocalPath
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
-		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		disk, err := createNewDisk(st, vmDir, generatedName, diskSize, stdout)
+		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		diskName, err := promptDiskName(suggestedName, stdin, stdout)
+		if err != nil {
+			return nil, "", err
+		}
+		disk, err := createNewDisk(st, vmDir, diskName, diskSize, stdout)
 		if err != nil {
 			return nil, "", err
 		}
@@ -321,10 +342,18 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			isoLocal = res.LocalPath
 		}
 
-		// Generate disk name from ISO
+		// Generate disk name from ISO and let user customize
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
-		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		disk, err = createNewDisk(st, vmDir, generatedName, *diskSize, stdout)
+		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		finalName := suggestedName
+		if !*autoYes {
+			var err error
+			finalName, err = promptDiskName(suggestedName, stdin, stdout)
+			if err != nil {
+				return err
+			}
+		}
+		disk, err = createNewDisk(st, vmDir, finalName, *diskSize, stdout)
 		if err != nil {
 			return err
 		}
@@ -370,27 +399,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		Display:     *display,
 	}
 
-	// Show configuration and allow editing
+	// Show configuration and allow editing runtime settings
 	if !*autoYes {
 		var err error
-		vmConfig, err = reviewVMConfig(vmConfig, vmDir, stdin, stdout)
+		vmConfig, err = reviewVMConfig(vmConfig, stdin, stdout)
 		if err != nil {
 			return err
-		}
-		// Update values that may have changed
-		if vmConfig.DiskName != disk.Name {
-			// User changed disk name - need to rename or create new
-			newDisk, err := createNewDisk(st, vmDir, vmConfig.DiskName, vmConfig.DiskSize, stdout)
-			if err != nil {
-				return err
-			}
-			// Remove old disk file if it was just created
-			if disk.Path != newDisk.Path {
-				_ = os.Remove(disk.Path)
-				state.RemoveDisk(st, disk.Name)
-			}
-			disk = newDisk
-			disk.ISOName = filepath.Base(isoLocal)
 		}
 		*memory = vmConfig.MemoryMB
 		*cpus = vmConfig.CPUs
@@ -904,25 +918,25 @@ type vmStartConfig struct {
 	Display      string
 }
 
-func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io.Writer) (*vmStartConfig, error) {
+func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmStartConfig, error) {
 	for {
 		writeLine(stdout, "")
 		writeLine(stdout, "VM Configuration:")
-		writef(stdout, "  1) Disk name:    %s\n", cfg.DiskName)
-		writef(stdout, "  2) Disk path:    %s\n", cfg.DiskPath)
-		writef(stdout, "  3) Disk size:    %s\n", cfg.DiskSize)
+		writef(stdout, "     Disk:         %s\n", cfg.DiskName)
+		writef(stdout, "     Disk path:    %s\n", cfg.DiskPath)
+		writef(stdout, "     Disk size:    %s\n", cfg.DiskSize)
 		if cfg.ISOPath != "" {
-			writef(stdout, "  4) ISO:          %s\n", filepath.Base(cfg.ISOPath))
+			writef(stdout, "     ISO:          %s\n", filepath.Base(cfg.ISOPath))
 		} else {
-			writeLine(stdout, "  4) ISO:          (none - booting from disk)")
+			writeLine(stdout, "     ISO:          (none - booting from disk)")
 		}
-		writef(stdout, "  5) Memory:       %d MB\n", cfg.MemoryMB)
-		writef(stdout, "  6) CPUs:         %d\n", cfg.CPUs)
-		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
+		writef(stdout, "  1) Memory:       %d MB\n", cfg.MemoryMB)
+		writef(stdout, "  2) CPUs:         %d\n", cfg.CPUs)
+		writef(stdout, "  3) Network:      %s\n", cfg.NetworkMode)
 		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
-			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
+			writef(stdout, "  4) Net interface: %s\n", cfg.NetworkIface)
 		}
-		writef(stdout, "  9) Display:      %s\n", cfg.Display)
+		writef(stdout, "  5) Display:      %s\n", cfg.Display)
 		writeLine(stdout, "")
 		writef(stdout, "Press Enter to continue, or enter a number to edit: ")
 
@@ -945,27 +959,6 @@ func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io
 
 		switch choice {
 		case 1:
-			val, err := prompt(stdin, stdout, "Enter new disk name")
-			if err != nil {
-				return nil, err
-			}
-			if val != "" {
-				cfg.DiskName = val
-				cfg.DiskPath = filepath.Join(vmDir, val+".qcow2")
-			}
-		case 2:
-			writeLine(stdout, "(Disk path is derived from disk name)")
-		case 3:
-			val, err := prompt(stdin, stdout, "Enter disk size (e.g., 60G, 100G)")
-			if err != nil {
-				return nil, err
-			}
-			if val != "" {
-				cfg.DiskSize = val
-			}
-		case 4:
-			writeLine(stdout, "(ISO cannot be changed here, use -iso flag)")
-		case 5:
 			val, err := prompt(stdin, stdout, "Enter memory in MB (e.g., 4096, 8192)")
 			if err != nil {
 				return nil, err
@@ -978,7 +971,7 @@ func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io
 					writeLine(stdout, "Invalid memory value")
 				}
 			}
-		case 6:
+		case 2:
 			val, err := prompt(stdin, stdout, "Enter number of CPUs (e.g., 2, 4)")
 			if err != nil {
 				return nil, err
@@ -991,7 +984,7 @@ func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io
 					writeLine(stdout, "Invalid CPU value")
 				}
 			}
-		case 7:
+		case 3:
 			val, err := prompt(stdin, stdout, "Enter network mode (bridged or user)")
 			if err != nil {
 				return nil, err
@@ -1001,7 +994,7 @@ func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io
 			} else if val != "" {
 				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
 			}
-		case 8:
+		case 4:
 			if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
 				candidates := vm.DetectUplinkCandidates()
 				if len(candidates) > 1 {
@@ -1028,8 +1021,10 @@ func reviewVMConfig(cfg *vmStartConfig, vmDir string, stdin io.Reader, stdout io
 						cfg.NetworkIface = val
 					}
 				}
+			} else {
+				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux)")
 			}
-		case 9:
+		case 5:
 			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
 			if err != nil {
 				return nil, err
