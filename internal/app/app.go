@@ -176,6 +176,23 @@ func createNewDisk(st *state.State, vmDir, name, size string, stdout io.Writer) 
 
 // selectOrCreateDisk prompts user to select existing disk or create new one
 // Returns: disk, isoPath (only if new disk created), error
+func promptDiskName(suggestedName string, stdin io.Reader, stdout io.Writer) (string, error) {
+	writeLine(stdout, "")
+	writef(stdout, "Suggested disk name: %s\n", suggestedName)
+	writef(stdout, "Press Enter to accept, or type a new name: ")
+
+	reader := bufio.NewReader(stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("cancelled")
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return suggestedName, nil
+	}
+	return line, nil
+}
+
 func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, stdin io.Reader, stdout io.Writer) (*state.Disk, string, error) {
 	if len(st.Disks) == 0 {
 		return nil, "", fmt.Errorf("no disks found")
@@ -214,8 +231,12 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 		}
 		isoLocal := res.LocalPath
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
-		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		disk, err := createNewDisk(st, vmDir, generatedName, diskSize, stdout)
+		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		diskName, err := promptDiskName(suggestedName, stdin, stdout)
+		if err != nil {
+			return nil, "", err
+		}
+		disk, err := createNewDisk(st, vmDir, diskName, diskSize, stdout)
 		if err != nil {
 			return nil, "", err
 		}
@@ -321,10 +342,18 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			isoLocal = res.LocalPath
 		}
 
-		// Generate disk name from ISO
+		// Generate disk name from ISO and let user customize
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
-		generatedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		disk, err = createNewDisk(st, vmDir, generatedName, *diskSize, stdout)
+		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
+		finalName := suggestedName
+		if !*autoYes {
+			var err error
+			finalName, err = promptDiskName(suggestedName, stdin, stdout)
+			if err != nil {
+				return err
+			}
+		}
+		disk, err = createNewDisk(st, vmDir, finalName, *diskSize, stdout)
 		if err != nil {
 			return err
 		}
