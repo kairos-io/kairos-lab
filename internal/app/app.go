@@ -156,8 +156,23 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	return nil
 }
 
+// validDiskName returns an error if name contains path separators or other
+// characters that would allow it to escape the vm directory when used as a filename.
+func validDiskName(name string) error {
+	if name == "" {
+		return fmt.Errorf("disk name must not be empty")
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("disk name must not contain path separators")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("disk name %q is not allowed", name)
+	}
+	return nil
+}
+
 // promptDiskName asks the user to confirm or replace suggestedName, re-prompting
-// if the chosen name is already in takenNames.
+// if the chosen name is already in takenNames or contains unsafe characters.
 func promptDiskName(suggestedName string, takenNames map[string]struct{}, stdin io.Reader, stdout io.Writer) (string, error) {
 	writeLine(stdout, "")
 	writef(stdout, "Suggested disk name: %s\n", suggestedName)
@@ -172,6 +187,10 @@ func promptDiskName(suggestedName string, takenNames map[string]struct{}, stdin 
 		name := strings.TrimSpace(line)
 		if name == "" {
 			name = suggestedName
+		}
+		if err := validDiskName(name); err != nil {
+			writef(stdout, "Invalid name: %v\n", err)
+			continue
 		}
 		if _, taken := takenNames[name]; taken {
 			writef(stdout, "A disk named %q already exists, choose a different name.\n", name)
@@ -411,22 +430,40 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	// Materialize disk — done after review so the config is final.
 	if isNewDisk {
+		// Validate the final disk path stays within vmDir before touching the filesystem.
+		absVMDir, err := filepath.Abs(vmDir)
+		if err != nil {
+			return fmt.Errorf("resolve vm directory: %w", err)
+		}
+		absDiskPath, err := filepath.Abs(vmConfig.DiskPath)
+		if err != nil {
+			return fmt.Errorf("resolve disk path: %w", err)
+		}
+		rel, err := filepath.Rel(absVMDir, absDiskPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("disk path %q must be within vm directory %q", vmConfig.DiskPath, vmDir)
+		}
+
 		writef(stdout, "Creating disk: %s (%s)\n", vmConfig.DiskName, vmConfig.DiskSize)
 		// Remove any stale file from a previous abandoned attempt so that the
 		// user-chosen size is always honoured (EnsureDisk is a no-op when the
 		// file already exists).
-		if err := os.Remove(vmConfig.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(absDiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove stale disk image: %w", err)
 		}
-		if err := vm.EnsureDisk(vmConfig.DiskPath, vmConfig.DiskSize); err != nil {
+		if err := vm.EnsureDisk(absDiskPath, vmConfig.DiskSize); err != nil {
 			return err
+		}
+		isoName := ""
+		if isoLocal != "" {
+			isoName = filepath.Base(isoLocal)
 		}
 		newDisk := state.Disk{
 			Name:      vmConfig.DiskName,
-			Path:      vmConfig.DiskPath,
+			Path:      absDiskPath,
 			CreatedAt: state.NowRFC3339(),
 			Size:      vmConfig.DiskSize,
-			ISOName:   filepath.Base(isoLocal),
+			ISOName:   isoName,
 		}
 		state.AddDisk(st, newDisk)
 		state.AddManagedFile(st, vmConfig.DiskPath)
@@ -958,14 +995,16 @@ type vmStartConfig struct {
 }
 
 func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmStartConfig, error) {
+	// systemRAMGB never changes during a session — compute once outside the loop.
+	ramGB := systemRAMGB()
+	ramHint := ""
+	if ramGB > 0 {
+		ramHint = fmt.Sprintf("  (%d GB available)", ramGB)
+	}
+
 	for {
 		writeLine(stdout, "")
-		ramGB := systemRAMGB()
 		diskFreeGB := freeSpaceGB(filepath.Dir(cfg.DiskPath))
-		ramHint := ""
-		if ramGB > 0 {
-			ramHint = fmt.Sprintf("  (%d GB available)", ramGB)
-		}
 		diskHint := ""
 		if diskFreeGB > 0 {
 			diskHint = fmt.Sprintf("  (%d GB free)", diskFreeGB)
@@ -984,6 +1023,8 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
 		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
 			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
+		} else {
+			writeLine(stdout, "  8) Net interface: (n/a)")
 		}
 		writef(stdout, "  9) Display:      %s\n", cfg.Display)
 		writeLine(stdout, "")
@@ -1017,6 +1058,10 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				return nil, err
 			}
 			if val != "" {
+				if err := validDiskName(val); err != nil {
+					writef(stdout, "Invalid name: %v\n", err)
+					break
+				}
 				if _, taken := cfg.TakenNames[val]; taken {
 					writef(stdout, "A disk named %q already exists, choose a different name.\n", val)
 					break
@@ -1072,7 +1117,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			writeLine(stdout, "")
 			selectedISO, err := iso.SelectOrDownloadISO(cfg.DownloadsDir, stdin, stdout)
 			if err != nil {
-				writef(stdout, "ISO selection cancelled: %v\n", err)
+				writef(stdout, "ISO selection failed: %v\n", err)
 			} else {
 				cfg.ISOPath = selectedISO
 			}
