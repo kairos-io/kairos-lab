@@ -111,6 +111,54 @@ func SelectDownloaded(cfg SelectConfig) (string, error) {
 	return isos[idx-1], nil
 }
 
+// SelectOrDownloadISO lets the user pick from existing downloaded ISOs or download a new one.
+func SelectOrDownloadISO(downloadsDir string, stdin io.Reader, stdout io.Writer) (string, error) {
+	isos, err := ListDownloaded(downloadsDir)
+	if err != nil {
+		return "", err
+	}
+
+	reader := bufio.NewReader(stdin)
+
+	if len(isos) > 0 {
+		_, _ = fmt.Fprintln(stdout, "Available ISOs:")
+		for i, iso := range isos {
+			_, _ = fmt.Fprintf(stdout, "  [%d] %s\n", i+1, filepath.Base(iso))
+		}
+		_, _ = fmt.Fprintln(stdout, "  [n] Download new ISO")
+		_, _ = fmt.Fprintf(stdout, "Choice [1-%d or n]: ", len(isos))
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("cancelled")
+		}
+		choice := strings.TrimSpace(strings.ToLower(line))
+
+		if choice != "n" && choice != "new" {
+			idx, err := strconv.Atoi(choice)
+			if err != nil || idx < 1 || idx > len(isos) {
+				return "", fmt.Errorf("invalid choice: %s", choice)
+			}
+			return isos[idx-1], nil
+		}
+	}
+
+	// Download new ISO
+	if err := os.MkdirAll(downloadsDir, 0o755); err != nil {
+		return "", fmt.Errorf("create downloads directory: %w", err)
+	}
+	selected, err := interactivePicker(stdin, stdout)
+	if err != nil {
+		return "", err
+	}
+	localPath, err := downloadISO(selected.DownloadURL, downloadsDir, stdout)
+	if err != nil {
+		return "", err
+	}
+	_, _ = fmt.Fprintf(stdout, "\nISO saved to: %s\n", localPath)
+	return localPath, nil
+}
+
 // ResolveForStart resolves an ISO for starting a VM
 // If localPath is provided, uses that. Otherwise selects from downloaded ISOs.
 func ResolveForStart(localPath, downloadsDir string, stdin io.Reader, stdout io.Writer) (*Result, error) {

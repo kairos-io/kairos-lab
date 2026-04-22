@@ -156,46 +156,36 @@ func runDownload(args []string, stdin io.Reader, stdout io.Writer, store *state.
 	return nil
 }
 
-func createNewDisk(st *state.State, vmDir, name, size string, stdout io.Writer) (*state.Disk, error) {
-	diskPath := filepath.Join(vmDir, name+".qcow2")
-	writef(stdout, "Creating disk: %s (%s)\n", name, size)
-	if err := vm.EnsureDisk(diskPath, size); err != nil {
-		return nil, err
-	}
-
-	disk := state.Disk{
-		Name:      name,
-		Path:      diskPath,
-		CreatedAt: state.NowRFC3339(),
-		Size:      size,
-	}
-	state.AddDisk(st, disk)
-	state.AddManagedFile(st, diskPath)
-	return &disk, nil
-}
-
-// selectOrCreateDisk prompts user to select existing disk or create new one
-// Returns: disk, isoPath (only if new disk created), error
-func promptDiskName(suggestedName string, stdin io.Reader, stdout io.Writer) (string, error) {
+// promptDiskName asks the user to confirm or replace suggestedName, re-prompting
+// if the chosen name is already in takenNames.
+func promptDiskName(suggestedName string, takenNames map[string]struct{}, stdin io.Reader, stdout io.Writer) (string, error) {
 	writeLine(stdout, "")
 	writef(stdout, "Suggested disk name: %s\n", suggestedName)
-	writef(stdout, "Press Enter to accept, or type a new name: ")
 
 	reader := bufio.NewReader(stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("cancelled")
+	for {
+		writef(stdout, "Press Enter to accept, or type a new name: ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return "", fmt.Errorf("cancelled")
+		}
+		name := strings.TrimSpace(line)
+		if name == "" {
+			name = suggestedName
+		}
+		if _, taken := takenNames[name]; taken {
+			writef(stdout, "A disk named %q already exists, choose a different name.\n", name)
+			continue
+		}
+		return name, nil
 	}
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return suggestedName, nil
-	}
-	return line, nil
 }
 
-func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, stdin io.Reader, stdout io.Writer) (*state.Disk, string, error) {
+// selectOrCreateDisk prompts the user to pick an existing disk or configure a new one.
+// For new disks it returns a pending Disk struct (isNew=true) without creating any file.
+func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, stdin io.Reader, stdout io.Writer) (disk *state.Disk, isoLocal string, isNew bool, err error) {
 	if len(st.Disks) == 0 {
-		return nil, "", fmt.Errorf("no disks found")
+		return nil, "", false, fmt.Errorf("no disks found")
 	}
 
 	writeLine(stdout, "Existing disks:")
@@ -217,40 +207,38 @@ func selectOrCreateDisk(st *state.State, vmDir, downloadsDir, diskSize string, s
 	reader := bufio.NewReader(stdin)
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return nil, "", fmt.Errorf("cancelled")
+		return nil, "", false, fmt.Errorf("cancelled")
 	}
 
 	choice := strings.TrimSpace(strings.ToLower(line))
 
 	if choice == "n" || choice == "new" {
-		// User wants new disk - need to select ISO first
 		writeLine(stdout, "")
 		res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		isoLocal := res.LocalPath
-		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
+		isoPath := res.LocalPath
+		isoBaseName := strings.TrimSuffix(filepath.Base(isoPath), ".iso")
 		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
-		diskName, err := promptDiskName(suggestedName, stdin, stdout)
+		diskName, err := promptDiskName(suggestedName, diskNameSet(st), stdin, stdout)
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		disk, err := createNewDisk(st, vmDir, diskName, diskSize, stdout)
-		if err != nil {
-			return nil, "", err
+		pending := &state.Disk{
+			Name: diskName,
+			Path: filepath.Join(vmDir, diskName+".qcow2"),
+			Size: diskSize,
 		}
-		disk.ISOName = filepath.Base(isoLocal)
-		return disk, isoLocal, nil
+		return pending, isoPath, true, nil
 	}
 
 	idx, err := strconv.Atoi(choice)
 	if err != nil || idx < 1 || idx > len(st.Disks) {
-		return nil, "", fmt.Errorf("invalid choice: %s", choice)
+		return nil, "", false, fmt.Errorf("invalid choice: %s", choice)
 	}
 
-	// Existing disk selected - no ISO needed
-	return &st.Disks[idx-1], "", nil
+	return &st.Disks[idx-1], "", false, nil
 }
 
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
@@ -260,7 +248,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	diskSize := fs.String("disk-size", "60G", "disk image size for new disks")
 	newDisk := fs.Bool("new", false, "create a new disk (even if others exist)")
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
-	memory := fs.Int("memory", defaultMemoryMB(), "memory in MB")
+	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
 	network := fs.String("network", "bridged", "network mode: bridged|user")
 	display := fs.String("display", "window", "display mode: window|serial")
@@ -302,8 +290,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	state.AddManagedDir(st, downloadsDir)
 
 	// Resolve disk and ISO
+	// New disks are not created yet — a pending Disk struct is built and the file
+	// is only written to disk after the user confirms the full configuration.
 	var disk *state.Disk
 	var isoLocal string
+	var isNewDisk bool
 
 	// Handle explicit -iso flag
 	if *isoPath != "" {
@@ -315,10 +306,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	if *diskName != "" {
-		// User specified a disk name
 		disk = state.FindDiskByName(st, *diskName)
 		if disk == nil {
-			// Create new disk with this name - needs ISO
+			// Named disk doesn't exist yet — build a pending struct
 			if isoLocal == "" {
 				res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
 				if err != nil {
@@ -326,14 +316,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 				}
 				isoLocal = res.LocalPath
 			}
-			disk, err = createNewDisk(st, vmDir, *diskName, *diskSize, stdout)
-			if err != nil {
-				return err
+			pending := state.Disk{
+				Name: *diskName,
+				Path: filepath.Join(vmDir, *diskName+".qcow2"),
+				Size: *diskSize,
 			}
-			disk.ISOName = filepath.Base(isoLocal)
+			disk = &pending
+			isNewDisk = true
 		}
 	} else if *newDisk || len(st.Disks) == 0 {
-		// Create new disk (forced or no disks exist) - needs ISO
+		// New disk (forced or no disks exist) — build a pending struct
 		if isoLocal == "" {
 			res, err := iso.ResolveForStart("", downloadsDir, stdin, stdout)
 			if err != nil {
@@ -341,27 +333,27 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			}
 			isoLocal = res.LocalPath
 		}
-
-		// Generate disk name from ISO and let user customize
 		isoBaseName := strings.TrimSuffix(filepath.Base(isoLocal), ".iso")
 		suggestedName := fmt.Sprintf("%s-%s", isoBaseName, state.NowTimestamp())
 		finalName := suggestedName
 		if !*autoYes {
 			var err error
-			finalName, err = promptDiskName(suggestedName, stdin, stdout)
+			finalName, err = promptDiskName(suggestedName, diskNameSet(st), stdin, stdout)
 			if err != nil {
 				return err
 			}
 		}
-		disk, err = createNewDisk(st, vmDir, finalName, *diskSize, stdout)
-		if err != nil {
-			return err
+		pending := state.Disk{
+			Name: finalName,
+			Path: filepath.Join(vmDir, finalName+".qcow2"),
+			Size: *diskSize,
 		}
-		disk.ISOName = filepath.Base(isoLocal)
+		disk = &pending
+		isNewDisk = true
 	} else {
-		// Existing disks available - ask what to do
+		// Existing disks available — ask what to do
 		var err error
-		disk, isoLocal, err = selectOrCreateDisk(st, vmDir, downloadsDir, *diskSize, stdin, stdout)
+		disk, isoLocal, isNewDisk, err = selectOrCreateDisk(st, vmDir, downloadsDir, *diskSize, stdin, stdout)
 		if err != nil {
 			return err
 		}
@@ -388,15 +380,18 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	// Build VM configuration
 	vmConfig := &vmStartConfig{
-		DiskName:    disk.Name,
-		DiskPath:    disk.Path,
-		DiskSize:    disk.Size,
-		ISOPath:     isoLocal,
-		MemoryMB:    *memory,
-		CPUs:        *cpus,
-		NetworkMode: *network,
+		DiskName:     disk.Name,
+		DiskPath:     disk.Path,
+		DiskSize:     disk.Size,
+		ISOPath:      isoLocal,
+		MemoryGB:     *memory,
+		CPUs:         *cpus,
+		NetworkMode:  *network,
 		NetworkIface: networkIface,
-		Display:     *display,
+		Display:      *display,
+		DownloadsDir: downloadsDir,
+		IsNewDisk:    isNewDisk,
+		TakenNames:   diskNameSet(st),
 	}
 
 	// Show configuration and allow editing runtime settings
@@ -406,11 +401,52 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if err != nil {
 			return err
 		}
-		*memory = vmConfig.MemoryMB
+		*memory = vmConfig.MemoryGB
 		*cpus = vmConfig.CPUs
 		*network = vmConfig.NetworkMode
 		networkIface = vmConfig.NetworkIface
 		*display = vmConfig.Display
+		isoLocal = vmConfig.ISOPath
+	}
+
+	// Materialize disk — done after review so the config is final.
+	if isNewDisk {
+		writef(stdout, "Creating disk: %s (%s)\n", vmConfig.DiskName, vmConfig.DiskSize)
+		// Remove any stale file from a previous abandoned attempt so that the
+		// user-chosen size is always honoured (EnsureDisk is a no-op when the
+		// file already exists).
+		if err := os.Remove(vmConfig.DiskPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale disk image: %w", err)
+		}
+		if err := vm.EnsureDisk(vmConfig.DiskPath, vmConfig.DiskSize); err != nil {
+			return err
+		}
+		newDisk := state.Disk{
+			Name:      vmConfig.DiskName,
+			Path:      vmConfig.DiskPath,
+			CreatedAt: state.NowRFC3339(),
+			Size:      vmConfig.DiskSize,
+			ISOName:   filepath.Base(isoLocal),
+		}
+		state.AddDisk(st, newDisk)
+		state.AddManagedFile(st, vmConfig.DiskPath)
+		disk = state.FindDiskByName(st, vmConfig.DiskName)
+		if disk == nil {
+			return fmt.Errorf("internal error: disk not found after creation")
+		}
+	} else if vmConfig.DiskSize != disk.Size {
+		// Existing disk: size was changed (gate already confirmed during review)
+		writef(stdout, "Recreating disk at new size %s...\n", vmConfig.DiskSize)
+		if err := os.Remove(disk.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove old disk image: %w", err)
+		}
+		if err := vm.EnsureDisk(disk.Path, vmConfig.DiskSize); err != nil {
+			return err
+		}
+		if stateDisk := state.FindDiskByName(st, disk.Name); stateDisk != nil {
+			stateDisk.Size = vmConfig.DiskSize
+		}
+		disk.Size = vmConfig.DiskSize
 	}
 
 	writeLine(stdout, "")
@@ -459,7 +495,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		DiskPath:      disk.Path,
 		QGASocketPath: qgaSock,
 		CPUs:          *cpus,
-		MemoryMB:      *memory,
+		MemoryMB:      *memory * 1024,
 		NetworkMode:   *network,
 		DisplayMode:   *display,
 		BridgeIface:   *bridgeIface,
@@ -911,32 +947,45 @@ type vmStartConfig struct {
 	DiskPath     string
 	DiskSize     string
 	ISOPath      string
-	MemoryMB     int
+	MemoryGB     int
 	CPUs         int
 	NetworkMode  string
 	NetworkIface string
 	Display      string
+	DownloadsDir string
+	IsNewDisk    bool
+	TakenNames   map[string]struct{}
 }
 
 func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmStartConfig, error) {
 	for {
 		writeLine(stdout, "")
+		ramGB := systemRAMGB()
+		diskFreeGB := freeSpaceGB(filepath.Dir(cfg.DiskPath))
+		ramHint := ""
+		if ramGB > 0 {
+			ramHint = fmt.Sprintf("  (%d GB available)", ramGB)
+		}
+		diskHint := ""
+		if diskFreeGB > 0 {
+			diskHint = fmt.Sprintf("  (%d GB free)", diskFreeGB)
+		}
 		writeLine(stdout, "VM Configuration:")
-		writef(stdout, "     Disk:         %s\n", cfg.DiskName)
-		writef(stdout, "     Disk path:    %s\n", cfg.DiskPath)
-		writef(stdout, "     Disk size:    %s\n", cfg.DiskSize)
+		writef(stdout, "  1) Disk name:    %s\n", cfg.DiskName)
+		writef(stdout, "  2) Disk path:    %s\n", cfg.DiskPath)
+		writef(stdout, "  3) Disk size:    %d GB%s\n", parseSizeGB(cfg.DiskSize), diskHint)
 		if cfg.ISOPath != "" {
-			writef(stdout, "     ISO:          %s\n", filepath.Base(cfg.ISOPath))
+			writef(stdout, "  4) ISO:          %s\n", filepath.Base(cfg.ISOPath))
 		} else {
-			writeLine(stdout, "     ISO:          (none - booting from disk)")
+			writeLine(stdout, "  4) ISO:          (none - booting from disk)")
 		}
-		writef(stdout, "  1) Memory:       %d MB\n", cfg.MemoryMB)
-		writef(stdout, "  2) CPUs:         %d\n", cfg.CPUs)
-		writef(stdout, "  3) Network:      %s\n", cfg.NetworkMode)
+		writef(stdout, "  5) Memory:       %d GB%s\n", cfg.MemoryGB, ramHint)
+		writef(stdout, "  6) CPUs:         %d  (%d logical CPUs on host)\n", cfg.CPUs, runtime.NumCPU())
+		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
 		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
-			writef(stdout, "  4) Net interface: %s\n", cfg.NetworkIface)
+			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
 		}
-		writef(stdout, "  5) Display:      %s\n", cfg.Display)
+		writef(stdout, "  9) Display:      %s\n", cfg.Display)
 		writeLine(stdout, "")
 		writef(stdout, "Press Enter to continue, or enter a number to edit: ")
 
@@ -959,19 +1008,88 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 
 		switch choice {
 		case 1:
-			val, err := prompt(stdin, stdout, "Enter memory in MB (e.g., 4096, 8192)")
+			if !cfg.IsNewDisk {
+				writeLine(stdout, "(disk name cannot be changed for an existing disk)")
+				break
+			}
+			val, err := prompt(stdin, stdout, "Enter disk name")
 			if err != nil {
 				return nil, err
 			}
 			if val != "" {
-				var mb int
-				if _, err := fmt.Sscanf(val, "%d", &mb); err == nil && mb > 0 {
-					cfg.MemoryMB = mb
-				} else {
-					writeLine(stdout, "Invalid memory value")
+				if _, taken := cfg.TakenNames[val]; taken {
+					writef(stdout, "A disk named %q already exists, choose a different name.\n", val)
+					break
 				}
+				cfg.DiskName = val
+				cfg.DiskPath = filepath.Join(filepath.Dir(cfg.DiskPath), val+".qcow2")
 			}
 		case 2:
+			if !cfg.IsNewDisk {
+				writeLine(stdout, "(disk path cannot be changed for an existing disk)")
+				break
+			}
+			writeLine(stdout, "(disk path is derived from the disk name — change the name to update the path)")
+		case 3:
+			if cfg.IsNewDisk {
+				val, err := prompt(stdin, stdout, "Enter disk size in GB (e.g., 20, 60)")
+				if err != nil {
+					return nil, err
+				}
+				if val != "" {
+					gb, err := strconv.Atoi(strings.TrimSpace(val))
+					if err != nil || gb <= 0 {
+						writeLine(stdout, "Invalid disk size, enter a number in GB (e.g., 20, 60)")
+					} else {
+						cfg.DiskSize = fmt.Sprintf("%dG", gb)
+					}
+				}
+			} else {
+				writeLine(stdout, "Warning: changing disk size will delete and recreate the disk image.")
+				writeLine(stdout, "Any existing data on the disk will be lost.")
+				ok, err := confirm(stdin, stdout, false, "I understand and want to change the disk size")
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					writeLine(stdout, "Cancelled.")
+					break
+				}
+				val, err := prompt(stdin, stdout, "Enter new disk size in GB (e.g., 20, 60)")
+				if err != nil {
+					return nil, err
+				}
+				if val != "" {
+					gb, err := strconv.Atoi(strings.TrimSpace(val))
+					if err != nil || gb <= 0 {
+						writeLine(stdout, "Invalid disk size, enter a number in GB (e.g., 20, 60)")
+					} else {
+						cfg.DiskSize = fmt.Sprintf("%dG", gb)
+					}
+				}
+			}
+		case 4:
+			writeLine(stdout, "")
+			selectedISO, err := iso.SelectOrDownloadISO(cfg.DownloadsDir, stdin, stdout)
+			if err != nil {
+				writef(stdout, "ISO selection cancelled: %v\n", err)
+			} else {
+				cfg.ISOPath = selectedISO
+			}
+		case 5:
+			val, err := prompt(stdin, stdout, "Enter memory in GB (e.g., 4, 8)")
+			if err != nil {
+				return nil, err
+			}
+			if val != "" {
+				gb, err := strconv.Atoi(strings.TrimSpace(val))
+				if err != nil || gb <= 0 {
+					writeLine(stdout, "Invalid memory value, enter a number in GB (e.g., 4, 8)")
+				} else {
+					cfg.MemoryGB = gb
+				}
+			}
+		case 6:
 			val, err := prompt(stdin, stdout, "Enter number of CPUs (e.g., 2, 4)")
 			if err != nil {
 				return nil, err
@@ -984,7 +1102,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 					writeLine(stdout, "Invalid CPU value")
 				}
 			}
-		case 3:
+		case 7:
 			val, err := prompt(stdin, stdout, "Enter network mode (bridged or user)")
 			if err != nil {
 				return nil, err
@@ -994,7 +1112,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			} else if val != "" {
 				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
 			}
-		case 4:
+		case 8:
 			if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
 				candidates := vm.DetectUplinkCandidates()
 				if len(candidates) > 1 {
@@ -1024,7 +1142,7 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 			} else {
 				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux)")
 			}
-		case 5:
+		case 9:
 			val, err := prompt(stdin, stdout, "Enter display mode (window or serial)")
 			if err != nil {
 				return nil, err
@@ -1074,6 +1192,69 @@ func defaultMemoryMB() int {
 		return 8192
 	}
 	return 4096
+}
+
+// systemRAMGB returns the host's total physical RAM in GB, or 0 if undetectable.
+func systemRAMGB() int {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+		if err != nil {
+			return 0
+		}
+		b, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+		if err != nil {
+			return 0
+		}
+		return int(b / (1024 * 1024 * 1024))
+	case "linux":
+		data, err := os.ReadFile("/proc/meminfo")
+		if err != nil {
+			return 0
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				fields := strings.Fields(line)
+				if len(fields) < 2 {
+					return 0
+				}
+				kb, err := strconv.ParseInt(fields[1], 10, 64)
+				if err != nil {
+					return 0
+				}
+				return int(kb / (1024 * 1024))
+			}
+		}
+	}
+	return 0
+}
+
+// freeSpaceGB returns the free disk space in GB at the given path, or 0 if undetectable.
+func freeSpaceGB(path string) int {
+	out, err := exec.Command("df", "-k", path).Output()
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return 0
+	}
+	fields := strings.Fields(lines[len(lines)-1])
+	if len(fields) < 4 {
+		return 0
+	}
+	kb, err := strconv.ParseInt(fields[3], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return int(kb / (1024 * 1024))
+}
+
+// parseSizeGB parses a size string like "60G" or "60" into an integer GB value.
+func parseSizeGB(s string) int {
+	s = strings.TrimSuffix(strings.TrimSpace(strings.ToUpper(s)), "G")
+	n, _ := strconv.Atoi(s)
+	return n
 }
 
 func defaultBridgeIface() string {
@@ -1194,6 +1375,14 @@ func nonEmpty(v, fallback string) string {
 		return fallback
 	}
 	return v
+}
+
+func diskNameSet(st *state.State) map[string]struct{} {
+	m := make(map[string]struct{}, len(st.Disks))
+	for _, d := range st.Disks {
+		m[d.Name] = struct{}{}
+	}
+	return m
 }
 
 var errSetupRequired = errors.New("setup has not been completed. Please run 'kairos-lab setup' first")
