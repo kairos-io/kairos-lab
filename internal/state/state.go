@@ -45,6 +45,8 @@ type Disk struct {
 	ISOName   string `json:"iso_name,omitempty"`
 	CreatedAt string `json:"created_at"`
 	Size      string `json:"size"`
+	MemoryGB  int    `json:"memory_gb,omitempty"`
+	CPUs      int    `json:"cpus,omitempty"`
 }
 
 type VM struct {
