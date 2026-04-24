@@ -397,13 +397,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		}
 	}
 
-	// For existing disks, prefer the saved memory/CPU settings over the flag
-	// defaults so that the user's previous choices persist across restarts.
+	// For existing disks, seed memory/CPU from the disk's saved settings so
+	// that the user's previous choices persist across restarts — but only when
+	// the user did not explicitly pass -memory/-cpus on this invocation.
 	if !isNewDisk {
-		if disk.MemoryGB > 0 {
+		explicitFlags := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
+		if disk.MemoryGB > 0 && !explicitFlags["memory"] {
 			*memory = disk.MemoryGB
 		}
-		if disk.CPUs > 0 {
+		if disk.CPUs > 0 && !explicitFlags["cpus"] {
 			*cpus = disk.CPUs
 		}
 	}
@@ -570,10 +573,16 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[2/3] Recording VM state")
 	// Persist the chosen memory and CPU settings on the disk so they become
-	// the default next time this disk is started.
+	// the default next time this disk is started. Guard against zero/negative
+	// values that could arrive via explicit flags (e.g. -memory 0) without
+	// going through the interactive reviewer.
 	if stateDisk := state.FindDiskByName(st, disk.Name); stateDisk != nil {
-		stateDisk.MemoryGB = vmConfig.MemoryGB
-		stateDisk.CPUs = vmConfig.CPUs
+		if vmConfig.MemoryGB > 0 {
+			stateDisk.MemoryGB = vmConfig.MemoryGB
+		}
+		if vmConfig.CPUs > 0 {
+			stateDisk.CPUs = vmConfig.CPUs
+		}
 	}
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = networkIface
