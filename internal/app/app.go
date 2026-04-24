@@ -397,6 +397,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		}
 	}
 
+	// For existing disks, prefer the saved memory/CPU settings over the flag
+	// defaults so that the user's previous choices persist across restarts.
+	if !isNewDisk {
+		if disk.MemoryGB > 0 {
+			*memory = disk.MemoryGB
+		}
+		if disk.CPUs > 0 {
+			*cpus = disk.CPUs
+		}
+	}
+
 	// Build VM configuration
 	vmConfig := &vmStartConfig{
 		DiskName:     disk.Name,
@@ -558,6 +569,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	writeLine(stdout, "[2/3] Recording VM state")
+	// Persist the chosen memory and CPU settings on the disk so they become
+	// the default next time this disk is started.
+	if stateDisk := state.FindDiskByName(st, disk.Name); stateDisk != nil {
+		stateDisk.MemoryGB = vmConfig.MemoryGB
+		stateDisk.CPUs = vmConfig.CPUs
+	}
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = networkIface
 	st.VM.ISOLocal = isoLocal
