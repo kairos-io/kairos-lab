@@ -38,6 +38,38 @@ func TestBuildLinuxCommandFailsWithoutTapInBridgeMode(t *testing.T) {
 	}
 }
 
+func TestBuildLinuxCommandIncludesTapInVirbrMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
+	}
+	_, args, err := buildLinux(StartConfig{
+		ISOPath:       "/tmp/kairos.iso",
+		DiskPath:      "/tmp/kairos.qcow2",
+		QGASocketPath: "/tmp/kairos.sock",
+		CPUs:          2,
+		MemoryMB:      4096,
+		NetworkMode:   "virbr",
+		LinuxTapName:  DefaultVirbrTapName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "ifname="+DefaultVirbrTapName) {
+		t.Fatalf("expected virtap in args: %s", joined)
+	}
+}
+
+func TestBuildLinuxCommandFailsWithoutTapInVirbrMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
+	}
+	_, _, err := buildLinux(StartConfig{NetworkMode: "virbr"})
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
 func TestBuildLinuxCommandSerialDisplayUsesNographic(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("linux-only test")
@@ -85,5 +117,8 @@ func TestBuildLinuxCommandWindowDisplayOmitsNographic(t *testing.T) {
 	}
 	if runtime.GOARCH == "arm64" && !strings.Contains(joined, "virtio-gpu-pci") {
 		t.Fatalf("expected virtio-gpu-pci for arm64 window display mode: %s", joined)
+	}
+	if !strings.Contains(joined, "net="+userSlirpNetCIDR) || strings.Contains(joined, "10.0.2") {
+		t.Fatalf("expected RFC1918 user slirp net in args: %s", joined)
 	}
 }

@@ -11,7 +11,7 @@ After you've played with kairos-lab, whether you choose to continue your Kairos 
 It helps you:
 
 - download a Kairos ISO (`download`)
-- boot a Kairos VM with bridged networking (`start`)
+- boot a Kairos VM with QEMU (**Linux: `--network auto` prefers wired‑LAN bridging when NetworkManager and an Ethernet default-route NIC exist; otherwise `virbr`, then slirp** — **Wi‑Fi is not bridged here**; **macOS defaults to `--network user`**)
 - manage multiple VM disks
 - inspect state (`status`)
 - clean VM artifacts (`reset`)
@@ -77,8 +77,14 @@ The ISO is saved to the cache directory and tracked for cleanup.
 This will:
 - Create a new disk (named after the ISO + timestamp)
 - Boot the VM with the ISO attached
-- Use bridged networking (VM gets a LAN IP you can SSH to)
+- On **Linux**, **`--network auto`**: **`bridged`** only when NetworkManager runs and **`ip route` default routes expose a wired **Ethernet** uplink (**`wlp*` / Wi‑Fi client NICs are skipped**; DHCP is from **your LAN** on that wired segment — **172.x**, **192.168.x**, **10.x**). Otherwise **`virbr`** (**192.168.122.x**); otherwise **`user`**/slirp (**192.168.239.x**, **`localhost:2222`**, **`localhost:8080`**).
+
+- Use **`user`** networking on macOS (**192.168.239.x**, SSH `localhost:2222`, HTTP `localhost:8080`)
 - Open a graphical window
+
+**Important:** slirp/virbr subnets are QEMU/libvirt-internal. **`bridged`/`auto`** only uses **Ethernet** bridge slaves (**not Wi‑Fi**). On Wi‑Fi-only laptops, **`auto`** falls through to **`virbr`**/**`user`** unless you plug in Ethernet (or USB–Ethernet tethering appearing as **`en*`**).
+
+To skip LAN bridging explicitly: `./kairos-lab start --network virbr` (libvirt NAT) or `./kairos-lab start --network user` (pure slirp).
 
 **Exit the VM with `Ctrl-a x`**
 
@@ -105,7 +111,7 @@ Downloads a Kairos ISO with interactive selection:
 
 Boots a VM with sensible defaults:
 - **Display**: `window` (graphical) by default
-- **Network**: `bridged` by default (VM gets LAN IP)
+- **Network** (defaults): Linux **`auto`** (wired‑LAN **`bridged`** when NM + Ethernet default-route; else **`virbr`**; else **`user`/slirp**); macOS **`user`** (NAT; guest **192.168.239.0/24**, forwards **SSH `localhost:2222`**, **HTTP `localhost:8080`**)
 - **Disk**: Select existing or create new
 
 Flags:
@@ -114,7 +120,7 @@ Flags:
 - `-no-iso` - Boot without ISO (installed system)
 - `-iso <path>` - Use specific ISO file
 - `-display serial|window` - Display mode (default: window)
-- `-network bridged|user` - Network mode (default: bridged)
+- `-network auto|user|bridged|virbr` — Linux default **`auto`** (same‑LAN bridging **Ethernet only**, then **`virbr`**, then **`user`**). **`bridged`** / **`auto`** bridging **reject Wi‑Fi** (`wlan`/`wl*`) uplinks — use **`--bridge-if`** Ethernet, USB‑Ethernet tether, or **`--network virbr`/`user`** instead.
 - `-disk-size 60G` - Disk size for new disks
 - `-memory 4096` / `-cpus 2` - VM resources
 - `-yes` - Auto-confirm prompts
@@ -145,18 +151,36 @@ Removes everything created by `kairos-lab`:
 
 ## Networking
 
+**Same IP space as your laptop:** only **wired LAN bridging** (Ethernet NIC slave to kairos‑lab **`kairoslab0`**) attaches the VM to DHCP on **that wired segment** (often **172.x**, **192.168.x**, **10.x**). **Wi‑Fi client interfaces (`wlp*` / `wlan`) are not bridged.** Slirp and **`virbr0`** NAT use unrelated private subnets.
+
+### Linux `--network auto` (default)
+
+1. **`bridged`** if **NetworkManager** is active **and** `ip route` default routes expose a wired **Ethernet** uplink (**not Wi‑Fi**).
+
+2. Else **`virbr`** if **`virbr0`** is usable (typically **192.168.122.x**).
+
+3. Else **`user`** (slirp **192.168.239.x**).
+
+Use **`--network bridged`** with Ethernet (**`--bridge-if enpXsY`**). Wi‑Fi-only hosts usually want **`virbr`** (host reaches guest IP on **122.x**) or **`user`** (`localhost` forwards).
+
+
+### QEMU user/slirp (`user` / auto fallback last)
+
+QEMU **user** networking (slirp / NAT): the guest gets **`192.168.239.0/24`** (often **`.15`**) and can reach your host at **`192.168.239.2`**. That subnet exists **only inside the emulator** — your real machine does **not** have a route to the guest’s address, so **`ping 192.168.239.15` from the host will not work**, and **ICMP is not port-forwarded** anyway. **Host → guest** access is only via **forwarded TCP ports**: **SSH `ssh -p 2222 localhost`**, HTTP **`http://localhost:8080`**. For DHCP on **the same routed LAN cable segment** as nearby wired hosts on Linux, use **`--network bridged`** (**Ethernet uplink**, not **`wlp*`**).
+
 ### macOS
 
-Uses QEMU's `vmnet-bridged` mode. Requires sudo for QEMU to access vmnet.
+Bridged (`--network bridged`): QEMU's `vmnet-bridged` mode. Requires sudo for QEMU to access vmnet.
+
+**User mode** (`--network user`): no sudo.
 
 ### Linux
 
-Requires **NetworkManager** for bridged networking. The tool:
-- Creates a bridge (`kairoslab0`) and tap device
-- Enslaves your physical interface to the bridge
-- VM gets DHCP from your LAN
+**Bridged LAN** (`--network bridged`): requires **NetworkManager**, **Ethernet** uplink (**Wi‑Fi not supported**).
 
-If NetworkManager is not available, use `--network user` for port-forwarded access (SSH via `localhost:2222`).
+**NAT on virbr** (`--network virbr`, or **`--network auto`** when bridging isn’t plausible but **`virbr0`** works): QEMU uses TAP **`kairoslab-vtap0`** on **`virbr0`**. Typical: **`sudo virsh net-start default`**. TAP setup uses sudo (`ip tuntap` / `ip link`).
+
+**Slirp / user NAT** (`--network user`, or last **`auto`** fallback): see [QEMU user/slirp](#qemu-userslirp-user--auto-fallback-last).
 
 ## State and Paths
 

@@ -18,6 +18,20 @@ const (
 	DefaultTapName    = "kairoslab-tap0"
 )
 
+// CanSuggestAutoBridged reports whether Linux bridged LAN mode is plausible for --network auto:
+// NetworkManager is running, we resolved a wired default-route uplink, and it is not Wi‑Fi
+// (NM/drivers seldom allow a wlan client NIC as a Linux bridge slave; see PrepareLinuxBridge).
+func CanSuggestAutoBridged() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if !networkManagerActive() {
+		return false
+	}
+	_, err := PreferWiredUplinkForBridge()
+	return err == nil
+}
+
 func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	if runtime.GOOS != "linux" {
 		return nil
@@ -33,20 +47,18 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 		bridge = DefaultBridgeName
 	}
 
-	// Check for stale bridge from previous run
-	if IsLinuxBridge(bridge) || nmConnectionExists(bridge) {
-		fmt.Println("Found stale network configuration, cleaning up...")
-		_ = cleanupNMConnections(bridge)
-		time.Sleep(2 * time.Second)
+	tap := st.Network.TapName
+	if tap == "" {
+		tap = DefaultTapName
 	}
 
 	uplink := st.Network.BridgeInterface
 	if uplink == "" {
-		// Retry a few times in case NM is still restoring the connection
+		// Retry a few times in case NM is still settling
 		var u string
 		var err error
 		for i := 0; i < 5; i++ {
-			u, err = detectDefaultUplink()
+			u, err = PreferWiredUplinkForBridge()
 			if err == nil {
 				break
 			}
@@ -67,12 +79,19 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 		return fmt.Errorf("uplink interface must be a physical host iface, got bridge: %s", uplink)
 	}
 	if isVirtualInterface(uplink) {
-		return fmt.Errorf("uplink interface must be a physical host iface, got virtual interface: %s (use -bridge-if to specify a physical interface like eth0, enp*, or wlan*)", uplink)
+		return fmt.Errorf("uplink interface must be a physical host iface, got virtual interface: %s (use --bridge-if with Ethernet, e.g. enp*, eth*)", uplink)
+	}
+	if IfaceIsWLAN(uplink) {
+		return fmt.Errorf("bridged LAN does not support Wi-Fi interface %q: NM/drivers seldom allow wlan client mode as a bridge slave; plug in Ethernet, pass --bridge-if <iface>, or use --network virbr / --network user instead", uplink)
 	}
 
-	tap := st.Network.TapName
-	if tap == "" {
-		tap = DefaultTapName
+	// Always drop prior kairos-lab NM profiles (and tap/bridge if present). NetworkManager
+	// permits duplicate profiles with the same name; deletes by name leave stale UUIDs
+	// pinned to an old uplink (e.g. Ethernet) when you've moved interfaces. Recreate from
+	// the interface chosen for this run (default route / -bridge-if).
+	fmt.Println("Preparing bridged networking (resetting any prior kairos-lab bridge setup)...")
+	if purgeLabBridgeNetworking(bridge, tap) {
+		time.Sleep(2 * time.Second)
 	}
 
 	if err := prepareLinuxBridgeWithNM(bridge, tap, uplink); err != nil {
@@ -108,62 +127,251 @@ func prepareLinuxBridgeWithNM(bridge, tap, uplink string) error {
 		return err
 	}
 
-	if !nmConnectionExists(bridgeConn) {
-		if err := sudo("nmcli", "connection", "add", "type", "bridge", "ifname", bridge, "con-name", bridgeConn, "autoconnect", "yes", "stp", "no"); err != nil {
-			return err
-		}
+	// Tear down matching NM profiles inside this helper too: leftover profiles or
+	// ambiguity on `modify`/`up NAME` still cause wrong-NIC binds (seen with enp* vs wlan).
+	nmDeleteProfilesWithExactNames([]string{tapConn, uplinkConn, bridgeConn})
+
+	if err := sudo("nmcli", "connection", "add", "type", "bridge", "ifname", bridge, "con-name", bridgeConn, "autoconnect", "yes", "stp", "no"); err != nil {
+		return err
 	}
-	if err := sudo("nmcli", "connection", "modify", bridgeConn, "connection.interface-name", bridge, "ipv4.method", "auto", "ipv6.method", "auto", "bridge.stp", "no", "connection.autoconnect", "yes"); err != nil {
+	bridgeUUID, err := nmWaitSingletonUUIDAfterAdd(bridgeConn)
+	if err != nil {
+		return err
+	}
+	if err := sudo("nmcli", "connection", "modify", bridgeUUID,
+		"connection.interface-name", bridge, "ipv4.method", "auto", "ipv6.method", "auto", "bridge.stp", "no", "connection.autoconnect", "yes"); err != nil {
 		return err
 	}
 
-	if !nmConnectionExists(uplinkConn) {
-		if err := sudo("nmcli", "connection", "add", "type", "ethernet", "ifname", uplink, "con-name", uplinkConn, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "yes"); err != nil {
-			return err
-		}
+	uplinkUUID, err := addEthernetBridgeSlaveUplink(uplink, uplinkConn, bridgeConn)
+	if err != nil {
+		return err
 	}
-	if err := sudo("nmcli", "connection", "modify", uplinkConn, "connection.interface-name", uplink, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "yes"); err != nil {
+	if err := sudo("nmcli", "connection", "modify", uplinkUUID,
+		"connection.interface-name", uplink, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "yes"); err != nil {
 		return err
 	}
 
-	if !nmConnectionExists(tapConn) {
-		if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "yes"); err != nil {
-			return err
-		}
+	if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "yes"); err != nil {
+		return err
 	}
-	if err := sudo("nmcli", "connection", "modify", tapConn, "connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "yes"); err != nil {
+	tapUUID, err := nmWaitSingletonUUIDAfterAdd(tapConn)
+	if err != nil {
+		return err
+	}
+	if err := sudo("nmcli", "connection", "modify", tapUUID,
+		"connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "yes"); err != nil {
 		return err
 	}
 
-	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
+	if err := sudo("nmcli", "connection", "up", bridgeUUID, "ifname", bridge); err != nil {
 		return err
 	}
-	if err := sudo("nmcli", "connection", "up", uplinkConn); err != nil {
-		return err
+	if err := sudo("nmcli", "connection", "up", uplinkUUID, "ifname", uplink); err != nil {
+		return fmt.Errorf("activate bridge slave uplink %q: %w", uplink, err)
 	}
-	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
+	if err := sudo("nmcli", "connection", "up", tapUUID, "ifname", tap); err != nil {
 		return err
 	}
 	return nil
+}
+
+// IfaceIsWLAN reports sysfs-style wireless NICs (not used as bridged LAN uplinks here).
+func IfaceIsWLAN(name string) bool {
+	if name == "" {
+		return false
+	}
+	base := filepath.Join("/sys/class/net", name)
+	if _, err := os.Stat(filepath.Join(base, "wireless")); err == nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(base, "phy80211")); err == nil {
+		return true
+	}
+	return strings.HasPrefix(name, "wl")
+}
+
+// PreferWiredUplinkForBridge returns the first default-route NIC that is not classified as wireless.
+func PreferWiredUplinkForBridge() (string, error) {
+	for _, iface := range DetectUplinkCandidates() {
+		if !IfaceIsWLAN(iface) {
+			return iface, nil
+		}
+	}
+	return "", fmt.Errorf("no wired (Ethernet) default-route interface — bridged LAN is not supported on Wi-Fi-only hosts here; plug in Ethernet and use --network bridged, or use --network virbr / --network user")
+}
+
+func addEthernetBridgeSlaveUplink(uplinkIface, uplinkConnName, bridgeConnName string) (string, error) {
+	if err := sudo("nmcli", "connection", "add", "type", "ethernet",
+		"ifname", uplinkIface,
+		"con-name", uplinkConnName,
+		"master", bridgeConnName,
+		"slave-type", "bridge",
+		"autoconnect", "yes"); err != nil {
+		return "", err
+	}
+	return nmWaitSingletonUUIDAfterAdd(uplinkConnName)
+}
+
+// parseNmCliColonField parses -t or verbose nmcli sections as KEY[:][VALUE]. Key match is ASCII case-insensitive.
+func parseNmCliColonField(output, wantedKey string) (value string, found bool) {
+	wantedKey = strings.TrimSpace(wantedKey)
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(key), wantedKey) {
+			continue
+		}
+		return strings.TrimSpace(val), true
+	}
+	return "", false
 }
 
 func CleanupLinuxBridge(st *state.State) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	if !st.Network.CreatedByKairosLab {
+	if !st.Network.CreatedByKairosLab || st.Network.Mode != "bridged" {
 		return nil
 	}
 	bridgeConn := st.Network.BridgeName
 	if bridgeConn == "" {
 		bridgeConn = DefaultBridgeName
 	}
-	if err := cleanupNMConnections(bridgeConn); err != nil {
+	tapIface := st.Network.TapName
+	if tapIface == "" {
+		tapIface = DefaultTapName
+	}
+	if err := cleanupNMConnections(bridgeConn, tapIface); err != nil {
 		return err
 	}
 	st.Network.LastCleanupAttemptAt = state.NowRFC3339()
 	st.Network = state.Network{}
 	return nil
+}
+
+// HasUsableLinuxVirbr reports whether libvirt's default NAT bridge exists, is UP, is a Linux bridge,
+// and has an IPv4 address (typical dnsmasq on 192.168.122.1).
+func HasUsableLinuxVirbr() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	if !linkExists(LinuxLibvirtNATBridge) || !IsLinuxBridge(LinuxLibvirtNATBridge) {
+		return false
+	}
+	out, err := exec.Command("ip", "link", "show", "dev", LinuxLibvirtNATBridge).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	if !strings.Contains(string(out), " state UP ") && !strings.Contains(string(out), " state UNKNOWN ") {
+		return false
+	}
+	addrOut, err := exec.Command("ip", "-4", "-o", "addr", "show", "dev", LinuxLibvirtNATBridge).Output()
+	return err == nil && strings.Contains(string(addrOut), " inet ")
+}
+
+func tapOwnershipUser() (string, error) {
+	u := strings.TrimSpace(os.Getenv("SUDO_USER"))
+	if u != "" && u != "root" {
+		return u, nil
+	}
+	u = strings.TrimSpace(os.Getenv("USER"))
+	if u != "" && u != "root" {
+		return u, nil
+	}
+	return "", fmt.Errorf("cannot determine a non-root user for QEMU tap ownership (avoid running kairos-lab entirely as root)")
+}
+
+// PrepareLinuxVirbrTap attaches a QEMU tap device to LinuxLibvirtNATBridge (typically virbr0).
+// Requires sudo for ip-link / tuntap; qemu can run without sudo once the tap is owned by tapOwnershipUser().
+func PrepareLinuxVirbrTap(st *state.State) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if !HasUsableLinuxVirbr() {
+		return fmt.Errorf(`libvirt default bridge "%s" is unavailable (missing, down, or no IPv4) — ensure libvirt NAT is active (often "sudo virsh net-start default"), then retry, or use --network user`, LinuxLibvirtNATBridge)
+	}
+	tap := DefaultVirbrTapName
+	owner, err := tapOwnershipUser()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Preparing libvirt NAT tap %q on bridge %s (for user %s)...\n", tap, LinuxLibvirtNATBridge, owner)
+
+	if linkExists(tap) {
+		_ = sudo("ip", "link", "set", tap, "nomaster")
+		if err := sudo("ip", "link", "delete", tap); err != nil {
+			return fmt.Errorf("remove existing tap %s: %w", tap, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := sudo("ip", "tuntap", "add", "dev", tap, "mode", "tap", "user", owner); err != nil {
+		return err
+	}
+	if err := sudo("ip", "link", "set", "dev", tap, "master", LinuxLibvirtNATBridge); err != nil {
+		_ = sudo("ip", "link", "delete", tap)
+		return err
+	}
+	if err := sudo("ip", "link", "set", "dev", tap, "up"); err != nil {
+		_ = sudo("ip", "link", "set", tap, "nomaster")
+		_ = sudo("ip", "link", "delete", tap)
+		return err
+	}
+
+	st.Network.Mode = "virbr"
+	st.Network.BridgeName = LinuxLibvirtNATBridge
+	st.Network.TapName = tap
+	st.Network.BridgeInterface = ""
+	st.Network.CleanupRequired = true
+	st.Network.CreatedByKairosLab = true
+	st.Network.LastPreparedAt = state.NowRFC3339()
+	return nil
+}
+
+// CleanupLinuxVirbrTap removes TAP state created by PrepareLinuxVirbrTap.
+func CleanupLinuxVirbrTap(st *state.State) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if !st.Network.CreatedByKairosLab || st.Network.Mode != "virbr" {
+		return nil
+	}
+	tap := st.Network.TapName
+	if tap == "" {
+		tap = DefaultVirbrTapName
+	}
+	st.Network.LastCleanupAttemptAt = state.NowRFC3339()
+	if linkExists(tap) {
+		_ = sudo("ip", "link", "set", tap, "nomaster")
+		if err := sudo("ip", "link", "delete", tap); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to delete tap %s: %v\n", tap, err)
+		}
+	}
+	st.Network = state.Network{}
+	return nil
+}
+
+func staleUnusedVirbrTap() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	return linkExists(DefaultVirbrTapName)
+}
+
+func removeVirbrNATTapIfUnused() {
+	if runtime.GOOS != "linux" || !linkExists(DefaultVirbrTapName) {
+		return
+	}
+	_ = sudo("ip", "link", "set", DefaultVirbrTapName, "nomaster")
+	if err := sudo("ip", "link", "delete", DefaultVirbrTapName); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to delete stale tap %s: %v\n", DefaultVirbrTapName, err)
+	}
 }
 
 // HasStaleNetworkResources checks if there are kairos-lab network resources
@@ -180,7 +388,8 @@ func HasStaleNetworkResources(st *state.State) bool {
 		bridge = DefaultBridgeName
 	}
 	return IsLinuxBridge(bridge) || nmConnectionExists(bridge) ||
-		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap")
+		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap") ||
+		staleUnusedVirbrTap()
 }
 
 // CleanupStaleNetworkResources removes kairos-lab network resources that aren't
@@ -193,13 +402,24 @@ func CleanupStaleNetworkResources(st *state.State) error {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	return cleanupNMConnections(bridge)
+	tapIface := DefaultTapName
+	if err := cleanupNMConnections(bridge, tapIface); err != nil {
+		return err
+	}
+	removeVirbrNATTapIfUnused()
+	return nil
 }
 
-func cleanupNMConnections(bridgeConn string) error {
+// purgeLabBridgeNetworking removes kairos-lab NetworkManager profiles and tap/bridge
+// interfaces. It deletes every NM connection UUID whose name matches the lab bridge,
+// uplink slave, or tap slave (handles duplicate nmcli connection names). Returns whether
+// any resource was removed.
+func purgeLabBridgeNetworking(bridgeConn, tapIface string) bool {
 	uplinkConn := bridgeConn + "-uplink"
 	tapConn := bridgeConn + "-tap"
-	tap := DefaultTapName
+	names := []string{tapConn, uplinkConn, bridgeConn}
+
+	changed := false
 
 	// Find the physical interface enslaved to the bridge before we delete anything
 	var uplinkIface string
@@ -207,25 +427,23 @@ func cleanupNMConnections(bridgeConn string) error {
 		uplinkIface = findBridgeSlave(bridgeConn)
 	}
 
-	// Delete all NM connections - use sudo (not sudoQuiet) so user can see
-	// what's happening and errors are visible
-	for _, conn := range []string{tapConn, uplinkConn, bridgeConn} {
-		if nmConnectionExists(conn) {
-			if err := sudo("nmcli", "connection", "delete", conn); err != nil {
-				fmt.Printf("warning: failed to delete connection %s: %v\n", conn, err)
-			}
-		}
+	if nmDeleteProfilesWithExactNames(names) {
+		changed = true
 	}
 
 	// Now clean up any lingering interfaces that NM didn't remove
-	if linkExists(tap) {
-		if err := sudo("ip", "link", "delete", tap); err != nil {
-			fmt.Printf("warning: failed to delete interface %s: %v\n", tap, err)
+	if linkExists(tapIface) {
+		if err := sudo("ip", "link", "delete", tapIface); err != nil {
+			fmt.Printf("warning: failed to delete interface %s: %v\n", tapIface, err)
+		} else {
+			changed = true
 		}
 	}
 	if linkExists(bridgeConn) {
 		if err := sudo("ip", "link", "delete", bridgeConn); err != nil {
 			fmt.Printf("warning: failed to delete interface %s: %v\n", bridgeConn, err)
+		} else {
+			changed = true
 		}
 	}
 
@@ -238,6 +456,11 @@ func cleanupNMConnections(bridgeConn string) error {
 		}
 	}
 
+	return changed
+}
+
+func cleanupNMConnections(bridgeConn, tapIface string) error {
+	_ = purgeLabBridgeNetworking(bridgeConn, tapIface)
 	return nil
 }
 
@@ -300,14 +523,6 @@ func IsLinuxBridge(name string) bool {
 	}
 	_, err := os.Stat(filepath.Join("/sys/class/net", name, "bridge"))
 	return err == nil
-}
-
-func detectDefaultUplink() (string, error) {
-	candidates := DetectUplinkCandidates()
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("could not determine default uplink interface (all candidates are bridges, virtual, or loopback)")
-	}
-	return candidates[0], nil
 }
 
 // DetectUplinkCandidates returns all valid physical interfaces from the default routes.
@@ -374,6 +589,79 @@ func nmConnectionExists(name string) bool {
 		return false
 	}
 	return exec.Command("nmcli", "-t", "-f", "NAME", "connection", "show", name).Run() == nil
+}
+
+// nmConnectionUUIDsForExactName returns every NM connection UUID whose connection
+// NAME equals exactName (NetworkManager permits duplicate names with different UUIDs).
+func nmConnectionUUIDsForExactName(exactName string) []string {
+	if exactName == "" {
+		return nil
+	}
+	if _, err := exec.LookPath("nmcli"); err != nil {
+		return nil
+	}
+	out, err := exec.Command("nmcli", "-t", "-f", "UUID,NAME", "connection", "show").Output()
+	if err != nil {
+		return nil
+	}
+	return parseNmcliUUIDNamePairs(string(out), exactName)
+}
+
+// parseNmcliUUIDNamePairs parses "nmcli -t -f UUID,NAME connection show" output lines
+// and returns UUIDs for rows whose NAME matches exactName after the first ':'.
+func parseNmcliUUIDNamePairs(output, exactName string) []string {
+	var match []string
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		i := strings.IndexByte(line, ':')
+		if i <= 0 || i >= len(line)-1 {
+			continue
+		}
+		uuid := line[:i]
+		connName := line[i+1:]
+		if connName != exactName {
+			continue
+		}
+		if uuid != "" {
+			match = append(match, uuid)
+		}
+	}
+	return match
+}
+
+// nmDeleteProfilesWithExactNames deletes every NM connection whose NAME matches exactly.
+func nmDeleteProfilesWithExactNames(names []string) bool {
+	removed := false
+	for _, nmName := range names {
+		for _, uuid := range nmConnectionUUIDsForExactName(nmName) {
+			if err := sudo("nmcli", "connection", "delete", uuid); err != nil {
+				fmt.Printf("warning: failed to delete connection %s: %v\n", uuid, err)
+				continue
+			}
+			removed = true
+		}
+	}
+	return removed
+}
+
+func nmWaitSingletonUUIDAfterAdd(nmName string) (string, error) {
+	var lastErr error
+	for range 40 {
+		uuids := nmConnectionUUIDsForExactName(nmName)
+		switch len(uuids) {
+		case 1:
+			return uuids[0], nil
+		case 0:
+			lastErr = fmt.Errorf("no NetworkManager connection named %q after create", nmName)
+		default:
+			return "", fmt.Errorf("ambiguous NetworkManager profiles named %q (%d); run kairos-lab cleanup and retry", nmName, len(uuids))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return "", lastErr
 }
 
 func uidForUser(user string) (string, error) {
