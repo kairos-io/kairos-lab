@@ -269,16 +269,19 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	noISO := fs.Bool("no-iso", false, "boot without ISO (for installed systems)")
 	memory := fs.Int("memory", defaultMemoryMB()/1024, "memory in GB")
 	cpus := fs.Int("cpus", 2, "number of vCPUs")
-	network := fs.String("network", "bridged", "network mode: bridged|user")
+	netDefault := defaultNetworkCLIValue()
+	network := fs.String("network", netDefault, "network mode: auto|user|bridged|virbr (Linux auto: Ethernet bridged LAN if NM + wired route, else virbr0 if usable, else user NAT)")
 	display := fs.String("display", "window", "display mode: window|serial")
 	bridgeIface := fs.String("bridge-if", defaultBridgeIface(), "bridge interface (macOS vmnet or Linux uplink iface)")
 	autoYes := fs.Bool("yes", false, "auto-confirm sudo operations")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *network != "bridged" && *network != "user" {
-		return fmt.Errorf("invalid network mode: %s", *network)
+	resolvedNetwork, err := resolveNetworkMode(*network)
+	if err != nil {
+		return err
 	}
+	*network = resolvedNetwork
 	if *display != "serial" && *display != "window" {
 		return fmt.Errorf("invalid display mode: %s", *display)
 	}
@@ -386,15 +389,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	// Determine network interface for bridged mode
 	networkIface := *bridgeIface
 	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
-		candidates := vm.DetectUplinkCandidates()
-		if len(candidates) == 0 {
-			return fmt.Errorf("no suitable uplink interface found for bridged networking (use -bridge-if to specify one, or -network user for port-forwarded access)")
-		} else if len(candidates) == 1 {
-			networkIface = candidates[0]
-		} else {
-			// Multiple candidates - will prompt in config review
-			networkIface = candidates[0] // default to first, user can change
+		u, err := vm.PreferWiredUplinkForBridge()
+		if err != nil {
+			return err
 		}
+		networkIface = u
 	}
 
 	// For existing disks, seed memory/CPU from the disk's saved settings so
@@ -437,9 +436,21 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		*memory = vmConfig.MemoryGB
 		*cpus = vmConfig.CPUs
 		*network = vmConfig.NetworkMode
+		reviewedNetwork, err := resolveNetworkMode(*network)
+		if err != nil {
+			return err
+		}
+		*network = reviewedNetwork
 		networkIface = vmConfig.NetworkIface
 		*display = vmConfig.Display
 		isoLocal = vmConfig.ISOPath
+	}
+	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
+		u, err := vm.PreferWiredUplinkForBridge()
+		if err != nil {
+			return err
+		}
+		networkIface = u
 	}
 
 	// Materialize disk — done after review so the config is final.
@@ -530,6 +541,34 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 			return err
 		}
 	}
+	if *network == "virbr" && runtime.GOOS == "linux" {
+		ok, err := confirm(stdin, stdout, *autoYes, fmt.Sprintf(`libvirt NAT tap on %s needs sudo ("ip tuntap" / "ip link"); QEMU attaches to the tap as your user`, vm.LinuxLibvirtNATBridge))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("sudo permission denied")
+		}
+		if err := vm.PrepareLinuxVirbrTap(st); err != nil {
+			return err
+		}
+		defer func() {
+			stRel, err := store.Load()
+			if err != nil {
+				writef(stdout, "warning: reload state after VM exit: %v\n", err)
+				return
+			}
+			if stRel.Network.Mode != "virbr" || !stRel.Network.CreatedByKairosLab {
+				return
+			}
+			if err := vm.CleanupLinuxVirbrTap(stRel); err != nil {
+				writef(stdout, "warning: virbr tap cleanup failed: %v\n", err)
+			}
+			if err := store.Save(stRel); err != nil {
+				writef(stdout, "warning: save state after virbr cleanup failed: %v\n", err)
+			}
+		}()
+	}
 
 	biosPath := ""
 	if runtime.GOOS == "darwin" {
@@ -585,7 +624,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		}
 	}
 	st.Network.Mode = *network
-	st.Network.BridgeInterface = networkIface
+	if *network == "bridged" && runtime.GOOS == "linux" {
+		// Uplink already set before PrepareLinuxBridge above.
+	} else {
+		st.Network.BridgeInterface = ""
+	}
 	st.VM.ISOLocal = isoLocal
 	st.VM.DiskPath = disk.Path
 	st.VM.DiskName = disk.Name
@@ -605,8 +648,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 
 	writeLine(stdout, "[3/3] Starting VM")
 	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
-	if *network == "user" {
-		writeLine(stdout, "user mode forwards: ssh localhost:2222, http localhost:8080")
+	switch *network {
+	case "user":
+		writeLine(stdout, vm.UserNetworkingHint())
+	case "virbr":
+		writeLine(stdout, vm.VirbrNetworkingHint())
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -692,9 +738,12 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
 	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
 	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
-	if st.Network.Mode == "bridged" {
+	if st.Network.Mode == "bridged" && runtime.GOOS == "linux" {
 		writef(stdout, "bridge iface: %s\n", emptyAsNone(st.Network.BridgeInterface))
 		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
+	}
+	if st.Network.Mode == "virbr" && runtime.GOOS == "linux" {
+		writef(stdout, "libvirt NAT: bridge=%s tap=%s (guest DHCP often 192.168.122.x)\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
 	}
 	writef(stdout, "vm running: %t\n", running)
 	if running {
@@ -763,14 +812,22 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	printRemovalPlan(stdout, "reset", toRemove, toSkip)
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
-		})
+		switch st.Network.Mode {
+		case "bridged":
+			printList(stdout, "Will clean up network resources", []string{
+				"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+				"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+			})
+		case "virbr":
+			printList(stdout, "Will clean up network resources", []string{
+				"libvirt bridge: " + nonEmpty(st.Network.BridgeName, vm.LinuxLibvirtNATBridge),
+				"tap: " + nonEmpty(st.Network.TapName, vm.DefaultVirbrTapName),
+			})
+		}
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
-			"bridge: " + vm.DefaultBridgeName,
-			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+			"NM bridge artifacts: bridge " + vm.DefaultBridgeName + " and related connections",
+			"orphaned libvirt tap (if present): " + vm.DefaultVirbrTapName,
 		})
 	}
 
@@ -801,12 +858,20 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	}
 
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Cleaning up bridged network...")
-		if err := vm.CleanupLinuxBridge(st); err != nil {
-			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		switch st.Network.Mode {
+		case "bridged":
+			writeLine(stdout, "Cleaning up bridged network...")
+			if err := vm.CleanupLinuxBridge(st); err != nil {
+				writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+			}
+		case "virbr":
+			writeLine(stdout, "Cleaning up libvirt NAT tap...")
+			if err := vm.CleanupLinuxVirbrTap(st); err != nil {
+				writef(stdout, "warning: virbr tap cleanup failed: %v\n", err)
+			}
 		}
 	} else if hasStaleNetwork {
-		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		writeLine(stdout, "Cleaning up stale network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 		}
@@ -864,14 +929,22 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 
 	hasStaleNetwork := vm.HasStaleNetworkResources(st)
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
-		})
+		switch st.Network.Mode {
+		case "bridged":
+			printList(stdout, "Will clean up network resources", []string{
+				"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
+				"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
+			})
+		case "virbr":
+			printList(stdout, "Will clean up network resources", []string{
+				"libvirt bridge: " + nonEmpty(st.Network.BridgeName, vm.LinuxLibvirtNATBridge),
+				"tap: " + nonEmpty(st.Network.TapName, vm.DefaultVirbrTapName),
+			})
+		}
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
-			"bridge: " + vm.DefaultBridgeName,
-			"connections: " + vm.DefaultBridgeName + ", " + vm.DefaultBridgeName + "-uplink, " + vm.DefaultBridgeName + "-tap",
+			"NM bridge artifacts: bridge " + vm.DefaultBridgeName + " and related connections",
+			"orphaned libvirt tap (if present): " + vm.DefaultVirbrTapName,
 		})
 	}
 
@@ -894,12 +967,20 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
-		writeLine(stdout, "Cleaning up bridged network...")
-		if err := vm.CleanupLinuxBridge(st); err != nil {
-			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+		switch st.Network.Mode {
+		case "bridged":
+			writeLine(stdout, "Cleaning up bridged network...")
+			if err := vm.CleanupLinuxBridge(st); err != nil {
+				writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+			}
+		case "virbr":
+			writeLine(stdout, "Cleaning up libvirt NAT tap...")
+			if err := vm.CleanupLinuxVirbrTap(st); err != nil {
+				writef(stdout, "warning: virbr tap cleanup failed: %v\n", err)
+			}
 		}
 	} else if hasStaleNetwork {
-		writeLine(stdout, "Cleaning up stale bridged network resources...")
+		writeLine(stdout, "Cleaning up stale network resources...")
 		if err := vm.CleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 		}
@@ -963,6 +1044,7 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  -new                 Create new disk (even if others exist)")
 	writeLine(w, "  -no-iso              Boot without ISO (installed system)")
 	writeLine(w, "  -iso <path>          Use specific ISO file")
+	writeLine(w, "  -network <mode>      auto|user|bridged|virbr (Linux auto: bridged only with wired NIC; then virbr; else slirp; macOS default: user)")
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }
@@ -1049,6 +1131,8 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 		writef(stdout, "  7) Network:      %s\n", cfg.NetworkMode)
 		if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
 			writef(stdout, "  8) Net interface: %s\n", cfg.NetworkIface)
+		} else if cfg.NetworkMode == "virbr" && runtime.GOOS == "linux" {
+			writef(stdout, "  8) Net interface: (n/a — attaches to libvirt bridge %s)\n", vm.LinuxLibvirtNATBridge)
 		} else {
 			writeLine(stdout, "  8) Net interface: (n/a)")
 		}
@@ -1174,41 +1258,56 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				}
 			}
 		case 7:
-			val, err := prompt(stdin, stdout, "Enter network mode (bridged or user)")
+			hint := "Enter network mode (auto, user, bridged"
+			if runtime.GOOS == "linux" {
+				hint += ", virbr)"
+			} else {
+				hint += ")"
+			}
+			val, err := prompt(stdin, stdout, hint)
 			if err != nil {
 				return nil, err
 			}
-			if val == "bridged" || val == "user" {
-				cfg.NetworkMode = val
-			} else if val != "" {
-				writeLine(stdout, "Invalid network mode, use 'bridged' or 'user'")
+			val = strings.ToLower(strings.TrimSpace(val))
+			if val == "" {
+				break
 			}
+			mode, err := resolveNetworkMode(val)
+			if err != nil {
+				writef(stdout, "%v\n", err)
+				break
+			}
+			cfg.NetworkMode = mode
 		case 8:
 			if cfg.NetworkMode == "bridged" && runtime.GOOS == "linux" {
-				candidates := vm.DetectUplinkCandidates()
-				if len(candidates) > 1 {
-					writeLine(stdout, "Available interfaces:")
-					for i, iface := range candidates {
-						writef(stdout, "  %d) %s\n", i+1, iface)
+				var wired []string
+				for _, c := range vm.DetectUplinkCandidates() {
+					if !vm.IfaceIsWLAN(c) {
+						wired = append(wired, c)
 					}
-					val, err := prompt(stdin, stdout, fmt.Sprintf("Select interface [1-%d]", len(candidates)))
-					if err != nil {
-						return nil, err
-					}
-					var idx int
-					if _, err := fmt.Sscanf(val, "%d", &idx); err == nil && idx >= 1 && idx <= len(candidates) {
-						cfg.NetworkIface = candidates[idx-1]
-					} else {
-						writeLine(stdout, "Invalid selection")
-					}
+				}
+				if len(wired) == 0 {
+					writeLine(stdout, "No Ethernet uplinks in default routes — bridged mode here does not bridge Wi‑Fi as an uplink. Plug in Ethernet, set -bridge-if, or choose another network mode.")
+					break
+				}
+				if len(wired) == 1 {
+					cfg.NetworkIface = wired[0]
+					writef(stdout, "Using wired uplink %q for bridging.\n", wired[0])
+					break
+				}
+				writeLine(stdout, "Available wired uplinks (Wi‑Fi excluded):")
+				for i, iface := range wired {
+					writef(stdout, "  %d) %s\n", i+1, iface)
+				}
+				val, err := prompt(stdin, stdout, fmt.Sprintf("Select Ethernet interface [1-%d]", len(wired)))
+				if err != nil {
+					return nil, err
+				}
+				var idx int
+				if _, err := fmt.Sscanf(val, "%d", &idx); err == nil && idx >= 1 && idx <= len(wired) {
+					cfg.NetworkIface = wired[idx-1]
 				} else {
-					val, err := prompt(stdin, stdout, "Enter interface name")
-					if err != nil {
-						return nil, err
-					}
-					if val != "" {
-						cfg.NetworkIface = val
-					}
+					writeLine(stdout, "Invalid selection")
 				}
 			} else {
 				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux)")
@@ -1336,6 +1435,45 @@ func defaultBridgeIface() string {
 		return ""
 	}
 	return ""
+}
+
+func defaultNetworkCLIValue() string {
+	if runtime.GOOS == "linux" {
+		return "auto"
+	}
+	return "user"
+}
+
+func resolveNetworkMode(mode string) (string, error) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "":
+		return "", fmt.Errorf("network mode must not be empty")
+	case "auto":
+		if runtime.GOOS == "linux" {
+			if vm.CanSuggestAutoBridged() {
+				return "bridged", nil
+			}
+			if vm.HasUsableLinuxVirbr() {
+				return "virbr", nil
+			}
+			return "user", nil
+		}
+		return "user", nil
+	case "user", "bridged":
+		return m, nil
+	case "virbr":
+		if runtime.GOOS != "linux" {
+			return "", fmt.Errorf("network mode %q is only supported on Linux (use auto, user, or bridged)", m)
+		}
+		return m, nil
+	default:
+		msg := "invalid network mode %q — use auto, user, or bridged"
+		if runtime.GOOS == "linux" {
+			msg += "; on Linux virbr is supported too"
+		}
+		return "", fmt.Errorf(msg, m)
+	}
 }
 
 func macOSFirmwarePath() (string, error) {

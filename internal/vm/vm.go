@@ -12,6 +12,42 @@ import (
 	"time"
 )
 
+// LinuxLibvirtNATBridge is libvirt's usual "default" NAT bridge (<inet 192.168.122.1/24>).
+const LinuxLibvirtNATBridge = "virbr0"
+
+// DefaultVirbrTapName is kairos-lab's tap attached to LinuxLibvirtNATBridge (not the bridged NM tap).
+// Must be ≤15 bytes — Linux IFNAMSIZ; longer names break "ip tuntap add".
+const DefaultVirbrTapName = "kairoslab-vtap0"
+
+// QEMU user-mode (slirp) addressing. We avoid the default 10.0.2.0/24 so the guest shows
+// a 192.168.x.x address while staying on an unlikely-to-collide /24 (many home LANs use
+// 192.168.0.x/1.x; libvirt NAT often uses 192.168.122.0/24).
+const (
+	userSlirpNetCIDR       = "192.168.239.0/24"
+	userSlirpHostFromGuest = "192.168.239.2"  // gateway / host address from the guest
+	userSlirpDHCPFirst     = "192.168.239.15" // first DHCP-assigned lease
+)
+
+func qemuUserNetdevArg() string {
+	return "user,id=net0,net=" + userSlirpNetCIDR +
+		",host=" + userSlirpHostFromGuest +
+		",dhcpstart=" + userSlirpDHCPFirst +
+		",hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080"
+}
+
+// UserNetworkingHint is a concise description for CLI output (NAT asymmetry + forwards).
+func UserNetworkingHint() string {
+	return "user NAT: guest DHCP " + userSlirpNetCIDR + " (often " + userSlirpDHCPFirst +
+		") is only inside QEMU — your laptop does not route to that IP, and ping(ICMP) " +
+		"host→guest is not forwarded; use ssh -p 2222 localhost and http://localhost:8080. " +
+		"Guest→host: ping " + userSlirpHostFromGuest + ". For the same DHCP pool as your LAN router use --network auto (Linux tries bridged) or --network bridged; wired uplink on Linux is most reliable."
+}
+
+// VirbrNetworkingHint describes libvirt default NAT attachment (guest 192.168.122.x, host↔guest without localhost forwards).
+func VirbrNetworkingHint() string {
+	return "NAT on libvirt " + LinuxLibvirtNATBridge + ": DHCP gives 192.168.122.x; ping/SSH/scp from host to guest IP directly; dnsmasq is on virbr — ensure `sudo virsh net-start default` if virbr is down."
+}
+
 type StartConfig struct {
 	ISOPath       string
 	DiskPath      string
@@ -163,17 +199,18 @@ func buildLinux(cfg StartConfig) (string, []string, error) {
 		"-device", "virtio-serial",
 		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 	)
-	if cfg.NetworkMode == "bridged" {
+	switch cfg.NetworkMode {
+	case "bridged", "virbr":
 		if cfg.LinuxTapName == "" {
-			return "", nil, fmt.Errorf("bridged linux mode requires tap name")
+			return "", nil, fmt.Errorf("%s linux mode requires tap name", cfg.NetworkMode)
 		}
 		args = append(args,
 			"-netdev", "tap,id=net0,ifname="+cfg.LinuxTapName+",script=no,downscript=no",
 			"-device", "virtio-net-pci,netdev=net0",
 		)
-	} else {
+	default:
 		args = append(args,
-			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
+			"-netdev", qemuUserNetdevArg(),
 			"-device", "virtio-net-pci,netdev=net0",
 		)
 	}
@@ -235,7 +272,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	} else {
 		args = append(args,
 			"-device", "virtio-net-pci,netdev=net0",
-			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
+			"-netdev", qemuUserNetdevArg(),
 		)
 	}
 	args = append(args,
