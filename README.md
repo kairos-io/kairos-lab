@@ -17,11 +17,15 @@ It helps you:
 - clean VM artifacts (`reset`)
 - clean everything created by the tool (`cleanup`)
 
+> **Found a bug, or want to request a feature?** Open it on
+> [kairos-io/kairos](https://github.com/kairos-io/kairos/issues), including
+> issues about this repository. Every Kairos issue lives in one place, so you
+> never have to work out which repository to file against.
+
 ## Supported Platforms
 
 - macOS
 - Linux
-
 
 Windows is not supported, use your preferred virtualization software to spin up a Kairos VM e.g. VirtualBox. You might be able to run inside WSL but it's not recommended because without KVM support the experience will be terribly slow.
 
