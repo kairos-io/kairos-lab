@@ -86,7 +86,11 @@ func SelectDownloaded(cfg SelectConfig) (string, error) {
 		return "", fmt.Errorf("no ISOs found. Run 'kairos-lab download' first")
 	}
 
+	// Name the choice. This branch takes no input, so without a line here the
+	// only cached ISO is attached with no output at all under `start -yes`,
+	// which is how a wrong ISO booted unnoticed in kairos-io/kairos#4432.
 	if len(isos) == 1 {
+		_, _ = fmt.Fprintf(cfg.Stdout, "Using the only downloaded ISO: %s\n", filepath.Base(isos[0]))
 		return isos[0], nil
 	}
 

@@ -17,11 +17,15 @@ It helps you:
 - clean VM artifacts (`reset`)
 - clean everything created by the tool (`cleanup`)
 
+> **Found a bug, or want to request a feature?** Open it on
+> [kairos-io/kairos](https://github.com/kairos-io/kairos/issues), including
+> issues about this repository. Every Kairos issue lives in one place, so you
+> never have to work out which repository to file against.
+
 ## Supported Platforms
 
 - macOS
 - Linux
-
 
 Windows is not supported, use your preferred virtualization software to spin up a Kairos VM e.g. VirtualBox. You might be able to run inside WSL but it's not recommended because without KVM support the experience will be terribly slow.
 
@@ -173,6 +177,16 @@ QEMU **user** networking (slirp / NAT): the guest gets **`192.168.239.0/24`** (o
 Bridged (`--network bridged`): QEMU's `vmnet-bridged` mode. Requires sudo for QEMU to access vmnet.
 
 **User mode** (`--network user`): no sudo.
+
+The bridge interface defaults to the one holding the host's default route.
+`start` refuses to run when that interface has no link, because vmnet builds
+the bridge anyway and the VM then boots with no DHCP lease and no error. Pass
+`-bridge-if <iface>` to choose a different one, or `-network user` for
+port-forwarded access.
+
+Bridging onto Wi-Fi works on some access points and not on others: many reject
+frames from a MAC other than the one that associated. `start` prints a warning
+when the interface it picked is a Wi-Fi radio.
 
 ### Linux
 
