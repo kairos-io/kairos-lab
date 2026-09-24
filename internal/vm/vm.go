@@ -239,8 +239,11 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	if cfg.MacOSBiosPath == "" {
 		return "", nil, fmt.Errorf("missing macOS qemu firmware path")
 	}
-	if cfg.BridgeIface == "" {
-		cfg.BridgeIface = "en0"
+	if cfg.NetworkMode == "bridged" && cfg.BridgeIface == "" {
+		// Defaulting to a hardcoded en0 here is how a VM ends up bridged onto
+		// an unplugged port with no lease and no warning (kairos-io/kairos#4431).
+		// The caller resolves the interface from the host's default route.
+		return "", nil, fmt.Errorf("missing bridge interface for bridged networking")
 	}
 	args := []string{
 		"-machine", "virt,accel=hvf,highmem=on",
