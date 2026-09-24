@@ -125,13 +125,15 @@ func TestParseDarwinHardwarePorts(t *testing.T) {
 }
 
 func TestValidateBridgeIface(t *testing.T) {
-	if err := validateBridgeIface("en1", "active", []string{"en1"}); err != nil {
+	hostIfaces := []string{"lo0", "en0", "en1", "awdl0", "bridge100"}
+
+	if err := validateBridgeIface("en1", "active", hostIfaces, []string{"en1"}, FlagBridgeControls); err != nil {
 		t.Fatalf("an interface with a link should validate: %v", err)
 	}
 
 	// The exact failure from the issue: en0 is up and RUNNING but has no
 	// cable, so the guest's DHCP requests die on the bridge.
-	err := validateBridgeIface("en0", "inactive", []string{"en1"})
+	err := validateBridgeIface("en0", "inactive", hostIfaces, []string{"en1"}, FlagBridgeControls)
 	if err == nil {
 		t.Fatal("expected an error for an inactive interface")
 	}
@@ -141,7 +143,7 @@ func TestValidateBridgeIface(t *testing.T) {
 		}
 	}
 
-	err = validateBridgeIface("bridge0", "", nil)
+	err = validateBridgeIface("en0", "", hostIfaces, nil, FlagBridgeControls)
 	if err == nil {
 		t.Fatal("expected an error for an interface with no link status")
 	}
@@ -150,9 +152,120 @@ func TestValidateBridgeIface(t *testing.T) {
 	}
 }
 
+// awdl0 is AirDrop and reports "active" on a real Mac, so the link check alone
+// lets an explicit -bridge-if walk past the filter DetectBridgeIfaceCandidates
+// applies (kairos-io/kairos#4649).
+func TestValidateBridgeIfaceRejectsVirtual(t *testing.T) {
+	hostIfaces := []string{"lo0", "en0", "en1", "awdl0", "bridge100"}
+
+	for _, iface := range []string{"awdl0", "bridge100", "lo0"} {
+		err := validateBridgeIface(iface, "active", hostIfaces, []string{"en1"}, FlagBridgeControls)
+		if err == nil {
+			t.Fatalf("%s is virtual and should not be accepted as a bridge interface", iface)
+		}
+		for _, want := range []string{iface, "virtual device", "en1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should mention %q", err, want)
+			}
+		}
+	}
+}
+
+// `ifconfig en9` fails for a name that is not on the host, so its status is ""
+// and used to be reported as a link problem (kairos-io/kairos#4649).
+func TestValidateBridgeIfaceRejectsUnknownName(t *testing.T) {
+	hostIfaces := []string{"lo0", "en0", "en1", "awdl0"}
+
+	err := validateBridgeIface("en9", "", hostIfaces, []string{"en1"}, FlagBridgeControls)
+	if err == nil {
+		t.Fatal("expected an error for an interface that does not exist")
+	}
+	if !strings.Contains(err.Error(), "no such interface en9") {
+		t.Errorf("error %q should say the interface does not exist", err)
+	}
+	if strings.Contains(err.Error(), "link status") {
+		t.Errorf("error %q should not diagnose a link problem for a typo", err)
+	}
+
+	// `ifconfig -l` itself can fail, and then every name is unknown. Fall
+	// back to the link diagnosis rather than calling a real interface a typo.
+	err = validateBridgeIface("en0", "inactive", nil, []string{"en1"}, FlagBridgeControls)
+	if err == nil {
+		t.Fatal("expected an error for an inactive interface")
+	}
+	if strings.Contains(err.Error(), "no such interface") {
+		t.Errorf("error %q should not claim en0 is missing when the host list is empty", err)
+	}
+}
+
 func TestWiFiBridgeWarning(t *testing.T) {
 	warning := wifiBridgeWarning("en1")
 	if !strings.Contains(warning, "en1") || !strings.Contains(warning, "Wi-Fi") {
 		t.Fatalf("warning should name the interface and Wi-Fi: %q", warning)
+	}
+}
+
+// The empty name was unreachable only because all three callers happened to
+// guard against it, and the message it produced named no interface and carried
+// a double space: "no such interface  on this host (...)". The guard belongs in
+// the validator (kairos-io/kairos#4649).
+func TestValidateBridgeIfaceRejectsEmptyName(t *testing.T) {
+	hostIfaces := []string{"lo0", "en0", "en1"}
+
+	err := validateBridgeIface("", "", hostIfaces, []string{"en1"}, FlagBridgeControls)
+	if err == nil {
+		t.Fatal("expected an error for an empty interface name")
+	}
+	if strings.Contains(err.Error(), "no such interface") {
+		t.Errorf("error %q should not read as a missing named interface", err)
+	}
+	if strings.Contains(err.Error(), "  ") {
+		t.Errorf("error %q has a double space where the name should be", err)
+	}
+	// It still has to say what the user can do next.
+	if !strings.Contains(err.Error(), "en1") {
+		t.Errorf("error %q should name the interfaces a bridge could use", err)
+	}
+}
+
+// The advice tail has to match where the user is standing. Inside the config
+// review -bridge-if and -network are already spent, and telling someone to
+// pass a flag to a command that is mid-run is the wrong instruction
+// (kairos-io/kairos#4649).
+func TestValidateBridgeIfaceAdviceFollowsTheCaller(t *testing.T) {
+	hostIfaces := []string{"lo0", "en0", "en1"}
+
+	flagErr := validateBridgeIface("en0", "inactive", hostIfaces, []string{"en1"}, FlagBridgeControls)
+	if flagErr == nil {
+		t.Fatal("expected an error for an inactive interface")
+	}
+	for _, want := range []string{"-bridge-if", "-network user"} {
+		if !strings.Contains(flagErr.Error(), want) {
+			t.Errorf("command-line error %q should mention %q", flagErr, want)
+		}
+	}
+
+	reviewErr := validateBridgeIface("en0", "inactive", hostIfaces, []string{"en1"}, ReviewBridgeControls)
+	if reviewErr == nil {
+		t.Fatal("expected an error for an inactive interface")
+	}
+	for _, want := range []string{"option 8", "option 7"} {
+		if !strings.Contains(reviewErr.Error(), want) {
+			t.Errorf("config-review error %q should mention %q", reviewErr, want)
+		}
+	}
+	for _, unwanted := range []string{"-bridge-if", "-network user"} {
+		if strings.Contains(reviewErr.Error(), unwanted) {
+			t.Errorf("config-review error %q should not send the user to %q", reviewErr, unwanted)
+		}
+	}
+
+	// Both wordings still have to carry the diagnosis itself.
+	for _, err := range []error{flagErr, reviewErr} {
+		for _, want := range []string{"en0", "inactive", "en1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q should mention %q", err, want)
+			}
+		}
 	}
 }
