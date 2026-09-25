@@ -240,10 +240,19 @@ func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 		"-device", "virtio-blk-pci,drive=disk1,bootindex=0",
 	)
 	if cfg.ISOPath != "" {
-		args = append(args,
-			"-drive", "id=cdrom1,if=none,media=cdrom,file="+cfg.ISOPath,
-			"-device", "ide-cd,drive=cdrom1,bootindex=1",
-		)
+		args = append(args, "-drive", "id=cdrom1,if=none,media=cdrom,file="+cfg.ISOPath)
+		if goarch == "arm64" {
+			// The virt machine has no IDE controller, so ide-cd makes QEMU
+			// exit with "No 'IDE' bus found for device 'ide-cd'" before the
+			// firmware runs (kairos-io/kairos#4858). virtio-scsi is the
+			// controller virt does carry, and EDK2 boots a scsi-cd off it.
+			args = append(args,
+				"-device", "virtio-scsi-pci",
+				"-device", "scsi-cd,drive=cdrom1,bootindex=1",
+			)
+		} else {
+			args = append(args, "-device", "ide-cd,drive=cdrom1,bootindex=1")
+		}
 	}
 	args = append(args, "-boot", "menu=on")
 	return binary, args, nil

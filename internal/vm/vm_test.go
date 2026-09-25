@@ -192,3 +192,74 @@ func TestBuildLinuxARM64RejectsAnEmptyFirmwarePath(t *testing.T) {
 		t.Errorf("error %q should name the missing firmware", err)
 	}
 }
+
+// The virt machine has no IDE controller, so the ide-cd the x86 path uses
+// makes QEMU exit with "No 'IDE' bus found for device 'ide-cd'" before the
+// firmware runs. See kairos-io/kairos#4858.
+func TestBuildLinuxARM64AttachesTheISOToABusVirtHas(t *testing.T) {
+	_, args, err := buildLinuxFor("arm64", StartConfig{
+		ISOPath:     "/tmp/kairos.iso",
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+		BiosPath:    "/usr/share/AAVMF/QEMU_EFI.fd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "ide-cd") {
+		t.Errorf("virt has no IDE bus, so the ISO cannot be an ide-cd: %s", joined)
+	}
+	for _, want := range []string{
+		"-device virtio-scsi-pci",
+		"-device scsi-cd,drive=cdrom1,bootindex=1",
+		"-drive id=cdrom1,if=none,media=cdrom,file=/tmp/kairos.iso",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("arm64 ISO attachment is missing %q: %s", want, joined)
+		}
+	}
+}
+
+// The SCSI controller exists only to carry the CD, so a run without an ISO
+// must not add it.
+func TestBuildLinuxARM64AddsNoSCSIControllerWithoutAnISO(t *testing.T) {
+	_, args, err := buildLinuxFor("arm64", StartConfig{
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+		BiosPath:    "/usr/share/AAVMF/QEMU_EFI.fd",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "scsi") {
+		t.Errorf("no ISO means no SCSI controller: %s", joined)
+	}
+}
+
+// q35 has an IDE bus and no SCSI controller, so the amd64 attachment must not
+// follow the arm64 one.
+func TestBuildLinuxAMD64KeepsTheIDECD(t *testing.T) {
+	_, args, err := buildLinuxFor("amd64", StartConfig{
+		ISOPath:     "/tmp/kairos.iso",
+		DiskPath:    "/tmp/kairos.qcow2",
+		CPUs:        2,
+		MemoryMB:    4096,
+		NetworkMode: "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "-device ide-cd,drive=cdrom1,bootindex=1") {
+		t.Errorf("amd64 lost its CD attachment: %s", joined)
+	}
+	if strings.Contains(joined, "scsi") {
+		t.Errorf("amd64 should not gain a SCSI controller: %s", joined)
+	}
+}
