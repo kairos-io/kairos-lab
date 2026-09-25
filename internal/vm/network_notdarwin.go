@@ -10,6 +10,8 @@ func DetectBridgeIfaceCandidates() []string { return nil }
 
 func ValidateBridgeIface(_ string) error { return nil }
 
+func ValidateReviewBridgeIface(_ string) error { return nil }
+
 func IsWiFiIface(_ string) bool { return false }
 
 func WiFiBridgeWarning(iface string) string { return wifiBridgeWarning(iface) }

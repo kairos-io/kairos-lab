@@ -418,20 +418,9 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	// Determine network interface for bridged mode
-	networkIface := *bridgeIface
-	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
-		u, err := vm.PreferWiredUplinkForBridge()
-		if err != nil {
-			return err
-		}
-		networkIface = u
-	}
-	if *network == "bridged" && runtime.GOOS == "darwin" && networkIface == "" {
-		candidates := vm.DetectBridgeIfaceCandidates()
-		if len(candidates) == 0 {
-			return fmt.Errorf("no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)")
-		}
-		networkIface = candidates[0]
+	networkIface, err := resolveBridgeIface(*network, *bridgeIface)
+	if err != nil {
+		return err
 	}
 
 	// For existing disks, seed memory/CPU from the disk's saved settings so
@@ -482,13 +471,15 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		networkIface = vmConfig.NetworkIface
 		*display = vmConfig.Display
 		isoLocal = vmConfig.ISOPath
-	}
-	if *network == "bridged" && runtime.GOOS == "linux" && networkIface == "" {
-		u, err := vm.PreferWiredUplinkForBridge()
+
+		// Option 7 can switch the mode to bridged without option 8 ever
+		// being touched, so resolve the interface again rather than starting
+		// the VM with an empty one (kairos-io/kairos#4649).
+		networkIface, err = resolveBridgeIface(*network, networkIface)
 		if err != nil {
 			return err
 		}
-		networkIface = u
+		vmConfig.NetworkIface = networkIface
 	}
 
 	// Materialize disk — done after review so the config is final.
@@ -1333,6 +1324,19 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 				break
 			}
 			cfg.NetworkMode = mode
+			// Option 7 is the only way bridged mode gets turned on from
+			// inside the review (directly, or through auto), and option 8
+			// renders cfg.NetworkIface verbatim, so resolve it now or the
+			// menu redraws with a blank interface and the user confirms the
+			// configuration without ever seeing which one the VM will use.
+			// runStart resolves again after the review as a backstop
+			// (kairos-io/kairos#4649).
+			iface, err := resolveBridgeIface(cfg.NetworkMode, cfg.NetworkIface)
+			if err != nil {
+				writef(stdout, "%v\n", err)
+			} else {
+				cfg.NetworkIface = iface
+			}
 		case 8:
 			if !bridgedIfaceSelectable(cfg.NetworkMode) {
 				writeLine(stdout, "Invalid option (network interface only available for bridged mode on Linux and macOS)")
@@ -1354,6 +1358,21 @@ func reviewVMConfig(cfg *vmStartConfig, stdin io.Reader, stdout io.Writer) (*vmS
 						cfg.NetworkIface = candidates[idx-1]
 					} else {
 						writeLine(stdout, "Invalid selection")
+					}
+				} else {
+					val, err := prompt(stdin, stdout, "Enter interface name")
+					if err != nil {
+						return nil, err
+					}
+					if val != "" {
+						// Free text walks past the filter
+						// DetectBridgeIfaceCandidates applies, so check it
+						// here too (kairos-io/kairos#4649).
+						if err := vm.ValidateReviewBridgeIface(val); err != nil {
+							writef(stdout, "%v\n", err)
+							break
+						}
+						cfg.NetworkIface = val
 					}
 				}
 				break
@@ -1531,6 +1550,32 @@ func bridgeIfaceCandidates() []string {
 		return vm.DetectBridgeIfaceCandidates()
 	}
 	return nil
+}
+
+// resolveBridgeIface picks the bridge interface for bridged mode when the user
+// named none. It is called both before and after the config review, because
+// the review can turn bridged mode on without ever touching the interface.
+func resolveBridgeIface(networkMode, iface string) (string, error) {
+	if networkMode != "bridged" || iface != "" {
+		return iface, nil
+	}
+	switch runtime.GOOS {
+	case "linux":
+		// Linux bridges onto Ethernet only, so the first wired default-route
+		// uplink wins, and the config review lets the user change it.
+		u, err := vm.PreferWiredUplinkForBridge()
+		if err != nil {
+			return "", fmt.Errorf("no suitable uplink interface found for bridged networking: %w", err)
+		}
+		return u, nil
+	case "darwin":
+		candidates := vm.DetectBridgeIfaceCandidates()
+		if len(candidates) == 0 {
+			return "", fmt.Errorf("no host interface has a link, so bridged networking would leave the VM without an address (use -bridge-if to specify one, or -network user for port-forwarded access)")
+		}
+		return candidates[0], nil
+	}
+	return iface, nil
 }
 
 // bridgedIfaceSelectable reports whether the network interface is the user's

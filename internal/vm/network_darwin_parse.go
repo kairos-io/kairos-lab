@@ -2,6 +2,7 @@ package vm
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -100,15 +101,60 @@ func isWiFiPort(port string) bool {
 	return strings.Contains(port, "wi-fi") || strings.Contains(port, "airport")
 }
 
-// validateBridgeIface turns an interface name plus its `ifconfig` status and
-// the list of interfaces that do have a link into an error the user can act
-// on. status is the value parseDarwinIfaceStatus returned; an interface that
-// reports no status at all cannot carry a bridge either.
+// The two ways out of a bridge validation error, worded for where the user is
+// standing when they read it. On the command line they are flags. Inside the
+// config review the flags are already spent, and the menu options are what the
+// user can still reach (kairos-io/kairos#4649).
+const (
+	FlagBridgeControls   = "use -bridge-if to pick one, or -network user for port-forwarded access"
+	ReviewBridgeControls = "pick option 8 to choose an interface, or option 7 for user-mode networking"
+)
+
+// bridgeIfaceAdvice is the tail every bridge validation error carries: the
+// interfaces a bridge could use instead, and the controls that get the user
+// out of it.
+func bridgeIfaceAdvice(candidates []string, controls string) string {
+	hint := "no host interface currently has a link"
+	if len(candidates) > 0 {
+		hint = "interfaces with a link: " + strings.Join(candidates, ", ")
+	}
+	return hint + "; " + controls
+}
+
+// validateBridgeIface turns an interface name plus its `ifconfig` status, the
+// names of every interface on the host and the ones that can carry a bridge
+// into an error the user can act on. status is the value
+// parseDarwinIfaceStatus returned; an interface that reports no status at all
+// cannot carry a bridge either. existing is what parseDarwinIfaceList read
+// from `ifconfig -l`, and is empty when that call failed. controls is one of
+// the two constants above.
 //
 // A bridge onto a dead interface is never what the caller wanted: the VM boots,
 // the console works, and its DHCP requests reach the vmnet bridge and stop
 // there, so it silently never gets an address (kairos-io/kairos#4431).
-func validateBridgeIface(name, status string, candidates []string) error {
+func validateBridgeIface(name, status string, existing, candidates []string, controls string) error {
+	advice := bridgeIfaceAdvice(candidates, controls)
+
+	// Every caller guards against this today, but they do it by standing in
+	// the right place rather than by asking, and the message an empty name
+	// produced named no interface and carried a double space.
+	if name == "" {
+		return fmt.Errorf("no bridge interface chosen (%s)", advice)
+	}
+	// A name that is not on the host is a typo, not a link problem: `ifconfig
+	// en9` fails, so darwinIfaceStatus returns "" for it, which is
+	// indistinguishable from an interface that genuinely reports no status
+	// (kairos-io/kairos#4649).
+	if len(existing) > 0 && !slices.Contains(existing, name) {
+		return fmt.Errorf("no such interface %s on this host (%s)", name, advice)
+	}
+	// DetectBridgeIfaceCandidates already drops these, so an explicit
+	// -bridge-if or a name typed into the config review is the only way one
+	// reaches here. awdl0 is AirDrop and reports "active" on a real Mac, so
+	// the status check below would wave it through.
+	if isDarwinVirtualInterface(name) {
+		return fmt.Errorf("bridge interface %s is a virtual device, and vmnet can only bridge onto a physical port (%s)", name, advice)
+	}
 	if status == "active" {
 		return nil
 	}
@@ -116,13 +162,9 @@ func validateBridgeIface(name, status string, candidates []string) error {
 	if status != "" {
 		detail = fmt.Sprintf("is %s", status)
 	}
-	hint := "no host interface currently has a link"
-	if len(candidates) > 0 {
-		hint = "interfaces with a link: " + strings.Join(candidates, ", ")
-	}
 	return fmt.Errorf(
-		"bridge interface %s %s, so the VM would boot with no network and no DHCP lease (%s; use -bridge-if to pick one, or -network user for port-forwarded access)",
-		name, detail, hint,
+		"bridge interface %s %s, so the VM would boot with no network and no DHCP lease (%s)",
+		name, detail, advice,
 	)
 }
 
