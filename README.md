@@ -198,6 +198,16 @@ Bridging onto Wi-Fi works on some access points and not on others: many reject
 frames from a MAC other than the one that associated. `start` prints a warning
 when the interface it picked is a Wi-Fi radio.
 
+The bridge interface defaults to the one holding the host's default route.
+`start` refuses to run when that interface has no link, because vmnet builds
+the bridge anyway and the VM then boots with no DHCP lease and no error. Pass
+`-bridge-if <iface>` to choose a different one, or `-network user` for
+port-forwarded access.
+
+Bridging onto Wi-Fi works on some access points and not on others: many reject
+frames from a MAC other than the one that associated. `start` prints a warning
+when the interface it picked is a Wi-Fi radio.
+
 ### Linux
 
 **Bridged LAN** (`--network bridged`): requires **NetworkManager**, **Ethernet** uplink (**Wi‑Fi not supported**).
