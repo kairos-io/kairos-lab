@@ -16,7 +16,7 @@ func macOSBridgeConfig(iface string) StartConfig {
 		CPUs:          2,
 		MemoryMB:      4096,
 		NetworkMode:   "bridged",
-		MacOSBiosPath: "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+		BiosPath:      "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
 		BridgeIface:   iface,
 	}
 }

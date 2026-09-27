@@ -35,9 +35,13 @@ type StartConfig struct {
 	// is a hand-edited or corrupted state file, and a silent fallback would
 	// put two VMs on the same default address. Leading zeroes may be omitted
 	// per octet; the address is padded to the form QEMU parses.
-	MACAddress    string
-	MacOSBiosPath string
-	Detached      bool
+	MACAddress string
+	// BiosPath is the UEFI firmware image. It is required on macOS (every
+	// build) and on Linux arm64, where the virt machine carries no firmware
+	// of its own; it is unused on Linux amd64, whose default machine comes
+	// with SeaBIOS already.
+	BiosPath string
+	Detached bool
 }
 
 // netDeviceArg builds the -device value for the guest NIC.
@@ -173,23 +177,65 @@ func IsRunning(pid int) (bool, error) {
 }
 
 func buildLinux(cfg StartConfig) (string, []string, error) {
+	return buildLinuxFor(runtime.GOARCH, cfg)
+}
+
+// buildLinuxFor takes the architecture as an argument so the arm64 command
+// line can be exercised from an amd64 test host.
+func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 	binary := "qemu-system-x86_64"
-	if runtime.GOARCH == "arm64" {
+	if goarch == "arm64" {
 		binary = "qemu-system-aarch64"
 	}
 	if cfg.DisplayMode == "" {
 		cfg.DisplayMode = "serial"
 	}
 	args := []string{}
-	if runtime.GOARCH == "amd64" {
+	switch goarch {
+	case "amd64":
 		args = append(args, "-enable-kvm", "-cpu", "host")
+	case "arm64":
+		// 1. qemu-system-aarch64 has no default machine: leaving out -machine
+		// exits with "No machine specified, and there is no default", which
+		// is system/vl.c's select_machine() emitting that message once its
+		// call to find_default_machine() comes back NULL, before QEMU ever
+		// reads the ISO. -bios is a separate requirement, not a partner in
+		// that same failure: a command line with -machine but no -bios
+		// starts and runs -- it just boots nothing, because the virt
+		// machine's flash is empty (kairos-io/kairos#4858).
+		//
+		// 2. -enable-kvm and -cpu host are coupled here, not optional extras:
+		// QEMU rejects -cpu host outside KVM/HVF, so this mirrors amd64's
+		// accelerator policy deliberately rather than picking a TCG-safe CPU.
+		// The consequence worth naming: on an arm64 Linux host with no
+		// /dev/kvm (a guest under Lima/UTM, an unprivileged container) start
+		// fails with a KVM error instead of quietly falling back to TCG --
+		// that fallback would need -cpu max instead, and is not what this
+		// restores.
+		//
+		// 3. The macOS sibling folds its accelerator into
+		// "-machine virt,accel=hvf,highmem=on" (see buildMacOS) instead of a
+		// separate flag. The two accelerator spellings are equivalent:
+		// -enable-kvm is shorthand for accel=kvm merged into the same
+		// machine-options dict, and "virt,gic-version=max" here sets no accel
+		// key of its own, so the later -machine does not clear the one
+		// -enable-kvm set.
+		if cfg.BiosPath == "" {
+			return "", nil, fmt.Errorf("missing qemu firmware path for arm64")
+		}
+		args = append(args,
+			"-enable-kvm",
+			"-machine", "virt,gic-version=max",
+			"-cpu", "host",
+			"-bios", cfg.BiosPath,
+		)
 	}
 	switch cfg.DisplayMode {
 	case "serial":
 		args = append(args, "-nographic", "-serial", "mon:stdio")
 	case "window":
 		args = append(args, "-display", "default", "-serial", "mon:stdio")
-		if runtime.GOARCH == "arm64" {
+		if goarch == "arm64" {
 			args = append(args,
 				"-device", "virtio-gpu-pci",
 				"-device", "qemu-xhci",
@@ -258,7 +304,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		cfg.DisplayMode = "serial"
 	}
 	binary := "qemu-system-aarch64"
-	if cfg.MacOSBiosPath == "" {
+	if cfg.BiosPath == "" {
 		return "", nil, fmt.Errorf("missing macOS qemu firmware path")
 	}
 	if cfg.NetworkMode == "bridged" && cfg.BridgeIface == "" {
@@ -272,7 +318,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-cpu", "host",
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
-		"-bios", cfg.MacOSBiosPath,
+		"-bios", cfg.BiosPath,
 		// Same guest-agent trio as buildLinux, spelled identically: the IP
 		// resolver M4 builds will read this socket, and without it that
 		// discovery source will not exist on macOS at all.
