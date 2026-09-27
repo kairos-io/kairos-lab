@@ -1633,6 +1633,18 @@ func TestStartCreatesTheDiskOnceThePrivilegeCheckHasPassed(t *testing.T) {
 	isolateFromHostBinaries(t)
 	seedStartableState(t, "kairos-disk0")
 
+	// This test is about the privilege check, not firmware, but runStart now
+	// resolves firmware as a precondition before disk creation, unconditionally
+	// on darwin. Left unstubbed, firmwareHostPlatform's real body reports the
+	// CI runner's actual GOOS, and on macos-latest that reaches macOSFirmwarePath,
+	// which shells to a real brew isolateFromHostBinaries has hidden -- failing
+	// this run one step earlier than the assertion below expects. Report a pair
+	// that hits firmwarePathFor's default case (no firmware lookup at all), so
+	// the test's own stopping point is unchanged on every host.
+	savedPlatform := firmwareHostPlatform
+	t.Cleanup(func() { firmwareHostPlatform = savedPlatform })
+	firmwareHostPlatform = func() (string, string) { return "linux", "amd64" }
+
 	calls := stubNetworkPrivilege(t, func(string) error { return nil })
 
 	var stdout, stderr bytes.Buffer
