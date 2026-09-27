@@ -8,45 +8,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
-
-// LinuxLibvirtNATBridge is libvirt's usual "default" NAT bridge (<inet 192.168.122.1/24>).
-const LinuxLibvirtNATBridge = "virbr0"
-
-// DefaultVirbrTapName is kairos-lab's tap attached to LinuxLibvirtNATBridge (not the bridged NM tap).
-// Must be ≤15 bytes — Linux IFNAMSIZ; longer names break "ip tuntap add".
-const DefaultVirbrTapName = "kairoslab-vtap0"
-
-// QEMU user-mode (slirp) addressing. We avoid the default 10.0.2.0/24 so the guest shows
-// a 192.168.x.x address while staying on an unlikely-to-collide /24 (many home LANs use
-// 192.168.0.x/1.x; libvirt NAT often uses 192.168.122.0/24).
-const (
-	userSlirpNetCIDR       = "192.168.239.0/24"
-	userSlirpHostFromGuest = "192.168.239.2"  // gateway / host address from the guest
-	userSlirpDHCPFirst     = "192.168.239.15" // first DHCP-assigned lease
-)
-
-func qemuUserNetdevArg() string {
-	return "user,id=net0,net=" + userSlirpNetCIDR +
-		",host=" + userSlirpHostFromGuest +
-		",dhcpstart=" + userSlirpDHCPFirst +
-		",hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080"
-}
-
-// UserNetworkingHint is a concise description for CLI output (NAT asymmetry + forwards).
-func UserNetworkingHint() string {
-	return "user NAT: guest DHCP " + userSlirpNetCIDR + " (often " + userSlirpDHCPFirst +
-		") is only inside QEMU — your laptop does not route to that IP, and ping(ICMP) " +
-		"host→guest is not forwarded; use ssh -p 2222 localhost and http://localhost:8080. " +
-		"Guest→host: ping " + userSlirpHostFromGuest + ". For the same DHCP pool as your LAN router use --network auto (Linux tries bridged) or --network bridged; wired uplink on Linux is most reliable."
-}
-
-// VirbrNetworkingHint describes libvirt default NAT attachment (guest 192.168.122.x, host↔guest without localhost forwards).
-func VirbrNetworkingHint() string {
-	return "NAT on libvirt " + LinuxLibvirtNATBridge + ": DHCP gives 192.168.122.x; ping/SSH/scp from host to guest IP directly; dnsmasq is on virbr — ensure `sudo virsh net-start default` if virbr is down."
-}
 
 type StartConfig struct {
 	ISOPath       string
@@ -58,10 +23,54 @@ type StartConfig struct {
 	MemoryMB      int
 	NetworkMode   string
 	DisplayMode   string
-	BridgeIface   string
-	LinuxTapName  string
-	BiosPath      string
+	// BridgeIface is the host interface to bridge onto. It is meaningful only
+	// for "bridged" mode; "shared" attaches to no host interface and "user"
+	// needs none, so both must leave it empty.
+	BridgeIface  string
+	LinuxTapName string
+	// MACAddress is the guest NIC address, in the usual colon-separated hex
+	// form. Leaving it empty (or whitespace-only) omits it from the command
+	// line, so QEMU falls back to its own default. A non-empty value that is
+	// not a well-formed MAC is an error, not a fallback: the realistic source
+	// is a hand-edited or corrupted state file, and a silent fallback would
+	// put two VMs on the same default address. Leading zeroes may be omitted
+	// per octet; the address is padded to the form QEMU parses.
+	MACAddress    string
+	MacOSBiosPath string
 	Detached      bool
+}
+
+// netDeviceArg builds the -device value for the guest NIC.
+//
+// A blank address -- unset, or nothing but whitespace -- is the documented
+// graceful path: the bare device goes on the command line and QEMU falls back
+// to its own default address, so a caller that never set the field still
+// starts. Emitting a dangling "mac=" instead would be a command line QEMU
+// rejects, which is why the blank check trims first; " " used to slip past it.
+//
+// Anything else that is not a MAC is an error, not a silent fallback. The
+// value is pasted into a COMMA-SEPARATED QEMU option list, so
+// "52:54:00:12:34:56,romfile=/tmp/evil.rom" would inject further device
+// properties rather than set an address. From M5 the address is read out of
+// the user's state.json, where a corrupted or hand-edited entry would
+// otherwise surface as an opaque QEMU startup abort naming neither the MAC nor
+// the file it came from; falling back to QEMU's default instead would hand the
+// VM the colliding address MACForDisk exists to avoid. So: fail, and name the
+// offending value.
+//
+// The address is emitted in CanonicalMAC's zero-padded form, which is what
+// QEMU's parser wants -- never NormalizeMAC's zero-stripped comparison form.
+func netDeviceArg(mac string) (string, error) {
+	const device = "virtio-net-pci,netdev=net0"
+	if strings.TrimSpace(mac) == "" {
+		return device, nil
+	}
+	canonical, ok := CanonicalMAC(mac)
+	if !ok {
+		return "", fmt.Errorf("invalid MAC address %q in the stored VM configuration: "+
+			"expected six colon-separated hex octets, for example 52:54:00:12:34:56", mac)
+	}
+	return device + ",mac=" + canonical, nil
 }
 
 type Process struct {
@@ -164,44 +173,23 @@ func IsRunning(pid int) (bool, error) {
 }
 
 func buildLinux(cfg StartConfig) (string, []string, error) {
-	return buildLinuxFor(runtime.GOARCH, cfg)
-}
-
-// buildLinuxFor takes the architecture as an argument so the arm64 command
-// line can be exercised from an amd64 test host.
-func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 	binary := "qemu-system-x86_64"
-	if goarch == "arm64" {
+	if runtime.GOARCH == "arm64" {
 		binary = "qemu-system-aarch64"
 	}
 	if cfg.DisplayMode == "" {
 		cfg.DisplayMode = "serial"
 	}
 	args := []string{}
-	switch goarch {
-	case "amd64":
+	if runtime.GOARCH == "amd64" {
 		args = append(args, "-enable-kvm", "-cpu", "host")
-	case "arm64":
-		// qemu-system-aarch64 has no default machine, and the virt machine
-		// carries no firmware of its own, so QEMU exits with "No machine
-		// specified" long before it reaches the ISO unless both are spelled
-		// out here (kairos-io/kairos#4858).
-		if cfg.BiosPath == "" {
-			return "", nil, fmt.Errorf("missing qemu firmware path for arm64")
-		}
-		args = append(args,
-			"-enable-kvm",
-			"-machine", "virt,gic-version=max",
-			"-cpu", "host",
-			"-bios", cfg.BiosPath,
-		)
 	}
 	switch cfg.DisplayMode {
 	case "serial":
 		args = append(args, "-nographic", "-serial", "mon:stdio")
 	case "window":
 		args = append(args, "-display", "default", "-serial", "mon:stdio")
-		if goarch == "arm64" {
+		if runtime.GOARCH == "arm64" {
 			args = append(args,
 				"-device", "virtio-gpu-pci",
 				"-device", "qemu-xhci",
@@ -220,19 +208,32 @@ func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 		"-device", "virtio-serial",
 		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 	)
+	// Every mode attaches the same NIC to netdev net0 and differs only in the
+	// -netdev backend, so the device is built once here: one MAC validation,
+	// one place for the two builders to stay identical.
+	nic, err := netDeviceArg(cfg.MACAddress)
+	if err != nil {
+		return "", nil, err
+	}
 	switch cfg.NetworkMode {
-	case "bridged", "virbr":
+	case "shared", "bridged":
+		// On Linux both modes present the guest a tap device on a
+		// NetworkManager bridge; only the bridge's own IPv4 method differs
+		// (shared NATs, bridged takes a lease off the LAN), and that is
+		// configured when the bridge is created, not here.
 		if cfg.LinuxTapName == "" {
 			return "", nil, fmt.Errorf("%s linux mode requires tap name", cfg.NetworkMode)
 		}
 		args = append(args,
 			"-netdev", "tap,id=net0,ifname="+cfg.LinuxTapName+",script=no,downscript=no",
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", nic,
 		)
 	default:
+		// Any unknown or empty mode falls back to user networking rather than
+		// leaving the guest with no NIC at all.
 		args = append(args,
-			"-netdev", qemuUserNetdevArg(),
-			"-device", "virtio-net-pci,netdev=net0",
+			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
+			"-device", nic,
 		)
 	}
 	args = append(args,
@@ -257,7 +258,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		cfg.DisplayMode = "serial"
 	}
 	binary := "qemu-system-aarch64"
-	if cfg.BiosPath == "" {
+	if cfg.MacOSBiosPath == "" {
 		return "", nil, fmt.Errorf("missing macOS qemu firmware path")
 	}
 	if cfg.NetworkMode == "bridged" && cfg.BridgeIface == "" {
@@ -271,7 +272,26 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		"-cpu", "host",
 		"-smp", strconv.Itoa(cfg.CPUs),
 		"-m", strconv.Itoa(cfg.MemoryMB),
-		"-bios", cfg.BiosPath,
+		"-bios", cfg.MacOSBiosPath,
+		// Same guest-agent trio as buildLinux, spelled identically: the IP
+		// resolver M4 builds will read this socket, and without it that
+		// discovery source will not exist on macOS at all.
+		//
+		// It will be the LAST resort there, though, behind the DHCP lease file
+		// and the ARP cache: on macOS -- and only on macOS -- QEMU is launched
+		// under sudo, for BOTH vmnet modes, bridged and shared
+		// (internal/app/app.go, the vmnetNeedsSudo branch). vmnet-shared needs
+		// root exactly as vmnet-bridged does, so the socket is root-owned in
+		// either of them, and connecting to a unix socket needs write
+		// permission: a resolver running as the user gets EACCES. Only user
+		// mode escapes it. M4 should treat QGA on macOS as best-effort, not a
+		// source to depend on.
+		//
+		// "virtio-serial" is an alias that qdev resolves to virtio-serial-pci
+		// on QEMU_ARCH_ARM, so it is valid on the aarch64 virt machine.
+		"-chardev", "socket,path=" + cfg.QGASocketPath + ",server=on,wait=off,id=qga0",
+		"-device", "virtio-serial",
+		"-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
 	}
 	switch cfg.DisplayMode {
 	case "serial":
@@ -288,15 +308,32 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 	default:
 		return "", nil, fmt.Errorf("invalid display mode: %s", cfg.DisplayMode)
 	}
-	if cfg.NetworkMode == "bridged" {
+	// Same single NIC device as buildLinux, built once before the switch.
+	nic, err := netDeviceArg(cfg.MACAddress)
+	if err != nil {
+		return "", nil, err
+	}
+	switch cfg.NetworkMode {
+	case "shared":
+		// No ifname here, ever: vmnet-shared attaches to no host interface by
+		// design, NetdevVmnetSharedOptions has no ifname member, and the opts
+		// visitor fails a leftover key with "Invalid parameter '%s'" -- so
+		// passing one is a hard QEMU startup abort, not an ignored option.
 		args = append(args,
-			"-device", "virtio-net-pci,netdev=net0",
+			"-device", nic,
+			"-netdev", "vmnet-shared,id=net0",
+		)
+	case "bridged":
+		args = append(args,
+			"-device", nic,
 			"-netdev", "vmnet-bridged,id=net0,ifname="+cfg.BridgeIface,
 		)
-	} else {
+	default:
+		// Any unknown or empty mode falls back to user networking rather than
+		// leaving the guest with no NIC at all.
 		args = append(args,
-			"-device", "virtio-net-pci,netdev=net0",
-			"-netdev", qemuUserNetdevArg(),
+			"-device", nic,
+			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
 		)
 	}
 	args = append(args,

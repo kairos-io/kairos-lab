@@ -2,11 +2,7 @@
 
 package vm
 
-import (
-	"fmt"
-
-	"github.com/kairos-io/kairos-lab/internal/state"
-)
+import "github.com/kairos-io/kairos-lab/internal/state"
 
 const (
 	DefaultBridgeName = "kairoslab0"
@@ -17,34 +13,18 @@ func PrepareLinuxBridge(_ *state.State, _ string) error {
 	return nil
 }
 
+func PrepareLinuxShared(_ *state.State, _ string) error {
+	return nil
+}
+
 func CleanupLinuxBridge(_ *state.State) error {
 	return nil
 }
 
-func PrepareLinuxVirbrTap(_ *state.State) error {
-	return fmt.Errorf("virbr networking is only supported on Linux")
-}
-
-func CleanupLinuxVirbrTap(_ *state.State) error {
-	return nil
-}
-
-func HasUsableLinuxVirbr() bool {
-	return false
-}
-
-func IfaceIsWLAN(_ string) bool {
-	return false
-}
-
-func PreferWiredUplinkForBridge() (string, error) {
-	return "", fmt.Errorf("bridged uplink selection is Linux-only")
-}
-
-func CanSuggestAutoBridged() bool {
-	return false
-}
-
+// IsLinuxBridge is a function here and a function on Linux too, where the
+// swappable seam the tests need is an unexported var one level down. Keeping
+// the exported identifier the same kind on both platforms is what stops
+// `vm.IsLinuxBridge = f` from compiling on one GOOS and failing on the other.
 func IsLinuxBridge(_ string) bool {
 	return false
 }
