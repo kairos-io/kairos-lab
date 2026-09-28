@@ -9,15 +9,15 @@ const (
 	DefaultTapName    = "kairoslab-tap0"
 )
 
-func PrepareLinuxBridge(_ *state.State, _ string) error {
+func PrepareLinuxBridge(_ *state.State, _ string, _ int, _ bool) error {
 	return nil
 }
 
-func PrepareLinuxShared(_ *state.State, _ string) error {
+func PrepareLinuxShared(_ *state.State, _ string, _ int, _ bool) error {
 	return nil
 }
 
-func CleanupLinuxBridge(_ *state.State) error {
+func CleanupLinuxBridge(_ *state.State, _ state.VM, _ bool) error {
 	return nil
 }
 

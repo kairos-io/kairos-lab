@@ -19,48 +19,59 @@ const (
 	DefaultTapName    = "kairoslab-tap0"
 )
 
-// linuxNetworkPreflight performs the host-side checks PrepareLinuxBridge and
-// PrepareLinuxShared both make, and resolves the bridge and tap names each of
-// them goes on to build. mode is the user-facing network mode ("bridged",
-// "shared"); it appears in the NetworkManager error so the message names the
-// mode the caller actually asked for.
-func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, tap string, err error) {
-	if !networkManagerActive() {
-		return "", "", fmt.Errorf("NetworkManager is required for %s networking on Linux. Please install and enable NetworkManager, or use --network user for port-forwarded access", mode)
-	}
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		return "", "", fmt.Errorf("create runtime directory: %w", err)
-	}
-	bridge = st.Network.BridgeName
+// resolveLinuxBridgeName resolves and validates the host-level bridge name --
+// st.Network.BridgeName, or DefaultBridgeName when unset. Unlike the tap, the
+// bridge is not per-VM (D2: one bridge, many taps), so it is resolved once,
+// before either PrepareLinuxBridge or PrepareLinuxShared can compute this
+// VM's own tap connection name (TapConnNameForIndex takes the bridge as an
+// argument).
+func resolveLinuxBridgeName(st *state.State) (string, error) {
+	bridge := st.Network.BridgeName
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	tap = st.Network.TapName
-	if tap == "" {
-		tap = DefaultTapName
-	}
-
-	// Both names were just read out of state.json, and both are about to be
-	// interpolated into root-run nmcli and ip commands, into a filesystem path
-	// and into the cleanup plan the user is asked to confirm. Validate them
-	// here, at the single point where both modes resolve them, rather than at
-	// each of those call sites. A rejected name is an error and not a quiet
-	// fall back to the default: a value someone put in state.json that
-	// silently does nothing is its own surprise.
+	// This name was just read out of state.json, and is about to be
+	// interpolated into root-run nmcli and ip commands, into a filesystem
+	// path and into the cleanup plan the user is asked to confirm. A
+	// rejected name is an error and not a quiet fall back to the default: a
+	// value someone put in state.json that silently does nothing is its own
+	// surprise.
 	if err := validateStoredInterfaceName("bridge name", bridge); err != nil {
-		return "", "", err
+		return "", err
 	}
-	if err := validateStoredInterfaceName("tap name", tap); err != nil {
-		return "", "", err
+	return bridge, nil
+}
+
+// linuxNetworkPreflight performs the host-side checks PrepareLinuxBridge and
+// PrepareLinuxShared both make, once bridge and tapConn -- this VM's own,
+// already resolved from its index -- are known. mode is the user-facing
+// network mode ("bridged", "shared"); it appears in the NetworkManager error
+// so the message names the mode the caller actually asked for.
+//
+// siblingLive is D3's fix for hazard (A): when true, a live sibling already
+// holds this bridge and the stale-cleanup branch below is skipped entirely,
+// so this start joins the bridge instead of tearing down what the sibling is
+// using. When false -- no other VM in this config dir is live -- today's
+// teardown runs unchanged, so a single-VM host still recovers from a
+// genuinely stale bridge exactly as before this change.
+func linuxNetworkPreflight(st *state.State, runtimeDir, mode, bridge, tapDevice, tapConn string, siblingLive bool) error {
+	if !networkManagerActive() {
+		return fmt.Errorf("NetworkManager is required for %s networking on Linux. Please install and enable NetworkManager, or use --network user for port-forwarded access", mode)
+	}
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		return fmt.Errorf("create runtime directory: %w", err)
 	}
 
 	// Check for stale resources from a previous run. The predicate is shared
 	// with HasStaleNetworkResources so the two cannot disagree about what
 	// stale means; see hasStaleBridgeResources for why every term of it
-	// matters to the shared path too.
-	if hasStaleBridgeResources(bridge) {
+	// matters to the shared path too. It is skipped outright when a sibling
+	// is live: see siblingLive above.
+	if !siblingLive && hasStaleBridgeResources(bridge, tapConn) {
 		fmt.Println("Found stale network configuration, cleaning up...")
-		cleanupErr := cleanupNMConnections(bridge, tap)
+		// false: this branch only runs when no sibling is live, so the full,
+		// unrestricted teardown is exactly what today's single-VM host gets.
+		cleanupErr := cleanupNMConnections(bridge, tapDevice, tapConn, false)
 		// A leftover that will not go is fatal for shared and survivable for
 		// bridged. Every connection this teardown deletes is one the bridged
 		// path recreates and re-modifies a few lines later, with the master,
@@ -93,7 +104,7 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		// the joined error, so the message names the gates instead of
 		// listing the steps as though they had all run.
 		if cleanupErr != nil && mode == "shared" {
-			return "", "", fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
+			return fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
 				"The cleanup does not stop at its first failure, so every step after the one above was still attempted where it had anything to attempt, and the failure above names each one that failed. Several steps do nothing when there is nothing to do: the `ip link delete`s run only for an interface `ip link show` can see, and the reconnect runs only when an interface was found on the bridge AND this cleanup deleted the connection that would otherwise be reactivated over it -- so a reconnect can be skipped for a NIC that is on the bridge, and the line above this refusal says so when it is. After a reboot, where the connection keyfiles survive and the interfaces do not, the delete that failed above can be the only command this cleanup issued at all. "+
 				"Where it did issue something, the host's networking has changed, and a physical interface can be left with no active connection -- `nmcli device status` shows which, and `sudo nmcli connection up <profile>` puts it back on the profile you name. Prefer that to `sudo nmcli device connect <iface>`, which activates whichever profile NetworkManager rates best for the device, routinely the bridge-slave profile after a bridged run -- one of the leftovers this cleanup was trying to remove. "+
 				"The start is refused rather than attempted because shared mode enslaves no host interface: its bridge carries ipv4.method shared and its only port is meant to be the tap, and a leftover this tool could not remove may be what attaches a NIC to that bridge. "+
@@ -102,7 +113,7 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode string) (bridge, ta
 		}
 		time.Sleep(staleCleanupSettleDelay)
 	}
-	return bridge, tap, nil
+	return nil
 }
 
 // staleCleanupSettleDelay is how long the preflight waits after tearing down a
@@ -139,17 +150,35 @@ var staleCleanupSettleDelay = 2 * time.Second
 //
 // linuxNetworkPreflight and HasStaleNetworkResources both call this so the
 // narrower of the two predicates cannot drift back into existence.
-func hasStaleBridgeResources(bridge string) bool {
+//
+// tapConn (M2) is this VM's own indexed tap connection name -- <bridge>-tap
+// at index 0, byte-identical to what this predicate always checked, and
+// <bridge>-tapN above it -- rather than a hardcoded <bridge>-tap, so a
+// leftover from a crashed run at THIS index is what is detected, and a live
+// sibling sitting at a different index is not read as staleness. siblingLive
+// already gates whether this predicate is even consulted; see
+// linuxNetworkPreflight.
+func hasStaleBridgeResources(bridge, tapConn string) bool {
 	return IsLinuxBridge(bridge) || nmConnectionExists(bridge) ||
-		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(bridge+"-tap")
+		nmConnectionExists(bridge+"-uplink") || nmConnectionExists(tapConn)
 }
 
-func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
+// PrepareLinuxBridge prepares the host side of --network bridged for one VM,
+// identified by index (D6/D7). siblingLive is D3's fix for hazard (A): true
+// when another VM in this config dir is currently live, which skips the
+// stale-cleanup branch that would otherwise tear down a bridge a sibling is
+// using.
+func PrepareLinuxBridge(st *state.State, runtimeDir string, index int, siblingLive bool) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	bridge, tap, err := linuxNetworkPreflight(st, runtimeDir, "bridged")
+	bridge, err := resolveLinuxBridgeName(st)
 	if err != nil {
+		return err
+	}
+	tap := TapNameForIndex(index)
+	tapConn := TapConnNameForIndex(bridge, index)
+	if err := linuxNetworkPreflight(st, runtimeDir, "bridged", bridge, tap, tapConn, siblingLive); err != nil {
 		return err
 	}
 
@@ -183,7 +212,7 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 		return fmt.Errorf("uplink interface must be a physical host iface, got virtual interface: %s (use -bridge-if to specify a physical interface like eth0, enp*, or wlan*)", uplink)
 	}
 
-	if err := prepareLinuxBridgeWithNM(bridge, tap, uplink); err != nil {
+	if err := prepareLinuxBridgeWithNM(bridge, tap, tapConn, uplink); err != nil {
 		return err
 	}
 
@@ -205,13 +234,12 @@ func PrepareLinuxBridge(st *state.State, runtimeDir string) error {
 	return nil
 }
 
-func prepareLinuxBridgeWithNM(bridge, tap, uplink string) error {
+func prepareLinuxBridgeWithNM(bridge, tap, tapConn, uplink string) error {
 	if !nmcliAvailable() {
 		return fmt.Errorf("NetworkManager is active but nmcli is not installed")
 	}
 	bridgeConn := bridge
 	uplinkConn := bridge + "-uplink"
-	tapConn := bridge + "-tap"
 	uid, err := tapOwnerUID()
 	if err != nil {
 		return err
@@ -273,16 +301,21 @@ func prepareLinuxBridgeWithNM(bridge, tap, uplink string) error {
 // associate. And because the masquerade rule NetworkManager installs matches
 // on the source subnet with no output-interface match, the host can move from
 // Wi-Fi to Ethernet under a running VM without any rule churn.
-func PrepareLinuxShared(st *state.State, runtimeDir string) error {
+func PrepareLinuxShared(st *state.State, runtimeDir string, index int, siblingLive bool) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	bridge, tap, err := linuxNetworkPreflight(st, runtimeDir, "shared")
+	bridge, err := resolveLinuxBridgeName(st)
 	if err != nil {
 		return err
 	}
+	tap := TapNameForIndex(index)
+	tapConn := TapConnNameForIndex(bridge, index)
+	if err := linuxNetworkPreflight(st, runtimeDir, "shared", bridge, tap, tapConn, siblingLive); err != nil {
+		return err
+	}
 
-	if err := prepareLinuxSharedWithNM(bridge, tap); err != nil {
+	if err := prepareLinuxSharedWithNM(bridge, tap, tapConn, siblingLive); err != nil {
 		return err
 	}
 
@@ -302,12 +335,11 @@ func PrepareLinuxShared(st *state.State, runtimeDir string) error {
 	return nil
 }
 
-func prepareLinuxSharedWithNM(bridge, tap string) error {
+func prepareLinuxSharedWithNM(bridge, tap, tapConn string, siblingLive bool) error {
 	if !nmcliAvailable() {
 		return fmt.Errorf("NetworkManager is active but nmcli is not installed")
 	}
 	bridgeConn := bridge
-	tapConn := bridge + "-tap"
 	uid, err := tapOwnerUID()
 	if err != nil {
 		return err
@@ -363,11 +395,11 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// revertAfterSharedWritten.
 	if !nmConnectionExists(tapConn) {
 		if err := sudo("nmcli", "connection", "add", "type", "tun", "ifname", tap, "con-name", tapConn, "mode", "tap", "owner", uid, "master", bridgeConn, "slave-type", "bridge", "autoconnect", "no"); err != nil {
-			return revertAfterSharedWritten(bridgeConn, tapConn, err)
+			return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
 		}
 	}
 	if err := sudo("nmcli", "connection", "modify", tapConn, "connection.interface-name", tap, "tun.mode", "tap", "tun.owner", uid, "master", bridgeConn, "slave-type", "bridge", "connection.autoconnect", "no"); err != nil {
-		return revertAfterSharedWritten(bridgeConn, tapConn, err)
+		return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
 	}
 
 	// The port assertion. What it asks the kernel is which interfaces are
@@ -397,11 +429,11 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// was on it still on it. The connection profile has just been re-pointed
 	// at ipv4.method shared, so this is the last moment before that method is
 	// applied to a bridge carrying somebody's NIC.
-	if err := refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap); err != nil {
+	if err := refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap, siblingLive); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
-		return revertAfterSharedWritten(bridgeConn, tapConn, err)
+		return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
 	}
 	// Again now the bridge is up, which is the check that catches the hazard
 	// this mode is guarded against: a profile carrying `master <bridge>
@@ -409,11 +441,11 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// the controller activates, whether the preflight's connection probes
 	// could see that profile or not. The tap comes up only after this passes,
 	// so a refused run never puts a guest on the bridge.
-	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached); err != nil {
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached, siblingLive); err != nil {
 		return err
 	}
 	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
-		return revertAfterSharedWritten(bridgeConn, tapConn, err)
+		return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
 	}
 	// And once more with the tap attached, where the expected port list is
 	// exactly the tap. `nmcli connection up` returns when the connection has
@@ -429,7 +461,7 @@ func prepareLinuxSharedWithNM(bridge, tap string) error {
 	// The window is narrowed and not closed: nothing reads the port list
 	// again once this function returns, and nothing watches it while the VM
 	// runs.
-	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapAttached); err != nil {
+	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapAttached, siblingLive); err != nil {
 		return err
 	}
 	return nil
@@ -482,7 +514,7 @@ const (
 // state.json, and validateStoredInterfaceName accepts "bond0" in it. "There
 // is no device of this name" is the only fact that implies "no ports", and it
 // is the fact this asks for.
-func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string) error {
+func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string, siblingLive bool) error {
 	exists, err := netDeviceExists(bridge)
 	if err != nil {
 		return fmt.Errorf("shared networking will not start over bridge %s, because this start could not tell whether a device of that name is already on this host: %w. "+
@@ -491,12 +523,12 @@ func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string) error 
 			"`ls -ld /sys/class/net/ /sys/class/net/%s` shows what could not be read; a /sys/class/net this user cannot read is the cause that reaches this message. "+
 			"%s. "+
 			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
-			bridge, err, bridgeConn, bridge, revertSharedSetup(bridgeConn, tapConn))
+			bridge, err, bridgeConn, bridge, revertSharedSetup(bridgeConn, tapConn, siblingLive))
 	}
 	if !exists {
 		return nil
 	}
-	return refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached)
+	return refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached, siblingLive)
 }
 
 // refuseForeignBridgePort enforces the invariant shared mode exists for: the
@@ -535,7 +567,7 @@ func refusePreexistingBridgePort(bridge, bridgeConn, tapConn, tap string) error 
 // may be one this tool never created, and deleting a user's network
 // configuration on their behalf is the failure mode this whole path exists to
 // avoid.
-func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttached bool) error {
+func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttached, siblingLive bool) error {
 	out, err := bridgeSlaveLinks(bridge)
 	if err != nil {
 		return fmt.Errorf("shared networking will not start over bridge %s, because the check that nothing is attached to it could not be run: `ip -o link show master %s` failed: %w. "+
@@ -544,13 +576,28 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 			"The same list is in `ls /sys/class/net/%s/brif` when that device is a Linux bridge, and that needs none of them: if it names an interface of yours, something is attaching that interface to this bridge; if it is empty, `sudo ip link delete %s` removes the leftover device and the next start builds its own. "+
 			"%s. "+
 			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
-			bridge, bridge, err, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
+			bridge, bridge, err, bridge, bridge, revertSharedSetup(bridgeConn, tapConn, siblingLive))
 	}
-	var expected []string
-	if tapIsAttached {
-		expected = []string{tap}
+	// D5: a port is expected -- and therefore never refused -- when it is
+	// this VM's own tap (once attached) or when it satisfies
+	// bridgePortExempt's three-part test: a generated tap name, a tun/tap
+	// device (condition 2, which is what keeps a renamed physical NIC from
+	// ever qualifying), owned by the uid this start itself would create a
+	// tap as. That is the bounded weakening D5 accepts in exchange for
+	// letting a second VM join a bridge a live sibling already has a tap on
+	// -- a leftover from a crashed run used to be refused by the old,
+	// stricter "the list must be empty" rule; it is accepted now, and
+	// condition 2 is what still keeps a real host NIC out.
+	var unexpected []string
+	for _, port := range parseBridgePorts(out) {
+		if tapIsAttached && port == tap {
+			continue
+		}
+		if bridgePortExempt(port) {
+			continue
+		}
+		unexpected = append(unexpected, port)
 	}
-	unexpected := unexpectedBridgePorts(parseBridgePorts(out), expected)
 	if len(unexpected) == 0 {
 		return nil
 	}
@@ -560,9 +607,9 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 	// the second, with no hint there had been more. It also says what it
 	// observed and no more than that -- a port list read out of the kernel --
 	// because it observed no profile and used to claim one.
-	expectation := fmt.Sprintf("this bridge is meant to have no ports at all at this point, since the tap %s is attached by a later step of this same start", tap)
+	expectation := fmt.Sprintf("this bridge is meant to carry only generated, kairos-lab-owned taps at this point, since the tap %s is attached by a later step of this same start", tap)
 	if tapIsAttached {
-		expectation = fmt.Sprintf("the only port this bridge is meant to have is the tap %s", tap)
+		expectation = fmt.Sprintf("the only ports this bridge is meant to have are the tap %s and any other generated, kairos-lab-owned taps", tap)
 	}
 	return fmt.Errorf("shared networking will not run over bridge %s: `ip -o link show master %s` reports %s on it, and %s. "+
 		"That port list is all this start observed. It is the kernel's own answer about what is attached to the bridge; which profile attached it, or whether any profile did, was not looked at and is not claimed here. "+
@@ -571,7 +618,56 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 		"Put an interface back with `sudo nmcli connection up <profile>` naming the profile you want, and only once the offending one is gone or re-pointed: `nmcli device connect <iface>` activates whichever profile NetworkManager rates best for that device, and after a bridged run that is routinely the bridge-slave profile it left behind, which attaches the interface to a bridge again. "+
 		"%s. "+
 		"Then start again, or use -network bridged, which attaches an interface to its bridge on purpose",
-		bridge, bridge, quoteNames(unexpected), expectation, bridge, bridge, revertSharedSetup(bridgeConn, tapConn))
+		bridge, bridge, quoteNames(unexpected), expectation, bridge, bridge, revertSharedSetup(bridgeConn, tapConn, siblingLive))
+}
+
+// bridgePortExempt is D5's three-part test: a port already on the bridge is
+// exempt from refusal only when all three hold --
+//
+//  1. the name parses as one this tool would itself generate for some VM
+//     index (IsGeneratedTapName);
+//  2. /sys/class/net/<name>/tun_flags is readable, which exists only for a
+//     tun/tap device and is what keeps a renamed physical NIC from ever
+//     qualifying, whatever it is named;
+//  3. /sys/class/net/<name>/owner equals the uid this start's own tap would
+//     be created with (tapOwnerUID).
+//
+// Any read failure means NOT exempt -- fail closed, the same direction as
+// every other probe on this path.
+func bridgePortExempt(name string) bool {
+	if _, ok := IsGeneratedTapName(name); !ok {
+		return false
+	}
+	if !tapSysfsTunFlagsReadable(name) {
+		return false
+	}
+	owner, ok := tapSysfsOwnerUID(name)
+	if !ok {
+		return false
+	}
+	want, err := tapOwnerUID()
+	if err != nil {
+		return false
+	}
+	return owner == want
+}
+
+// tapSysfsTunFlagsReadable and tapSysfsOwnerUID are swappable seams over the
+// two /sys reads D5 conditions 2 and 3 need, for the same reason
+// statNetDevice is one: a test drives them without a real tap device on the
+// host running it. Nothing in production assigns them; tests restore the
+// originals with t.Cleanup.
+var tapSysfsTunFlagsReadable = func(name string) bool {
+	_, err := os.Stat(filepath.Join(sysClassNet, name, "tun_flags"))
+	return err == nil
+}
+
+var tapSysfsOwnerUID = func(name string) (string, bool) {
+	b, err := os.ReadFile(filepath.Join(sysClassNet, name, "owner"))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(b)), true
 }
 
 // revertAfterSharedWritten turns a failure from one of the steps that run
@@ -600,10 +696,10 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 // wrote nothing, and the bridge connection it names may be one that predates
 // this start, so reverting there would delete a user's profile over a command
 // that changed nothing.
-func revertAfterSharedWritten(bridgeConn, tapConn string, cause error) error {
+func revertAfterSharedWritten(bridgeConn, tapConn string, siblingLive bool, cause error) error {
 	return fmt.Errorf("shared networking setup failed after ipv4.method shared had already been written to connection %s: %w. "+
 		"That setting is persisted as soon as nmcli returns, so this start tried to take it back off the host rather than leave it for the next thing that activates that connection: %s",
-		bridgeConn, cause, revertSharedSetup(bridgeConn, tapConn))
+		bridgeConn, cause, revertSharedSetup(bridgeConn, tapConn, siblingLive))
 }
 
 // revertSharedSetup undoes what prepareLinuxSharedWithNM has already done to
@@ -642,16 +738,28 @@ func revertAfterSharedWritten(bridgeConn, tapConn string, cause error) error {
 // overwrote cannot be put back. What goes is a profile named after the bridge
 // in state.json, which is the same profile every teardown in this file
 // deletes.
-func revertSharedSetup(bridgeConn, tapConn string) string {
+// siblingLive (M3) gates both destructive steps -- the "down" and the
+// bridge's own delete -- and not only the bridge delete: with a live sibling
+// VM's tap on this bridge, taking the bridge connection down would disturb
+// it exactly as deleting it would. This VM's own tap connection is still
+// deleted either way, since it is this failed start's own resource and never
+// the sibling's.
+func revertSharedSetup(bridgeConn, tapConn string, siblingLive bool) string {
 	notes := make([]string, 0, 4)
-	if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
+	if siblingLive {
+		notes = append(notes, fmt.Sprintf("connection %s was left alone, and so was the bridge device itself: a sibling VM's tap is still live on it, and taking either down would disturb that VM", bridgeConn))
+	} else if err := sudo("nmcli", "connection", "down", bridgeConn); err != nil {
 		notes = append(notes, fmt.Sprintf("taking connection %s down failed (%v), which is what a bridge this start never activated does; if it was up, it may be up still", bridgeConn, err))
 	} else {
 		notes = append(notes, fmt.Sprintf("connection %s was taken down, which should release what it had attached", bridgeConn))
 	}
+	targets := []string{tapConn}
+	if !siblingLive {
+		targets = append(targets, bridgeConn)
+	}
 	var deleted, failed []string
 	bridgeDeleted := false
-	for _, conn := range []string{tapConn, bridgeConn} {
+	for _, conn := range targets {
 		if err := sudo("nmcli", "connection", "delete", conn); err != nil {
 			failed = append(failed, fmt.Sprintf("%s (%v)", conn, err))
 			continue
@@ -667,7 +775,9 @@ func revertSharedSetup(bridgeConn, tapConn string) string {
 	if len(failed) > 0 {
 		notes = append(notes, fmt.Sprintf("deleting %s failed", strings.Join(failed, ", ")))
 	}
-	if bridgeDeleted {
+	if siblingLive {
+		notes = append(notes, fmt.Sprintf("the ipv4.method shared this start had written to %s stays on this host, because a sibling VM still needs that bridge", bridgeConn))
+	} else if bridgeDeleted {
 		notes = append(notes, fmt.Sprintf("so the ipv4.method shared this start had written to %s is off this host again", bridgeConn))
 	} else {
 		notes = append(notes, fmt.Sprintf("so the ipv4.method shared this start had written to %s is still on this host, and `sudo nmcli connection delete %s` is what removes it", bridgeConn, bridgeConn))
@@ -675,7 +785,14 @@ func revertSharedSetup(bridgeConn, tapConn string) string {
 	return strings.Join(notes, "; ")
 }
 
-func CleanupLinuxBridge(st *state.State) error {
+// CleanupLinuxBridge tears down one VM's (v's) network resources. siblingLive
+// (M3) is D4's liveness predicate applied to every OTHER VM in this config
+// dir: when true, only v's own tap connection and tap device are removed --
+// never the bridge connection, never the bridge link -- and st.Network is
+// left intact, since CreatedByKairosLab must survive for whichever VM
+// eventually does remove the bridge. st.Network is cleared only when the
+// bridge itself was actually torn down.
+func CleanupLinuxBridge(st *state.State, v state.VM, siblingLive bool) error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
@@ -686,8 +803,14 @@ func CleanupLinuxBridge(st *state.State) error {
 	if bridgeConn == "" {
 		bridgeConn = DefaultBridgeName
 	}
-	if err := cleanupNMConnections(bridgeConn, st.Network.TapName); err != nil {
+	tapDevice := TapNameForIndex(v.Index)
+	tapConn := TapConnNameForIndex(bridgeConn, v.Index)
+	if err := cleanupNMConnections(bridgeConn, tapDevice, tapConn, siblingLive); err != nil {
 		return err
+	}
+	if siblingLive {
+		st.Network.LastCleanupAttemptAt = state.NowRFC3339()
+		return nil
 	}
 	st.Network.LastCleanupAttemptAt = state.NowRFC3339()
 	st.Network = state.Network{}
@@ -695,7 +818,10 @@ func CleanupLinuxBridge(st *state.State) error {
 }
 
 // HasStaleNetworkResources checks if there are kairos-lab network resources
-// that exist but aren't tracked in state (e.g., from a failed setup).
+// that exist but aren't tracked in state (e.g., from a failed setup). It asks
+// about index 0's names, matching the single-VM host this check has always
+// run against: it fires before any VM record exists at all, so there is no
+// VM to read an index from.
 func HasStaleNetworkResources(st *state.State) bool {
 	if runtime.GOOS != "linux" {
 		return false
@@ -707,11 +833,12 @@ func HasStaleNetworkResources(st *state.State) bool {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	return hasStaleBridgeResources(bridge)
+	return hasStaleBridgeResources(bridge, TapConnNameForIndex(bridge, 0))
 }
 
-// CleanupStaleNetworkResources removes kairos-lab network resources that aren't
-// tracked in state, typically from a failed or interrupted setup.
+// CleanupStaleNetworkResources removes kairos-lab network resources that
+// aren't tracked in state, typically from a failed or interrupted setup, at
+// index 0 -- see HasStaleNetworkResources for why.
 func CleanupStaleNetworkResources(st *state.State) error {
 	if runtime.GOOS != "linux" {
 		return nil
@@ -720,7 +847,7 @@ func CleanupStaleNetworkResources(st *state.State) error {
 	if bridge == "" {
 		bridge = DefaultBridgeName
 	}
-	return cleanupNMConnections(bridge, st.Network.TapName)
+	return cleanupNMConnections(bridge, TapNameForIndex(0), TapConnNameForIndex(bridge, 0), false)
 }
 
 // cleanupNMConnections tears down the bridge, the tap and the NetworkManager
@@ -742,28 +869,57 @@ func CleanupStaleNetworkResources(st *state.State) error {
 // an interface linkExists can see, and the reconnect only for an interface
 // findBridgeSlave found on the bridge whose uplink connection this run
 // deleted, so a teardown can reach every step and issue one command.
-func cleanupNMConnections(bridgeConn, tapName string) error {
-	// Every destructive command below is built from these two names, which
-	// come out of state.json -- a 0644 file any process running as the user
-	// can write. linuxNetworkPreflight validates them before a start, but
-	// reset and cleanup reach here without passing through the preflight, so
-	// the same check has to sit at the choke point too. Without it a stored
-	// name of "eth0" turns into `sudo nmcli connection delete eth0` and
-	// `sudo ip link delete eth0`, and the host loses its network. The tap name
-	// is checked for exactly the same reason as the bridge name: it is the
-	// argument of an `ip link delete` below.
+// cleanupNMConnections is sibling-aware (M3): when siblingLive is true, only
+// this VM's own tap connection (tapConn) and tap device (tapDevice) are
+// deleted, and neither the bridge connection nor the bridge link nor the
+// uplink connection is ever touched, whatever nmConnectionExists or
+// linkExists says about them -- a live sibling may be using every one of
+// those. When siblingLive is false the full teardown below runs exactly as
+// it always has.
+func cleanupNMConnections(bridgeConn, tapDevice, tapConn string, siblingLive bool) error {
+	// Every destructive command below is built from these names, which come
+	// out of state.json -- a 0644 file any process running as the user can
+	// write. linuxNetworkPreflight validates them before a start, but reset
+	// and cleanup reach here without passing through the preflight, so the
+	// same check has to sit at the choke point too. Without it a stored name
+	// of "eth0" turns into `sudo nmcli connection delete eth0` and
+	// `sudo ip link delete eth0`, and the host loses its network. The tap
+	// device name is checked for exactly the same reason as the bridge name:
+	// it is the argument of an `ip link delete` below. tapConn is not
+	// separately validated here: it is always TapConnNameForIndex's own
+	// output, built from a bridge name that has already passed this same
+	// check and an integer index, never a string read fresh from
+	// state.json.
 	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
 		return fmt.Errorf("refusing to clean up network resources: %w", err)
 	}
-	tap := tapName
+	tap := tapDevice
 	if tap == "" {
 		tap = DefaultTapName
 	}
 	if err := validateStoredInterfaceName("tap name", tap); err != nil {
 		return fmt.Errorf("refusing to clean up network resources: %w", err)
 	}
+	if tapConn == "" {
+		tapConn = bridgeConn + "-tap"
+	}
 	uplinkConn := bridgeConn + "-uplink"
-	tapConn := bridgeConn + "-tap"
+
+	var failures []error
+
+	if siblingLive {
+		if nmConnectionExists(tapConn) {
+			if err := sudo("nmcli", "connection", "delete", tapConn); err != nil {
+				failures = append(failures, fmt.Errorf("delete connection %s: %w", tapConn, err))
+			}
+		}
+		if linkExists(tap) {
+			if err := sudo("ip", "link", "delete", tap); err != nil {
+				failures = append(failures, fmt.Errorf("delete interface %s: %w", tap, err))
+			}
+		}
+		return errors.Join(failures...)
+	}
 
 	// Find the physical interface enslaved to the bridge before we delete
 	// anything. The tap is a port of this bridge too and must not be mistaken
@@ -772,8 +928,6 @@ func cleanupNMConnections(bridgeConn, tapName string) error {
 	if IsLinuxBridge(bridgeConn) {
 		uplinkIface = findBridgeSlave(bridgeConn, tap)
 	}
-
-	var failures []error
 
 	// Delete all NM connections - use sudo (not sudoQuiet) so user can see
 	// what's happening and errors are visible.

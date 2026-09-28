@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kairos-io/kairos-lab/internal/state"
 )
 
 type StartConfig struct {
@@ -42,6 +44,19 @@ type StartConfig struct {
 	// with SeaBIOS already.
 	BiosPath string
 	Detached bool
+	// SSHPort and HTTPPort are the host-side forwards user-mode networking
+	// publishes, per D7: 2222/8080 at index 0 (today's fixed defaults,
+	// unchanged) and 2222+index/8080+index above it. Zero means "use the
+	// index-0 default", so a StartConfig built before these fields existed
+	// keeps behaving exactly as it did.
+	SSHPort  int
+	HTTPPort int
+	// UserModeHostBind is the address user-mode's forwarded ports bind, per
+	// D11: "" (INADDR_ANY, today's behaviour, unchanged) at index 0, because
+	// AC 5 forbids changing what index 0 already exposes, and "127.0.0.1"
+	// at every index above it, which is new surface with no compatibility
+	// constraint to keep.
+	UserModeHostBind string
 }
 
 // netDeviceArg builds the -device value for the guest NIC.
@@ -64,6 +79,25 @@ type StartConfig struct {
 //
 // The address is emitted in CanonicalMAC's zero-padded form, which is what
 // QEMU's parser wants -- never NormalizeMAC's zero-stripped comparison form.
+// userModeNetdevArg builds the -netdev value for user-mode networking, per
+// D7/D11: SSHPort/HTTPPort default to 2222/8080 when unset (a StartConfig
+// built before these fields existed keeps today's exact command line), and
+// UserModeHostBind prefixes both forwards -- "" reproduces today's
+// INADDR_ANY bind at index 0, and "127.0.0.1" is what internal/app sets for
+// every index above it.
+func userModeNetdevArg(cfg StartConfig) string {
+	sshPort := cfg.SSHPort
+	if sshPort == 0 {
+		sshPort = 2222
+	}
+	httpPort := cfg.HTTPPort
+	if httpPort == 0 {
+		httpPort = 8080
+	}
+	bind := cfg.UserModeHostBind
+	return fmt.Sprintf("user,id=net0,hostfwd=tcp:%s:%d-:22,hostfwd=tcp:%s:%d-:8080", bind, sshPort, bind, httpPort)
+}
+
 func netDeviceArg(mac string) (string, error) {
 	const device = "virtio-net-pci,netdev=net0"
 	if strings.TrimSpace(mac) == "" {
@@ -162,6 +196,19 @@ func Stop(pid int, timeout time.Duration) error {
 	return nil
 }
 
+// IsRunning reports whether pid names a live process, per D3.
+//
+// The three-way split on the signal-0 probe is the fix: EPERM means the
+// process exists and we merely may not signal it -- a root-recorded VM
+// probed by a later unprivileged start, which KAIROS_LAB_CONFIG_DIR and the
+// blessed root-writes-user's-state.json case make ordinary -- and that reads
+// as running, not as absent. ESRCH is the one definite no. Anything else
+// (the FindProcess error included, which on unix never itself fails for a
+// bad pid but is kept here for the platforms where it can) is returned to
+// the caller rather than swallowed into false: on unix, os.FindProcess
+// always succeeds and does no probing of its own, so every real answer comes
+// from the Signal call below, and "cannot tell" must not read the same as
+// "not running" -- see D3 for why the two are not symmetric.
 func IsRunning(pid int) (bool, error) {
 	if pid <= 0 {
 		return false, nil
@@ -170,10 +217,45 @@ func IsRunning(pid int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := p.Signal(syscall.Signal(0)); err != nil {
+	switch err := p.Signal(syscall.Signal(0)); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, syscall.EPERM):
+		return true, nil
+	case errors.Is(err, syscall.ESRCH), errors.Is(err, os.ErrProcessDone):
 		return false, nil
+	default:
+		return false, err
 	}
-	return true, nil
+}
+
+// VMIsLive is D4's two-part liveness predicate: a VM counts as live when its
+// QEMU PID is running, or when it has no such PID yet but was reserved by a
+// starter process (StarterPID, written before command.Start() so the
+// allocator and the sibling-aware preflight both see the reservation for the
+// whole window that contains this VM's own privileged prepare) that is
+// itself still running.
+//
+// Per D3, an IsRunning that cannot tell resolves to live here: skipping a
+// stale-cleanup step wrongly leaves a stale bridge for reset to clear, and
+// tearing one down wrongly kills a running VM, and those costs are not
+// symmetric. So both checks below treat an IsRunning error as "live" rather
+// than propagate it -- there is no caller here that could act on the error
+// differently anyway; every caller of VMIsLive just needs a bool.
+func VMIsLive(v state.VM) bool {
+	if v.PID > 0 {
+		running, err := IsRunning(v.PID)
+		if err != nil || running {
+			return true
+		}
+	}
+	if v.StarterPID > 0 {
+		running, err := IsRunning(v.StarterPID)
+		if err != nil || running {
+			return true
+		}
+	}
+	return false
 }
 
 func buildLinux(cfg StartConfig) (string, []string, error) {
@@ -278,7 +360,7 @@ func buildLinuxFor(goarch string, cfg StartConfig) (string, []string, error) {
 		// Any unknown or empty mode falls back to user networking rather than
 		// leaving the guest with no NIC at all.
 		args = append(args,
-			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
+			"-netdev", userModeNetdevArg(cfg),
 			"-device", nic,
 		)
 	}
@@ -379,7 +461,7 @@ func buildMacOS(cfg StartConfig) (string, []string, error) {
 		// leaving the guest with no NIC at all.
 		args = append(args,
 			"-device", nic,
-			"-netdev", "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080",
+			"-netdev", userModeNetdevArg(cfg),
 		)
 	}
 	args = append(args,

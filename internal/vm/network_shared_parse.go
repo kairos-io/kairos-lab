@@ -8,7 +8,68 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/kairos-io/kairos-lab/internal/state"
 )
+
+// TapNameForIndex returns the tap DEVICE name for a per-config-dir VM index,
+// per D7: index 0 is byte-identical to a pre-multi-VM host --
+// DefaultTapName, "kairoslab-tap0" -- and index N>=1 is "kairoslab-tapN".
+// This is a kernel interface name, so it goes through
+// validateStoredInterfaceName's 15-byte IFNAMSIZ limit wherever it reaches a
+// root-run command, which is where state.MaxVMIndex's 99 comes from:
+// "kairoslab-tap100" is 16 bytes.
+func TapNameForIndex(index int) string {
+	if index == 0 {
+		return DefaultTapName
+	}
+	return fmt.Sprintf("kairoslab-tap%d", index)
+}
+
+// TapConnNameForIndex returns the tap NetworkManager connection name for
+// bridge at index, per D7: index 0 is "<bridge>-tap", byte-identical to a
+// pre-multi-VM host, and index N>=1 is "<bridge>-tapN".
+//
+// Unlike the device name this carries no IFNAMSIZ limit -- a NetworkManager
+// profile name is not a kernel interface name -- so it must never be passed
+// to validateStoredInterfaceName, or indices 10..99 become unreachable
+// ("kairoslab0-tap10" is 16 bytes).
+func TapConnNameForIndex(bridge string, index int) string {
+	if index == 0 {
+		return bridge + "-tap"
+	}
+	return fmt.Sprintf("%s-tap%d", bridge, index)
+}
+
+// IsGeneratedTapName is D5 condition 1: does name parse as a tap device this
+// tool would itself generate for some index in 0..state.MaxVMIndex?
+//
+// It is a parse and not a regexp, so it accepts only what TapNameForIndex
+// itself would produce: no leading zero ("kairoslab-tap007" is rejected even
+// though it names a real device once created), no sign ("kairoslab-tap-1" is
+// read as the literal suffix "-1" after the prefix cut, which is not
+// digits-only), and nothing past state.MaxVMIndex ("kairoslab-tap100" is
+// rejected here independently of the 15-byte check that also catches it
+// elsewhere).
+func IsGeneratedTapName(name string) (index int, ok bool) {
+	digits, found := strings.CutPrefix(name, "kairoslab-tap")
+	if !found || digits == "" {
+		return 0, false
+	}
+	if digits != "0" && strings.HasPrefix(digits, "0") {
+		return 0, false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 0 || n > state.MaxVMIndex {
+		return 0, false
+	}
+	return n, true
+}
 
 // The path building and the output parsing in this file are deliberately kept
 // apart from the exec calls in network_linux.go so they can be exercised on
@@ -147,6 +208,12 @@ func validateStoredInterfaceName(field, name string) error {
 // created cannot make the old tap look like a physical slave; for the default
 // configuration the two are the same string and the behaviour is unchanged.
 //
+// Every OTHER generated tap name (M3) is skipped too, through
+// IsGeneratedTapName -- the same predicate D5's bridge-port exemption uses,
+// so the two cannot drift apart. With more than one VM sharing this bridge,
+// a sibling's tap is a legitimate port and must never be mistaken for a
+// physical uplink the way a foreign NIC would be.
+//
 // This is a teardown's question and not the shared path's assertion, which is
 // why parseBridgePorts below exists beside it rather than being built out of
 // it: excluding a name is right here and wrong there. See the comment on that
@@ -155,6 +222,9 @@ func parseBridgeSlave(out, tap string) string {
 	for _, line := range strings.Split(out, "\n") {
 		iface := bridgePortName(line)
 		if iface == "" || iface == tap || iface == DefaultTapName {
+			continue
+		}
+		if _, ok := IsGeneratedTapName(iface); ok {
 			continue
 		}
 		return iface

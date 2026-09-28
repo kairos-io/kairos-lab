@@ -88,6 +88,18 @@ type fakeHost struct {
 	// error the stat failed with, because which error it is decides the
 	// answer.
 	invisibleBridges map[string]error
+	// notRealTapDevices names a port that parses as a generated tap name
+	// (D5 condition 1) but is not actually a tun/tap device -- modelling an
+	// attacker who named a real NIC "kairoslab-tap5". bridgePortExempt's
+	// condition 2 must answer false for it, so it is never exempt from
+	// refusal however it is named.
+	notRealTapDevices map[string]bool
+	// foreignOwnedTaps names a generated, real tap device (conditions 1 and
+	// 2 both hold) whose owner is not this run's own uid -- D5 condition 3
+	// failing on its own. Absent from this map, a generated name that
+	// passes condition 1 is modelled as a real, self-owned tap device by
+	// default, which is what an ordinary kairos-lab-created tap is.
+	foreignOwnedTaps map[string]bool
 	// slaveLinksCalls counts how many times the port list was read. The
 	// number is a claim internal/app's consent paragraph makes out loud, so
 	// it is pinned rather than described.
@@ -115,13 +127,15 @@ type fakeHost struct {
 func newFakeHost(t *testing.T) *fakeHost {
 	t.Helper()
 	h := &fakeHost{
-		conns:            map[string]bool{},
-		links:            map[string]bool{},
-		bridges:          map[string]bool{},
-		slaves:           map[string][]string{},
-		profiles:         map[string]nmProfile{},
-		invisibleLinks:   map[string]bool{},
-		invisibleBridges: map[string]error{},
+		conns:             map[string]bool{},
+		links:             map[string]bool{},
+		bridges:           map[string]bool{},
+		slaves:            map[string][]string{},
+		profiles:          map[string]nmProfile{},
+		invisibleLinks:    map[string]bool{},
+		invisibleBridges:  map[string]error{},
+		notRealTapDevices: map[string]bool{},
+		foreignOwnedTaps:  map[string]bool{},
 	}
 
 	origSudo := sudo
@@ -133,6 +147,8 @@ func newFakeHost(t *testing.T) *fakeHost {
 	origLinkExists := linkExists
 	origSlaveLinks := bridgeSlaveLinks
 	origDelay := staleCleanupSettleDelay
+	origTunFlags := tapSysfsTunFlagsReadable
+	origOwnerUID := tapSysfsOwnerUID
 	t.Cleanup(func() {
 		sudo = origSudo
 		networkManagerActive = origNMActive
@@ -143,6 +159,8 @@ func newFakeHost(t *testing.T) *fakeHost {
 		linkExists = origLinkExists
 		bridgeSlaveLinks = origSlaveLinks
 		staleCleanupSettleDelay = origDelay
+		tapSysfsTunFlagsReadable = origTunFlags
+		tapSysfsOwnerUID = origOwnerUID
 	})
 
 	sudo = h.run
@@ -186,6 +204,29 @@ func newFakeHost(t *testing.T) *fakeHost {
 	}
 	bridgeSlaveLinks = h.slaveLinks
 	staleCleanupSettleDelay = 0
+	// D5's two /sys reads. A name that parses as generated (condition 1) is
+	// modelled as a real, self-owned tap device by default -- an ordinary
+	// kairos-lab-created tap -- unless the test opts a name into
+	// notRealTapDevices (condition 2 fails: not a tun/tap device at all) or
+	// foreignOwnedTaps (condition 3 fails: a real generated-name tap device
+	// this run did not create).
+	tapSysfsTunFlagsReadable = func(name string) bool {
+		if h.notRealTapDevices[name] {
+			return false
+		}
+		_, ok := IsGeneratedTapName(name)
+		return ok
+	}
+	tapSysfsOwnerUID = func(name string) (string, bool) {
+		if h.foreignOwnedTaps[name] {
+			return "not-this-uid", true
+		}
+		want, err := tapOwnerUID()
+		if err != nil {
+			return "", false
+		}
+		return want, true
+	}
 
 	// Both variables empty keeps tapOwnerUID on its os.Getuid() branch, so the
 	// uid in the expected argv is known and no subprocess runs.
@@ -403,7 +444,7 @@ func TestPrepareLinuxSharedCleanHostSequence(t *testing.T) {
 	h := newFakeHost(t)
 	st := &state.State{}
 
-	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxShared: %v", err)
 	}
 
@@ -434,7 +475,7 @@ func TestPrepareLinuxSharedDeletesOrphanedUplinkConnection(t *testing.T) {
 	h.conns[DefaultBridgeName+"-uplink"] = true
 	st := &state.State{}
 
-	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxShared: %v", err)
 	}
 
@@ -470,7 +511,7 @@ func TestPrepareLinuxSharedRefusesWhenAStaleUplinkWillNotGo(t *testing.T) {
 	}
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared built a NAT bridge over an uplink connection it could not delete")
 	}
@@ -537,7 +578,7 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 			return nil
 		}
 
-		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared continued over a stale bridge connection it could not delete")
 		}
@@ -565,7 +606,7 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 			return nil
 		}
 
-		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared continued over a teardown that could not finish")
 		}
@@ -600,7 +641,7 @@ func TestPrepareLinuxSharedCleanupRefusalClaimsOnlyWhatWasIssued(t *testing.T) {
 		return nil
 	}
 
-	err := PrepareLinuxShared(&state.State{}, t.TempDir())
+	err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared continued over a stale connection it could not delete")
 	}
@@ -709,7 +750,7 @@ func TestPrepareLinuxSharedRefusesAnInterfaceEnslavedWhenTheBridgeComesUp(t *tes
 			h.onCommand = enslaveOnBridgeUp
 			st := &state.State{}
 
-			err := PrepareLinuxShared(st, t.TempDir())
+			err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 			if err == nil {
 				t.Fatal("PrepareLinuxShared left the host's NIC enslaved to a NAT bridge and reported success")
 			}
@@ -757,7 +798,7 @@ func TestPrepareLinuxSharedRefusesAnInterfaceAlreadyEnslavedBeforeTheBridgeComes
 	h.slaves[DefaultBridgeName] = []string{"eth0"}
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared brought a NAT bridge up over an enslaved host NIC")
 	}
@@ -818,7 +859,7 @@ func TestPrepareLinuxSharedAcceptsABridgeWhoseOnlyPortIsTheTap(t *testing.T) {
 	h := newFakeHost(t)
 	st := &state.State{}
 
-	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxShared refused a bridge whose only port is its own tap: %v", err)
 	}
 	// The sequence is the ordinary one, so the assertions issued no command
@@ -854,7 +895,7 @@ func TestPrepareLinuxSharedRefusesWhenThePortListCannotBeRead(t *testing.T) {
 	h.slaveLinksErr = fmt.Errorf(`exit status 2: %q`, `ip: either "dev" is duplicate, or "kairoslab0" is garbage`)
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared built a NAT bridge on a host where it could not read the bridge's port list")
 	}
@@ -908,7 +949,7 @@ func TestPrepareLinuxSharedRefusesACleanHostThatCannotAnswer(t *testing.T) {
 	h.slaveLinksErr = fmt.Errorf("exec: \"ip\": executable file not found in $PATH")
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared completed without ever reading the bridge's port list")
 	}
@@ -949,7 +990,7 @@ func TestPrepareLinuxSharedRefusesAHostNICStoredAsTheTapName(t *testing.T) {
 		st := &state.State{}
 		st.Network.TapName = "eth0"
 
-		err := PrepareLinuxShared(st, t.TempDir())
+		err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared accepted the host's own NIC as the bridge's port because state.json called it the tap")
 		}
@@ -971,7 +1012,7 @@ func TestPrepareLinuxSharedRefusesAHostNICStoredAsTheTapName(t *testing.T) {
 		st := &state.State{}
 		st.Network.TapName = "eth0"
 
-		err := PrepareLinuxShared(st, t.TempDir())
+		err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared let a foreign profile attach the host NIC because state.json called it the tap")
 		}
@@ -998,17 +1039,22 @@ func TestPrepareLinuxSharedRefusesAHostNICStoredAsTheTapName(t *testing.T) {
 // before the tap is activated leaves no name exempt, this one included.
 func TestPrepareLinuxSharedRefusesAPortNamedLikeTheDefaultTap(t *testing.T) {
 	h := newFakeHost(t)
+	// Merely parsing as a generated tap name is not enough to be exempt
+	// (D5): it also has to be a real tap device (condition 2), which this
+	// one is modelled as not being -- a foreign NIC coincidentally named
+	// like the generated default, the scenario this test is about. Tap
+	// identity is index-derived (M2) and no longer read from
+	// st.Network.TapName at all, so there is no state field left to set to
+	// keep this run's own tap from being the default one.
+	h.notRealTapDevices[DefaultTapName] = true
 	h.onCommand = func(h *fakeHost, argv []string) {
 		if strings.Join(argv, " ") == "nmcli connection up kairoslab0" {
 			h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 		}
 	}
 	st := &state.State{}
-	// This run's tap is not the default one, so nothing here has any reason
-	// to treat the default name as its own.
-	st.Network.TapName = "kltap0"
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared accepted a port on the bridge because it was named like the default tap")
 	}
@@ -1039,7 +1085,7 @@ func TestPrepareLinuxSharedRefusesAnInterfaceThatArrivesWithTheTap(t *testing.T)
 	}
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared returned with a host NIC on the bridge it had just built")
 	}
@@ -1119,7 +1165,7 @@ func TestPrepareLinuxSharedRefusalNamesEveryPortItFound(t *testing.T) {
 				}
 			}
 
-			err := PrepareLinuxShared(&state.State{}, t.TempDir())
+			err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 			if err == nil {
 				t.Fatal("PrepareLinuxShared accepted a bridge with a foreign port on it")
 			}
@@ -1157,7 +1203,7 @@ func TestPrepareLinuxSharedRefusalDoesNotInventAProfile(t *testing.T) {
 		}
 	}
 
-	err := PrepareLinuxShared(&state.State{}, t.TempDir())
+	err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared accepted a bridge with a foreign port on it")
 	}
@@ -1209,7 +1255,7 @@ func TestPrepareLinuxSharedRefusalRevertsWhatItWrote(t *testing.T) {
 			}
 		}
 
-		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared accepted a bridge with a foreign port on it")
 		}
@@ -1240,7 +1286,7 @@ func TestPrepareLinuxSharedRefusalRevertsWhatItWrote(t *testing.T) {
 			return nil
 		}
 
-		err := PrepareLinuxShared(&state.State{}, t.TempDir())
+		err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false)
 		if err == nil {
 			t.Fatal("PrepareLinuxShared accepted a bridge with a foreign port on it")
 		}
@@ -1283,7 +1329,7 @@ func TestPrepareLinuxBridgeSurvivesAStaleUplinkThatWillNotGo(t *testing.T) {
 	st := &state.State{}
 	st.Network.BridgeInterface = "eth0"
 
-	if err := PrepareLinuxBridge(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxBridge(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxBridge refused a leftover it rebuilds itself: %v", err)
 	}
 
@@ -1315,7 +1361,7 @@ func TestPrepareLinuxSharedRecordsState(t *testing.T) {
 	// An earlier bridged run left an uplink in state; shared has none.
 	st.Network.BridgeInterface = "eth0"
 
-	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxShared: %v", err)
 	}
 
@@ -1348,7 +1394,7 @@ func TestPrepareLinuxBridgeSequence(t *testing.T) {
 	st := &state.State{}
 	st.Network.BridgeInterface = "eth0" // skips detectDefaultUplink, which shells out
 
-	if err := PrepareLinuxBridge(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxBridge(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxBridge: %v", err)
 	}
 
@@ -1380,7 +1426,7 @@ func TestPrepareLinuxBridgeClearsDHCPLeaseFile(t *testing.T) {
 		t.Fatal("fixture is empty, the test would pass for the wrong reason")
 	}
 
-	if err := PrepareLinuxBridge(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxBridge(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxBridge: %v", err)
 	}
 
@@ -1401,6 +1447,15 @@ func TestPrepareLinuxBridgeClearsDHCPLeaseFile(t *testing.T) {
 // with the malformed name PRESENT as a connection and a link, so a validator
 // that were removed, or moved back below the stale block, would leave the
 // preflight finding it "stale" and deleting it.
+// TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything no longer
+// carries a tap-name case (M2): the tap identity PrepareLinuxShared uses is
+// TapNameForIndex(index), computed from a validated integer, and
+// st.Network.TapName is never read to build it any more, per D9's
+// "recomputed from the index and never trusted". A malformed value stored
+// there is inert -- there is nothing left for it to reach -- so a test
+// asserting it gets refused would be pinning dead code. TestVMFieldsAreNeverTrustedForTapIdentity
+// below is the test that replaces it: it plants a malformed TapName in state
+// and asserts PrepareLinuxShared runs right past it.
 func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1410,7 +1465,6 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 		{"bridge name is a NetworkManager profile", attackNMProfileName, ""},
 		{"bridge name walks out of NMSTATEDIR", attackPathTraversal, ""},
 		{"bridge name forges a plan row", attackPlanRowInjection, ""},
-		{"tap name is a NetworkManager profile", "", attackNMProfileName},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1427,7 +1481,7 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 				h.bridges[name] = true
 			}
 
-			err := PrepareLinuxShared(st, t.TempDir())
+			err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 			if err == nil {
 				t.Fatalf("PrepareLinuxShared accepted a malformed stored name")
 			}
@@ -1445,6 +1499,31 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 	}
 }
 
+// TestVMFieldsAreNeverTrustedForTapIdentity is D9's "recomputed from the
+// index and never trusted" pinned as a test: a malformed st.Network.TapName
+// -- the kind of value TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything
+// used to refuse -- does not stop a start and is not the name anything ends
+// up on the wire. Only TapNameForIndex(index) is ever used.
+func TestVMFieldsAreNeverTrustedForTapIdentity(t *testing.T) {
+	h := newFakeHost(t)
+	st := &state.State{}
+	st.Network.TapName = attackNMProfileName
+
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
+		t.Fatalf("a malformed stored TapName should not affect a start that no longer reads it: %v", err)
+	}
+	for _, argv := range h.commands {
+		for _, word := range argv {
+			if word == attackNMProfileName {
+				t.Errorf("the malformed stored name %q reached a root command: %v", attackNMProfileName, argv)
+			}
+		}
+	}
+	if st.Network.TapName != DefaultTapName {
+		t.Errorf("st.Network.TapName after a successful start = %q, want %q (TapNameForIndex(0), not the stale stored value)", st.Network.TapName, DefaultTapName)
+	}
+}
+
 // Shared mode's connections must not come up on their own. A bridge carrying
 // ipv4.method shared runs a DHCP server and a DNS forwarder and installs a
 // MASQUERADE rule, and NetworkManager persists these connections as keyfiles:
@@ -1457,7 +1536,7 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 func TestSharedDisablesAutoconnectAndBridgedKeepsIt(t *testing.T) {
 	t.Run("shared", func(t *testing.T) {
 		h := newFakeHost(t)
-		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err != nil {
 			t.Fatalf("PrepareLinuxShared: %v", err)
 		}
 		assertAutoconnect(t, h, "no")
@@ -1467,7 +1546,7 @@ func TestSharedDisablesAutoconnectAndBridgedKeepsIt(t *testing.T) {
 		h.links["eth0"] = true
 		st := &state.State{}
 		st.Network.BridgeInterface = "eth0"
-		if err := PrepareLinuxBridge(st, t.TempDir()); err != nil {
+		if err := PrepareLinuxBridge(st, t.TempDir(), 0, false); err != nil {
 			t.Fatalf("PrepareLinuxBridge: %v", err)
 		}
 		assertAutoconnect(t, h, "yes")
@@ -1513,7 +1592,7 @@ func TestStalenessPredicateCoversEveryResource(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newFakeHost(t)
 			tt.seed(h)
-			if !hasStaleBridgeResources(DefaultBridgeName) {
+			if !hasStaleBridgeResources(DefaultBridgeName, DefaultBridgeName+"-tap") {
 				t.Errorf("hasStaleBridgeResources missed a leftover %s", tt.name)
 			}
 			st := &state.State{}
@@ -1525,7 +1604,7 @@ func TestStalenessPredicateCoversEveryResource(t *testing.T) {
 
 	t.Run("clean host", func(t *testing.T) {
 		newFakeHost(t)
-		if hasStaleBridgeResources(DefaultBridgeName) {
+		if hasStaleBridgeResources(DefaultBridgeName, DefaultBridgeName+"-tap") {
 			t.Error("hasStaleBridgeResources reports a clean host as stale")
 		}
 	})
@@ -1595,7 +1674,7 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredName(t *testing.T) {
 			h.links[bridge] = true
 			h.bridges[bridge] = true
 
-			err := cleanupNMConnections(bridge, DefaultTapName)
+			err := cleanupNMConnections(bridge, DefaultTapName, bridge+"-tap", false)
 			if err == nil {
 				t.Fatalf("cleanupNMConnections accepted a malformed stored name")
 			}
@@ -1616,7 +1695,7 @@ func TestCleanupNMConnectionsStillRemovesAValidBridge(t *testing.T) {
 	h.conns[DefaultBridgeName+"-tap"] = true
 	h.bridges[DefaultBridgeName] = true
 
-	if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+	if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 		t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 	}
 	joined := strings.Join(h.lines(), "\n")
@@ -1654,7 +1733,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		// the first line instead of the first non-tap line is visible here.
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 
-		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -1675,7 +1754,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 
-		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -1701,7 +1780,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h.bridges[DefaultBridgeName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "captap0"}
 
-		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -1745,7 +1824,7 @@ func TestCleanupNMConnectionsDoesNotReconnectOverASurvivingUplinkProfile(t *test
 
 		var err error
 		out := captureStdout(t, func() {
-			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 		})
 		if err != nil {
 			t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
@@ -1785,7 +1864,7 @@ func TestCleanupNMConnectionsDoesNotReconnectOverASurvivingUplinkProfile(t *test
 
 		var err error
 		out := captureStdout(t, func() {
-			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+			err = cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 		})
 		if err == nil {
 			t.Fatal("cleanupNMConnections reported success although a delete failed")
@@ -1839,7 +1918,7 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItDeclinesToReconnect(t *testing.
 
 	var err error
 	out := captureStdout(t, func() {
-		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 	})
 	if err != nil {
 		t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
@@ -1896,7 +1975,7 @@ func TestCleanupNMConnectionsIssuesNoDeleteForAConnectionItCannotSee(t *testing.
 		st.Network.BridgeName = DefaultBridgeName
 		st.Network.TapName = DefaultTapName
 
-		if err := CleanupLinuxBridge(st); err != nil {
+		if err := CleanupLinuxBridge(st, state.VM{}, false); err != nil {
 			t.Fatalf("an ordinary shared teardown reported failure: %v", err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -1916,7 +1995,7 @@ func TestCleanupNMConnectionsIssuesNoDeleteForAConnectionItCannotSee(t *testing.
 		h.bridges[DefaultBridgeName] = true
 		h.failCmd = failUnknownConnectionDeletes(h)
 
-		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err != nil {
 			t.Fatalf("PrepareLinuxShared refused a host whose leftover bridge it removed: %v", err)
 		}
 		want := append([]string{"ip link delete " + DefaultBridgeName}, sharedSequence(testUID(t))...)
@@ -1940,7 +2019,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		h.failCmd = func([]string) error { return fmt.Errorf("exit status 1") }
 
-		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 		if err == nil {
 			t.Fatal("cleanupNMConnections reported success after every step failed")
 		}
@@ -1991,7 +2070,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 			return nil
 		}
 
-		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 		if err == nil {
 			t.Fatal("a partial teardown reported success")
 		}
@@ -2014,7 +2093,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 		h.conns[DefaultBridgeName] = true
 		h.bridges[DefaultBridgeName] = true
 
-		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("a teardown that did everything asked of it returned %v, want nil", err)
 		}
 	})
@@ -2032,7 +2111,7 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 			h.conns[DefaultBridgeName] = true
 			h.links[tap] = true
 
-			err := cleanupNMConnections(DefaultBridgeName, tap)
+			err := cleanupNMConnections(DefaultBridgeName, tap, DefaultBridgeName+"-tap", false)
 			if err == nil {
 				t.Fatal("cleanupNMConnections accepted a malformed stored tap name")
 			}
@@ -2052,7 +2131,7 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 		h.conns[DefaultBridgeName] = true
 		h.links[DefaultTapName] = true
 
-		if err := cleanupNMConnections(DefaultBridgeName, ""); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, "", DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections with no stored tap name = %v, want nil", err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -2068,7 +2147,7 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 		h.conns[DefaultBridgeName] = true
 		h.links["kltap0"] = true
 
-		if err := cleanupNMConnections(DefaultBridgeName, "kltap0"); err != nil {
+		if err := cleanupNMConnections(DefaultBridgeName, "kltap0", DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections = %v, want nil", err)
 		}
 		assertSequence(t, h.lines(), []string{
@@ -2135,7 +2214,7 @@ func TestPrepareLinuxSharedRefusesWhenTheBridgeStatCannotAnswer(t *testing.T) {
 			h.invisibleBridges[DefaultBridgeName] = tt.statErr
 			st := &state.State{}
 
-			err := PrepareLinuxShared(st, t.TempDir())
+			err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 			if err == nil {
 				t.Fatal("PrepareLinuxShared applied ipv4.method shared over a bridge it never read the port list of")
 			}
@@ -2234,7 +2313,7 @@ func TestPrepareLinuxSharedProceedsWhenTheBridgeDeviceIsNotThere(t *testing.T) {
 	}
 	st := &state.State{}
 
-	if err := PrepareLinuxShared(st, t.TempDir()); err != nil {
+	if err := PrepareLinuxShared(st, t.TempDir(), 0, false); err != nil {
 		t.Fatalf("PrepareLinuxShared refused a host that simply has no bridge of that name yet: %v", err)
 	}
 	assertSequence(t, h.lines(), sharedSequence(testUID(t)))
@@ -2263,7 +2342,7 @@ func TestPrepareLinuxSharedRefusesPortsOnAMasterThatIsNotABridge(t *testing.T) {
 	h.slaves[DefaultBridgeName] = []string{"eth0"}
 	st := &state.State{}
 
-	err := PrepareLinuxShared(st, t.TempDir())
+	err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 	if err == nil {
 		t.Fatal("PrepareLinuxShared brought a NAT bridge up over a master carrying the host's NIC")
 	}
@@ -2351,7 +2430,7 @@ func TestPrepareLinuxSharedRevertsEveryExitAfterTheMethodIsWritten(t *testing.T)
 			}
 			st := &state.State{}
 
-			err := PrepareLinuxShared(st, t.TempDir())
+			err := PrepareLinuxShared(st, t.TempDir(), 0, false)
 			if err == nil {
 				t.Fatalf("PrepareLinuxShared reported success although %q failed", tt.failing)
 			}
@@ -2439,7 +2518,7 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
 
 	var err error
 	out := captureStdout(t, func() {
-		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName)
+		err = cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false)
 	})
 	if err == nil {
 		t.Fatal("cleanupNMConnections reported success although the reconnect failed")
@@ -2509,7 +2588,7 @@ func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
 	t.Run("a clean host reads it twice", func(t *testing.T) {
 		h := newFakeHost(t)
 
-		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err != nil {
 			t.Fatalf("PrepareLinuxShared = %v, want nil", err)
 		}
 		if h.slaveLinksCalls != 2 {
@@ -2525,7 +2604,7 @@ func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
 		// hint, and that read is not one of the checks this counts.
 		h.links[DefaultBridgeName] = true
 
-		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err != nil {
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err != nil {
 			t.Fatalf("PrepareLinuxShared = %v, want nil", err)
 		}
 		if h.slaveLinksCalls != 3 {
@@ -2545,7 +2624,7 @@ func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
 			Err:  fs.ErrPermission,
 		}
 
-		if err := PrepareLinuxShared(&state.State{}, t.TempDir()); err == nil {
+		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err == nil {
 			t.Fatal("PrepareLinuxShared completed over a host it could not stat")
 		}
 		// Zero reads here is right and is not the escape: the refusal is the

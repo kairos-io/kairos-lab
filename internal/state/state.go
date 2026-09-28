@@ -15,11 +15,11 @@ import (
 
 const SchemaVersion = 2
 
-// maxVMIndex is the highest per-VM index this schema allocates. It bounds
+// MaxVMIndex is the highest per-VM index this schema allocates. It bounds
 // both NextFreeVMIndex and the validation Load applies to a stored index: an
 // index above it is not a name TapNameForIndex or TapConnNameForIndex would
 // ever produce, so a record carrying one is quarantined rather than trusted.
-const maxVMIndex = 99
+const MaxVMIndex = 99
 
 type Platform struct {
 	OS             string `json:"os"`
@@ -114,11 +114,11 @@ type QuarantinedVM struct {
 }
 
 type State struct {
-	Version      int      `json:"version"`
-	Platform     Platform `json:"platform"`
-	Setup        Setup    `json:"setup"`
-	Network      Network  `json:"network"`
-	VMs          []VM     `json:"vms,omitempty"`
+	Version  int      `json:"version"`
+	Platform Platform `json:"platform"`
+	Setup    Setup    `json:"setup"`
+	Network  Network  `json:"network"`
+	VMs      []VM     `json:"vms,omitempty"`
 	// Legacy is the pre-multi-VM "vm" record. It is a pointer and not a VM
 	// value so Load can tell "absent from the file" (nil) from "present and
 	// the zero value" (non-nil, pointing at a VM that never started) -- the
@@ -285,8 +285,8 @@ func invalidVMReason(v VM) string {
 			return fmt.Sprintf("name: %v", err)
 		}
 	}
-	if v.Index < 0 || v.Index > maxVMIndex {
-		return fmt.Sprintf("index %d is outside the supported range 0..%d", v.Index, maxVMIndex)
+	if v.Index < 0 || v.Index > MaxVMIndex {
+		return fmt.Sprintf("index %d is outside the supported range 0..%d", v.Index, MaxVMIndex)
 	}
 	if v.NetworkMode != "" && !validNetworkMode(v.NetworkMode) {
 		return fmt.Sprintf("network mode %q is not one this binary knows", v.NetworkMode)
@@ -600,7 +600,7 @@ func RemoveVM(st *State, name string) {
 	st.VMs = out
 }
 
-// NextFreeVMIndex returns the lowest index in 0..maxVMIndex not held by a
+// NextFreeVMIndex returns the lowest index in 0..MaxVMIndex not held by a
 // live VM, per D6. "Not held by a live VM" and not "not held by any VM": a
 // config dir with two disks started one at a time would otherwise give the
 // second disk a rising index and non-default ports with only one VM ever
@@ -617,12 +617,12 @@ func NextFreeVMIndex(st *State, live func(VM) bool) (int, error) {
 			count++
 		}
 	}
-	for i := 0; i <= maxVMIndex; i++ {
+	for i := 0; i <= MaxVMIndex; i++ {
 		if !held[i] {
 			return i, nil
 		}
 	}
-	return 0, fmt.Errorf("no free VM index in 0..%d: %d VMs are live", maxVMIndex, count)
+	return 0, fmt.Errorf("no free VM index in 0..%d: %d VMs are live", MaxVMIndex, count)
 }
 
 // lockAcquireTimeout and lockRetryInterval bound Update's wait for the
