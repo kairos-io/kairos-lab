@@ -139,18 +139,20 @@ Flags:
 
 ### `status`
 
-Shows current state:
+Shows current state, with one block per VM this config dir knows about:
 - Platform and dependencies
-- The ISO and disk path in use
-- Network configuration, including the bridge and tap on Linux, where
-  `shared` and `bridged` build them (on macOS QEMU's vmnet backend does the
-  bridging and there are none to name)
-- The VM's address - always printed, in every mode, reading `none` until one
-  is known
-- In `user` mode, the two forwarded host ports - 2222 for SSH, 8080 for the
-  WebUI - since a SLIRP guest has no address on the host's network to show
-  instead
-- Running VM info
+- For each VM: the ISO and disk path in use, its network mode, its own tap on
+  Linux, its address (always printed, reading `none` until one is known), and
+  whether it is running
+- In `user` mode, that VM's own forwarded host ports - 2222 for SSH, 8080 for
+  the WebUI at index 0, and 2222 plus its index / 8080 plus its index for a
+  second or later VM - since a SLIRP guest has no address on the host's
+  network to show instead
+- The shared bridge, on Linux, where `shared` and `bridged` build one (on
+  macOS QEMU's vmnet backend does the bridging and there is none to name),
+  and every VM's own tap on it
+- Any VM record this binary could not trust (a state.json field outside what
+  it expects), named rather than silently dropped
 
 ### `reset`
 
@@ -169,9 +171,9 @@ Removes everything created by `kairos-lab`:
 
 ## Networking
 
-Three modes, picked with `-network`. This CLI starts one VM at a time
-whichever you pick - what differs is what that guest can reach, and what can
-reach it:
+Three modes, picked with `-network`. `start` can now run more than one VM at
+once in the same config dir (`-name` picks which); what a mode decides is
+what that guest can reach, and what can reach it:
 
 | Mode | Gets | Cannot |
 |---|---|---|
@@ -183,14 +185,26 @@ reach it:
 VM on a private NAT subnet instead. That's also why it works over Wi-Fi,
 where `bridged` often can't: no guest frame leaves the host with a MAC the
 access point never saw associate. The VM still gets a real address on that
-subnet, not just forwarded ports. That subnet could carry more than one
-guest, but this CLI does not claim a cluster: nothing here asks for a second
-VM, and neither way around that is supported. `start` refuses outright while
-this config dir's VM is already running, on either platform; and pointing a
-second run at another config dir resolves the same bridge and tap names,
-since no flag sets them - which on Linux is what the pre-flight in
-`internal/vm` treats as stale and removes, taking the running VM's network
-with it. The limit today is the CLI's, not the subnet's.
+subnet, not just forwarded ports, and that subnet really can carry more than
+one guest now: two `start` runs in the same config dir, under different
+`-name`s, get their own tap on the one shared bridge and can reach each
+other and the internet, each with its own address. `start` still refuses a
+second run under a name that is already live; what changed is that a
+*different* name no longer gets refused, and no longer tears the first VM's
+network down to make room for itself.
+
+Two limits stay, and are worth being explicit about. **Multi-VM support is
+per config dir, not host-wide**: index allocation and the liveness check
+both look only within the one config dir a run is pointed at, while the
+bridge itself is host-level, so a second config dir still resolves the same
+default bridge and tap names and destroys the first's network, exactly as a
+single-VM host always did - there is no flag that changes where a config dir
+points, so this only bites when `KAIROS_LAB_CONFIG_DIR` is set to more than
+one directory on the same host. And the shared segment is host-wide and
+unisolated **between guests**, whatever config dir they came from: every VM
+on it can see every other's traffic and can ARP- or DHCP-spoof a sibling.
+Do not put anything on this subnet you would not put on the same LAN
+segment as every other guest.
 
 **bridged** puts the VM on your LAN with a real LAN address, at the cost of
 enslaving a physical interface to the bridge. Bridging onto Wi-Fi is
@@ -203,12 +217,14 @@ implementation-specific, which is why bridging onto Wi-Fi works on some
 access points and fails on others.
 
 **user** is QEMU's own NAT, with ports forwarded from the host - connect at
-`ssh -p 2222 kairos@localhost` and `http://localhost:8080`. It needs no
+`ssh -p 2222 kairos@localhost` and `http://localhost:8080` for the first VM
+you start. A second VM in `user` mode gets the next pair up, 2223/8081, and
+so on - `kairos-lab status` shows which VM has which. It needs no
 privileges and no NetworkManager. SLIRP is a userspace NAT inside the QEMU
-process, so the guest has no address on your network at all and those two
-forwarded ports are the only way in. That is what keeps `user` out of any
-cluster, and unlike the one-VM limit above it is the network's rather than
-this CLI's - no change here would lift it.
+process, so the guest has no address on your network at all and its own
+forwarded ports are the only way in: that is what keeps `user` out of any
+cluster, and it is the network's limit rather than this CLI's - no change
+here would lift it.
 
 ### macOS
 
@@ -251,8 +267,10 @@ prints, for what your VM actually got.
 
 ### Linux
 
-Both `shared` and `bridged` require **NetworkManager**, and both build a
-bridge (`kairoslab0`) and a tap device for the VM:
+Both `shared` and `bridged` require **NetworkManager**, and both build one
+bridge (`kairoslab0`) shared by every VM in this config dir, plus a tap
+device of its own for each VM (`kairoslab-tap0` for the first, `kairoslab-tap1`
+for the second, and so on):
 - **shared** attaches nothing but the tap. NetworkManager assigns
   `10.42.x.1/24` to the bridge, then runs a DHCP server and NAT on it, so the
   VM gets an address on a private subnet with no physical interface touched.
