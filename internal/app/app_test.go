@@ -3030,6 +3030,14 @@ func TestTeardownMessagesNameNoMode(t *testing.T) {
 // the ISO resolver or creating anything.
 func seedStartableState(t *testing.T, diskName string) {
 	t.Helper()
+	seedStartableStateWithDisks(t, diskName)
+}
+
+// seedStartableStateWithDisks is seedStartableState for more than one disk at
+// once, so a test can start two VMs in the same config dir without one
+// start's own seeding wiping out the disk the other one needs.
+func seedStartableStateWithDisks(t *testing.T, diskNames ...string) {
+	t.Helper()
 	store, err := state.DefaultStore()
 	if err != nil {
 		t.Fatalf("DefaultStore: %v", err)
@@ -3037,12 +3045,14 @@ func seedStartableState(t *testing.T, diskName string) {
 	st := state.NewState(store)
 	st.Setup.CompletedAt = state.NowRFC3339()
 	st.Setup.DependencyCheckPassed = true
-	st.Disks = append(st.Disks, state.Disk{
-		Name:      diskName,
-		Path:      filepath.Join(store.CacheDir, "vm", diskName+".qcow2"),
-		Size:      "60G",
-		CreatedAt: state.NowRFC3339(),
-	})
+	for _, diskName := range diskNames {
+		st.Disks = append(st.Disks, state.Disk{
+			Name:      diskName,
+			Path:      filepath.Join(store.CacheDir, "vm", diskName+".qcow2"),
+			Size:      "60G",
+			CreatedAt: state.NowRFC3339(),
+		})
+	}
 	if err := store.Save(st); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -4592,4 +4602,160 @@ func runtimeDirForTest(t *testing.T) string {
 		t.Fatalf("DefaultStore: %v", err)
 	}
 	return filepath.Join(store.CacheDir, "runtime")
+}
+
+// --- multi-VM (kairos-lab#6) -------------------------------------------
+
+// TestStartAllocatesTheNextFreeIndexForASecondLiveVM is an end-to-end proof
+// of the feature this issue is about: two differently-named VMs in one
+// config dir get different indices, runtime paths and user-mode ports, and
+// starting the second is not refused over the first. -network user is what
+// lets this run on any host without NetworkManager or a real bridge: it
+// takes neither of the two Linux-only prepare branches this package seams,
+// so nothing here is faked, and PATH isolation makes both starts fail at
+// the QEMU launch itself -- after "[2/3] Recording VM state" has already
+// run, which is the state this test reads.
+func TestStartAllocatesTheNextFreeIndexForASecondLiveVM(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	seedStartableStateWithDisks(t, "vm-a", "vm-b")
+
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+
+	var stdoutA, stderrA bytes.Buffer
+	errA := Run([]string{"start", "-name", "vm-a", "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdoutA, &stderrA, "test")
+	if errA == nil || !strings.Contains(errA.Error(), "start qemu") {
+		t.Fatalf("starting vm-a returned %v, want it to have recorded state and then failed to launch; stdout:\n%s", errA, stdoutA.String())
+	}
+
+	// vm-a's own record carries no PID (the launch never got that far), so
+	// D4's liveness predicate needs its StarterPID to still be a running
+	// process for vm-b's start to see it as a live sibling and allocate
+	// index 1 rather than reusing index 0. This process's own PID is
+	// guaranteed to still be running.
+	if err := store.Update(func(st *state.State) error {
+		v := state.FindVM(st, "vm-a")
+		if v == nil {
+			t.Fatal("vm-a has no state record after its start")
+		}
+		v.StarterPID = os.Getpid()
+		return nil
+	}); err != nil {
+		t.Fatalf("mark vm-a live: %v", err)
+	}
+
+	var stdoutB, stderrB bytes.Buffer
+	errB := Run([]string{"start", "-name", "vm-b", "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdoutB, &stderrB, "test")
+	if errB == nil || !strings.Contains(errB.Error(), "start qemu") {
+		t.Fatalf("starting vm-b with vm-a live returned %v, want the same recorded-then-failed-launch outcome, not a refusal over vm-a; stdout:\n%s", errB, stdoutB.String())
+	}
+
+	st, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	a := state.FindVM(st, "vm-a")
+	b := state.FindVM(st, "vm-b")
+	if a == nil || b == nil {
+		t.Fatalf("both VMs should have a state record: vm-a=%v vm-b=%v", a, b)
+	}
+	if a.Index != 0 {
+		t.Errorf("vm-a index = %d, want 0 (the first VM started, with a live sibling check that had nothing else to find)", a.Index)
+	}
+	if b.Index != 1 {
+		t.Errorf("vm-b index = %d, want 1 (vm-a is live at index 0, so the lowest free index is 1)", b.Index)
+	}
+	if a.QGASockPath == b.QGASockPath {
+		t.Errorf("both VMs share a QGA socket path %q, so a second one would collide with the first", a.QGASockPath)
+	}
+	if a.LogPath == b.LogPath {
+		t.Errorf("both VMs share a log path %q", a.LogPath)
+	}
+	if !strings.HasSuffix(a.QGASockPath, "qemu.sock") {
+		t.Errorf("vm-a (index 0) QGA socket = %q, want it to end in the byte-identical index-0 name qemu.sock (D7)", a.QGASockPath)
+	}
+	if !strings.HasSuffix(b.QGASockPath, "qemu-1.sock") {
+		t.Errorf("vm-b (index 1) QGA socket = %q, want it to end in qemu-1.sock", b.QGASockPath)
+	}
+	// User-mode ports: index 0 keeps the fixed 2222/8080, index 1 gets
+	// 2223/8081, per D7. The recorded QEMU command line is where this is
+	// externally observable.
+	if !slices.Contains(a.QemuArgs, "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080") {
+		t.Errorf("vm-a's user-mode netdev is not the unchanged index-0 default:\n%q", a.QemuArgs)
+	}
+	if !slices.Contains(b.QemuArgs, "user,id=net0,hostfwd=tcp:127.0.0.1:2223-:22,hostfwd=tcp:127.0.0.1:8081-:8080") {
+		t.Errorf("vm-b's user-mode netdev is not 2223/8081 bound to 127.0.0.1:\n%q", b.QemuArgs)
+	}
+}
+
+// TestStatusShowsTwoVMsAndTwoAddresses is AC 3 (mutual reachability is a
+// host-level claim this suite cannot make; that two VMs show up as two
+// distinct, independently addressed entries in status is the part of it
+// this package owns).
+func TestStatusShowsTwoVMsAndTwoAddresses(t *testing.T) {
+	out := runStatusOutput(t, func(st *state.State) {
+		state.UpsertVM(st, state.VM{Name: "vm-a", Index: 0, IPAddress: "192.168.64.10", NetworkMode: "shared"})
+		state.UpsertVM(st, state.VM{Name: "vm-b", Index: 1, IPAddress: "192.168.64.11", NetworkMode: "shared"})
+	})
+	for _, want := range []string{"vm: vm-a", "vm: vm-b", "  vm ip address: 192.168.64.10\n", "  vm ip address: 192.168.64.11\n"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status does not print %q:\n%s", want, out)
+		}
+	}
+	if got := strings.Count(out, "vm ip address:"); got != 2 {
+		t.Errorf("status prints %d address rows, want exactly 2 -- one per VM:\n%s", got, out)
+	}
+}
+
+// TestResetOneVMLeavesASiblingsRecordAlone is the state-layer half of "reset
+// -disk a with b live never disturbs b": internal/vm's own fakeHost tests
+// (network_multivm_linux_test.go) cover the network side -- that
+// CleanupLinuxBridge with siblingLive=true never touches the bridge or a
+// sibling's tap. This is the app-layer half, with no real networking
+// involved: b's own VM record must survive a `reset -disk a` untouched.
+func TestResetOneVMLeavesASiblingsRecordAlone(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	store, err := state.DefaultStore()
+	if err != nil {
+		t.Fatalf("DefaultStore: %v", err)
+	}
+	st := state.NewState(store)
+	st.Setup.CompletedAt = state.NowRFC3339()
+	st.Setup.DependencyCheckPassed = true
+	state.AddDisk(st, state.Disk{Name: "vm-a", Path: "/nope/vm-a.qcow2", CreatedAt: state.NowRFC3339(), Size: "60G"})
+	state.AddDisk(st, state.Disk{Name: "vm-b", Path: "/nope/vm-b.qcow2", CreatedAt: state.NowRFC3339(), Size: "60G"})
+	state.UpsertVM(st, state.VM{Name: "vm-a", Index: 0})
+	// vm-b is live: a real, running PID, so reset must refuse to touch it
+	// and must not report it as part of a completed reset either.
+	state.UpsertVM(st, state.VM{Name: "vm-b", Index: 1, PID: os.Getpid()})
+	if err := store.Save(st); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := Run([]string{"reset", "-disk", "vm-a", "-yes"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+		t.Fatalf("reset -disk vm-a: %v; stdout:\n%s", err, stdout.String())
+	}
+
+	got := loadStoredState(t)
+	if state.FindVM(got, "vm-a") != nil {
+		t.Error("vm-a's own record should have been removed by its own reset")
+	}
+	b := state.FindVM(got, "vm-b")
+	if b == nil {
+		t.Fatal("vm-b's record was removed by a reset that named only vm-a")
+	}
+	if b.PID != os.Getpid() {
+		t.Errorf("vm-b's record was modified by a reset that named only vm-a: PID = %d, want %d", b.PID, os.Getpid())
+	}
+	if state.FindDiskByName(got, "vm-b") == nil {
+		t.Error("vm-b's disk was removed by a reset that named only vm-a")
+	}
 }
