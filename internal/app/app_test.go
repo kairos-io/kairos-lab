@@ -4616,6 +4616,9 @@ func runtimeDirForTest(t *testing.T) string {
 // the QEMU launch itself -- after "[2/3] Recording VM state" has already
 // run, which is the state this test reads.
 func TestStartAllocatesTheNextFreeIndexForASecondLiveVM(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("this test drives the start path as Linux takes it, and %s is not Linux: on darwin -- the only other platform kairos-lab is built for -- the run needs a firmware path from `brew --prefix qemu` before it records anything, and this test's isolation from host binaries denies it one", runtime.GOOS)
+	}
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	isolateFromHostBinaries(t)
