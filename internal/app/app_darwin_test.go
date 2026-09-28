@@ -25,7 +25,7 @@ import (
 // pin is a decision and a string, and neither of them shows that runStart
 // acts on the decision -- that cmdName becomes "sudo", that the QEMU binary
 // moves into the argument list behind it, and that this is what gets recorded
-// as st.VM.QemuBinary and printed as the command about to run. Deleting the
+// as the recorded VM's QemuBinary and printed as the command about to run. Deleting the
 // `cmdName = "sudo"` assignment leaves both of those tests green.
 //
 // Reaching it needs no seam and no production change. Between Run and the
@@ -65,13 +65,13 @@ func TestStartLaunchesVmnetSharedUnderSudo(t *testing.T) {
 	}
 
 	st := loadStoredState(t)
-	if st.VM.QemuBinary != "sudo" {
-		t.Errorf("QemuBinary = %q, want %q: both vmnet modes need QEMU itself launched as root", st.VM.QemuBinary, "sudo")
+	if soleVM(t, st).QemuBinary != "sudo" {
+		t.Errorf("QemuBinary = %q, want %q: both vmnet modes need QEMU itself launched as root", soleVM(t, st).QemuBinary, "sudo")
 	}
-	if len(st.VM.QemuArgs) == 0 || st.VM.QemuArgs[0] != "qemu-system-aarch64" {
-		t.Fatalf("QemuArgs = %q, want the QEMU binary as the first argument to sudo", st.VM.QemuArgs)
+	if len(soleVM(t, st).QemuArgs) == 0 || soleVM(t, st).QemuArgs[0] != "qemu-system-aarch64" {
+		t.Fatalf("QemuArgs = %q, want the QEMU binary as the first argument to sudo", soleVM(t, st).QemuArgs)
 	}
-	// The recorded command is the command: st.VM.QemuArgs is what `status`
+	// The recorded command is the command: the VM's own QemuArgs is what `status`
 	// and a later `stop` read, so the binary moving behind sudo has to be
 	// visible there and not only in the exec.
 	if !strings.Contains(stdout.String(), "Running: sudo qemu-system-aarch64") {
@@ -80,10 +80,10 @@ func TestStartLaunchesVmnetSharedUnderSudo(t *testing.T) {
 	// And it is a vmnet-shared launch, over no host interface at all: the
 	// firmware path is the one the fake brew answered with, which is what
 	// says macOSFirmwarePath really ran on the way here.
-	if valueAfterArg(st.VM.QemuArgs, "-netdev") != "vmnet-shared,id=net0" {
-		t.Errorf("QemuArgs = %q, want a bare vmnet-shared netdev", st.VM.QemuArgs)
+	if valueAfterArg(soleVM(t, st).QemuArgs, "-netdev") != "vmnet-shared,id=net0" {
+		t.Errorf("QemuArgs = %q, want a bare vmnet-shared netdev", soleVM(t, st).QemuArgs)
 	}
-	if got := valueAfterArg(st.VM.QemuArgs, "-bios"); got != firmware {
+	if got := valueAfterArg(soleVM(t, st).QemuArgs, "-bios"); got != firmware {
 		t.Errorf("-bios = %q, want %q -- the path the fake brew answered with", got, firmware)
 	}
 	if st.Network.BridgeInterface != "" {

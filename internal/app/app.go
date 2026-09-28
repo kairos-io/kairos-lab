@@ -392,10 +392,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if err := requireSetup(st); err != nil {
 		return err
 	}
-	running, _ := vm.IsRunning(st.VM.PID)
-	if running {
-		return fmt.Errorf("a vm is already running with pid %d", st.VM.PID)
-	}
+	// The per-VM refusal replaces this early, single-VM check (D1/M4): which
+	// VM this start is about is not known until the disk is resolved below,
+	// and the check that matters is made just above the prepare blocks, per
+	// the hazard at the "[1/3] Preparing networking" step -- a prepare
+	// mutates the host before store.Save is reached. See the reservation
+	// below.
 
 	vmDir := filepath.Join(store.CacheDir, "vm")
 	runtimeDir := filepath.Join(store.CacheDir, "runtime")
@@ -670,6 +672,70 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		writeLine(stdout, "")
 	}
 
+	// The per-VM refusal, D1/D4's reservation, and D6's index allocation, all
+	// in one Update so the check, the allocation and the reservation are
+	// atomic against a sibling doing the same thing at the same time --
+	// without that, two concurrent starts could both read "index free" and
+	// both pick 0. This sits above both prepare blocks below and above every
+	// later write of this VM's own state, per the hazard at app.go's own
+	// note on why "[2/3] Recording VM state" is not reached until well after
+	// a prepare has already mutated the host.
+	//
+	// disk.Name is used, not vmConfig.DiskName: the review above renames a
+	// NEW disk only, and a new disk has no live VM by construction, so the
+	// post-review name is the one to key the reservation on.
+	vmName := disk.Name
+	var vmIndex int
+	var siblingLive bool
+	reservedAt := state.NowRFC3339()
+	if err := store.Update(func(s *state.State) error {
+		if existing := state.FindVM(s, vmName); existing != nil && vm.VMIsLive(*existing) {
+			return fmt.Errorf("a vm named %q is already running (pid %d)", vmName, existing.PID)
+		}
+		for _, v := range s.VMs {
+			if v.Name != vmName && vm.VMIsLive(v) {
+				siblingLive = true
+			}
+		}
+		idx, err := state.NextFreeVMIndex(s, vm.VMIsLive)
+		if err != nil {
+			return err
+		}
+		vmIndex = idx
+		state.UpsertVM(s, state.VM{
+			Name:       vmName,
+			Index:      idx,
+			DiskName:   disk.Name,
+			DiskPath:   disk.Path,
+			StarterPID: os.Getpid(),
+			StartingAt: reservedAt,
+		})
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Releases the reservation on any return before "[2/3] Recording VM
+	// state" below completes -- a failed prepare, a declined sudo prompt --
+	// so a VM that never got as far as a real record does not read as live
+	// forever after (StarterPID is this test/CLI process's own, which in a
+	// long-lived process never exits on its own). Once recorded is true
+	// this is a no-op: state.UpsertVM below has written a real record --
+	// disk resolved, network prepared, QEMU command built -- and it stays
+	// even if QEMU itself then fails to launch, exactly as a single-VM host
+	// always kept it.
+	recorded := false
+	defer func() {
+		if recorded {
+			return
+		}
+		_ = store.Update(func(s *state.State) error {
+			if v := state.FindVM(s, vmName); v != nil && v.PID == 0 && v.StarterPID == os.Getpid() {
+				state.RemoveVM(s, vmName)
+			}
+			return nil
+		})
+	}()
+
 	writeLine(stdout, "[1/3] Preparing networking")
 	if *network == "bridged" && runtime.GOOS == "darwin" {
 		// vmnet happily builds a bridge onto an interface with no link. The
@@ -724,7 +790,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if !ok {
 			return fmt.Errorf("sudo permission denied")
 		}
-		if err := prepareLinuxShared(st, runtimeDir); err != nil {
+		if err := prepareLinuxShared(st, runtimeDir, vmIndex, siblingLive); err != nil {
 			return err
 		}
 	}
@@ -743,7 +809,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		if !ok {
 			return fmt.Errorf("sudo permission denied")
 		}
-		if err := prepareLinuxBridge(st, runtimeDir); err != nil {
+		if err := prepareLinuxBridge(st, runtimeDir, vmIndex, siblingLive); err != nil {
 			return err
 		}
 		// Read back what the prepare enslaved instead of trusting what it
@@ -795,21 +861,27 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		macAddress = vm.MACForDisk(disk.Name)
 	}
 
-	// Use short names for socket (Unix socket path limit is ~108 chars)
-	qgaSock := filepath.Join(runtimeDir, "qemu.sock")
-	logPath := filepath.Join(runtimeDir, "qemu.log")
+	// Use short names for socket (Unix socket path limit is ~108 chars), and
+	// index 0's paths are byte-identical to a pre-multi-VM host (D7); every
+	// index above it gets its own socket and log so two VMs never share
+	// either.
+	qgaSock, logPath := runtimePathsForIndex(runtimeDir, vmIndex)
+	sshPort, httpPort, userModeHostBind := userModePortsForIndex(vmIndex)
 	binary, qemuArgs, err := buildQEMUCommand(vm.StartConfig{
-		ISOPath:       isoLocal,
-		DiskPath:      disk.Path,
-		QGASocketPath: qgaSock,
-		CPUs:          *cpus,
-		MemoryMB:      *memory * 1024,
-		NetworkMode:   *network,
-		DisplayMode:   *display,
-		BridgeIface:   bridgeInterfaceForMode(*network, networkIface),
-		LinuxTapName:  st.Network.TapName,
-		MACAddress:    macAddress,
-		BiosPath:      biosPath,
+		ISOPath:          isoLocal,
+		DiskPath:         disk.Path,
+		QGASocketPath:    qgaSock,
+		CPUs:             *cpus,
+		MemoryMB:         *memory * 1024,
+		NetworkMode:      *network,
+		DisplayMode:      *display,
+		BridgeIface:      bridgeInterfaceForMode(*network, networkIface),
+		LinuxTapName:     st.Network.TapName,
+		MACAddress:       macAddress,
+		BiosPath:         biosPath,
+		SSHPort:          sshPort,
+		HTTPPort:         httpPort,
+		UserModeHostBind: userModeHostBind,
 	})
 	if err != nil {
 		return err
@@ -830,43 +902,80 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	writeLine(stdout, "[2/3] Recording VM state")
-	// Persist the chosen memory and CPU settings on the disk so they become
-	// the default next time this disk is started. Guard against zero/negative
-	// values that could arrive via explicit flags (e.g. -memory 0) without
-	// going through the interactive reviewer.
-	if stateDisk := state.FindDiskByName(st, disk.Name); stateDisk != nil {
-		if vmConfig.MemoryGB > 0 {
-			stateDisk.MemoryGB = vmConfig.MemoryGB
-		}
-		if vmConfig.CPUs > 0 {
-			stateDisk.CPUs = vmConfig.CPUs
-		}
-		stateDisk.MAC = macAddress
-	}
+	// Every write from here on goes through store.Update rather than the
+	// plain store.Save this replaced, and touches only vmName's own entry in
+	// s.VMs (state.UpsertVM) plus the disk/managed-path bookkeeping that
+	// names disk.Name specifically -- never another VM's record. Two
+	// concurrent starts each hold their own in-memory st, loaded before
+	// either reached this point, so a plain Save here would publish a stale
+	// copy of whatever the other one had already written; Update reloads
+	// fresh under the same lock reservedAt was written under, so this
+	// merges instead of overwriting.
+	//
+	// The final Update also re-asserts on disk.Name (D4): if this VM's
+	// reservation somehow no longer names us (it always should, since
+	// nothing else can complete a start under this name while a live
+	// reservation stands), the error surfaces here rather than silently
+	// recording a PID nobody asked for.
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = bridgeInterfaceForMode(*network, networkIface)
-	st.VM.ISOLocal = isoLocal
-	st.VM.DiskPath = disk.Path
-	st.VM.DiskName = disk.Name
-	st.VM.LogPath = logPath
-	st.VM.QemuBinary = cmdName
-	st.VM.QemuArgs = cmdArgs
-	st.VM.StartedAt = state.NowRFC3339()
-	st.VM.StoppedAt = ""
-	st.VM.RuntimeDir = runtimeDir
-	st.VM.QGASockPath = qgaSock
-	st.VM.LastError = ""
-	// The address recorded here belongs to the run being recorded, and this
-	// run has not got one yet: the poll that finds it starts once QEMU is
-	// running. Carrying the previous run's address over would have `status`
-	// report a stale address as this VM's for as long as the poll takes, and
-	// for good if it never answers.
-	st.VM.IPAddress = ""
-	state.AddManagedFile(st, logPath)
-	state.AddManagedFile(st, qgaSock)
-	if err := store.Save(st); err != nil {
+	tapConnName := ""
+	if st.Network.BridgeName != "" {
+		tapConnName = vm.TapConnNameForIndex(st.Network.BridgeName, vmIndex)
+	}
+	vmRecord := state.VM{
+		Name:        vmName,
+		Index:       vmIndex,
+		ISOLocal:    isoLocal,
+		DiskPath:    disk.Path,
+		DiskName:    disk.Name,
+		LogPath:     logPath,
+		QemuBinary:  cmdName,
+		QemuArgs:    cmdArgs,
+		StartedAt:   state.NowRFC3339(),
+		RuntimeDir:  runtimeDir,
+		QGASockPath: qgaSock,
+		TapName:     st.Network.TapName,
+		TapConnName: tapConnName,
+		NetworkMode: *network,
+		SSHPort:     sshPort,
+		HTTPPort:    httpPort,
+		StarterPID:  os.Getpid(),
+		StartingAt:  reservedAt,
+	}
+	if err := store.Update(func(s *state.State) error {
+		// Mutated on the in-memory st first, and then copied whole into s,
+		// whether s already has a record of this name (an existing disk
+		// this run started) or not (a new disk this run just created,
+		// added to st but never yet saved to disk).
+		if srcDisk := state.FindDiskByName(st, disk.Name); srcDisk != nil {
+			if vmConfig.MemoryGB > 0 {
+				srcDisk.MemoryGB = vmConfig.MemoryGB
+			}
+			if vmConfig.CPUs > 0 {
+				srcDisk.CPUs = vmConfig.CPUs
+			}
+			srcDisk.MAC = macAddress
+			if existing := state.FindDiskByName(s, disk.Name); existing != nil {
+				*existing = *srcDisk
+			} else {
+				state.AddDisk(s, *srcDisk)
+			}
+		}
+		s.Network = st.Network
+		state.AddManagedFile(s, logPath)
+		state.AddManagedFile(s, qgaSock)
+		state.UpsertVM(s, vmRecord)
+		return nil
+	}); err != nil {
 		return err
 	}
+	// From here on vmRecord is a real record -- config fully resolved,
+	// disk materialized, QEMU command built -- and worth keeping even if
+	// QEMU itself then fails to launch (below) exactly as it was before
+	// multi-VM support. Only the bare reservation stub from before this
+	// point is what the deferred release above exists to clean up.
+	recorded = true
 
 	writeLine(stdout, "[3/3] Starting VM")
 	writef(stdout, "Running: %s\n", renderCommand(cmdName, cmdArgs))
@@ -916,14 +1025,26 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	command.Stdout = childStdio(cmdName == "sudo", stdout, io.MultiWriter(vmOut, logFile))
 	command.Stderr = childStdio(cmdName == "sudo", stderr, io.MultiWriter(vmErr, logFile))
 	if err := command.Start(); err != nil {
-		st.VM.LastError = err.Error()
-		_ = store.Save(st)
+		vmRecord.LastError = err.Error()
+		_ = store.Update(func(s *state.State) error {
+			state.UpsertVM(s, vmRecord)
+			return nil
+		})
 		return fmt.Errorf("start qemu: %w", err)
 	}
-	st.VM.PID = command.Process.Pid
-	if err := store.Save(st); err != nil {
-		_ = command.Process.Kill()
-		return err
+	vmRecord.PID = command.Process.Pid
+	// An Update that cannot complete here (D8: a timed-out lock, most likely)
+	// is logged and the run continues rather than treated as a start
+	// failure: QEMU is already running, and killing it over a bookkeeping
+	// write would orphan nothing while still losing the VM the user asked
+	// for. The PID is recorded on the next successful write instead --
+	// either the exit-time one below, or a `status`/`reset` that reconciles
+	// it -- so the record catches up rather than staying wrong forever.
+	if err := store.Update(func(s *state.State) error {
+		state.UpsertVM(s, vmRecord)
+		return nil
+	}); err != nil {
+		writef(stderr, "warning: the VM's PID was not recorded: %v\n", err)
 	}
 
 	// The guest has no address until it has booted and asked for one, and
@@ -931,14 +1052,10 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	// boot" is a goroutine running BESIDE the VM and not code placed after
 	// that call.
 	//
-	// The goroutine never touches st. It records what it finds through its
-	// own store.Load/store.Save, which is what lets a `status` in another
-	// terminal see the address while the VM is still running, and it is the
-	// only writer of state.json for that whole window: between the save just
-	// above and the one after Wait, no other line of runStart writes st or
-	// calls store.Save. The join below sits ahead of that later save, and the
-	// address is put back on st there so the save does not blank the field
-	// the goroutine had written.
+	// The goroutine never touches st or vmRecord directly. It records what
+	// it finds through its own store.Update, keyed on vmName, which is what
+	// lets a `status` in another terminal see the address while the VM is
+	// still running without that write ever touching another VM's entry.
 	ipCtx, cancelIPPoll := context.WithCancel(context.Background())
 	ipDone := make(chan struct{})
 	ipResolved := make(chan vm.IPResult, 1)
@@ -948,6 +1065,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		close(ipDone)
 	} else {
 		poll := vmIPPoll{
+			Name: vmName,
 			Lookup: vm.IPLookup{
 				MAC:           macAddress,
 				Mode:          *network,
@@ -981,18 +1099,18 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	<-ipDone
 	select {
 	case res := <-ipResolved:
-		st.VM.IPAddress = res.IP
+		vmRecord.IPAddress = res.IP
 	default:
 	}
-	st.VM.PID = 0
-	st.VM.StoppedAt = state.NowRFC3339()
+	vmRecord.PID = 0
+	vmRecord.StoppedAt = state.NowRFC3339()
 	if waitErr != nil {
-		st.VM.LastError = waitErr.Error()
-		_ = store.Save(st)
+		vmRecord.LastError = waitErr.Error()
+		_ = finalizeVMRecord(store, st, vmRecord)
 		return fmt.Errorf("vm exited with error: %w (log: %s)", waitErr, logPath)
 	}
-	st.VM.LastError = ""
-	if err := store.Save(st); err != nil {
+	vmRecord.LastError = ""
+	if err := finalizeVMRecord(store, st, vmRecord); err != nil {
 		return err
 	}
 	writeLine(stdout, "vm exited")
@@ -1014,6 +1132,31 @@ const (
 	webUIPort       = "8080"
 	userModeSSHPort = "2222"
 )
+
+// runtimePathsForIndex returns the QGA socket and log paths for a VM at
+// index, per D7: index 0 is "runtime/qemu.sock" and "runtime/qemu.log",
+// byte-identical to a pre-multi-VM host, and index N>=1 is
+// "runtime/qemu-N.sock" and "runtime/qemu-N.log", so two VMs in the same
+// config dir never share either.
+func runtimePathsForIndex(runtimeDir string, index int) (qgaSock, logPath string) {
+	if index == 0 {
+		return filepath.Join(runtimeDir, "qemu.sock"), filepath.Join(runtimeDir, "qemu.log")
+	}
+	suffix := fmt.Sprintf("-%d", index)
+	return filepath.Join(runtimeDir, "qemu"+suffix+".sock"), filepath.Join(runtimeDir, "qemu"+suffix+".log")
+}
+
+// userModePortsForIndex returns the SSH/HTTP forwards and the host address
+// they bind, per D7/D11: index 0 keeps today's fixed 2222/8080 bound to
+// every host interface (AC 5 forbids changing what index 0 already
+// exposes), and index N>=1 gets 2222+N/8080+N bound to 127.0.0.1 only --
+// new surface with no compatibility constraint to keep.
+func userModePortsForIndex(index int) (sshPort, httpPort int, hostBind string) {
+	if index == 0 {
+		return 2222, 8080, ""
+	}
+	return 2222 + index, 8080 + index, "127.0.0.1"
+}
 
 // vmUpBlock is what a start prints once the guest's address is known.
 //
@@ -1245,6 +1388,9 @@ var pollVMIP = func(ctx context.Context, lookup vm.IPLookup, timeout, interval t
 // about, how long to ask for, where to print the answer and where to record
 // it.
 type vmIPPoll struct {
+	// Name is the VM this poll's findings belong to; recordVMIP keys its
+	// Update on it so the write never touches any other VM's entry.
+	Name     string
 	Lookup   vm.IPLookup
 	Uplink   string
 	Timeout  time.Duration
@@ -1310,7 +1456,7 @@ func (p vmIPPoll) run(ctx context.Context) (vm.IPResult, bool) {
 		// what this code backs on every path it covers. What is lost in both
 		// halves is a `status` run made WHILE the VM is up, the very window
 		// this poll exists to serve.
-		if err := recordVMIP(p.Store, res.IP); err != nil {
+		if err := recordVMIP(p.Store, p.Name, res.IP); err != nil {
 			writef(p.Stderr, "warning: the VM address was not recorded, so `kairos-lab status` will not show it while this VM is running: %s\n         this run tries to write the address to the state file again when the VM exits.\n", planValue(err.Error()))
 		}
 		return res, true
@@ -1382,21 +1528,60 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
-// recordVMIP puts the address in state.json through a load of its own.
+// finalizeVMRecord writes vmRecord's final state (the exit-time write, both
+// on a clean exit and on a wait error) through a merge-safe store.Update, per
+// D8, falling back to a plain overwrite built from st when Update cannot
+// even complete a Load.
+//
+// The fallback matters because a plain runStart's own write here is the
+// process's last act before it exits: a state.json this process cannot
+// currently parse -- corrupted by another write landing at exactly the
+// wrong moment, or by anything else -- must not mean the VM's exit goes
+// unrecorded forever. Before D8's Update, a bare store.Save(st) already
+// rebuilt the file unconditionally in that situation, since Save never reads
+// what is currently on disk; falling back to exactly that keeps the
+// property. st is this run's own last-known-good copy of everything else in
+// the file -- Setup, Disks, Network, the managed lists -- so the rebuild
+// loses nothing this run itself did not already have.
+func finalizeVMRecord(store *state.Store, st *state.State, vmRecord state.VM) error {
+	err := store.Update(func(s *state.State) error {
+		// Merge rather than overwrite: the IP poll's own Update (or a
+		// `status`/`reset` from another terminal) may have touched this
+		// record since vmRecord was last synced with disk, most notably the
+		// IPAddress field, which the caller may hold a stale (empty) copy
+		// of if the poll's own write landed after it was last read.
+		if v := state.FindVM(s, vmRecord.Name); v != nil && vmRecord.IPAddress == "" {
+			vmRecord.IPAddress = v.IPAddress
+		}
+		state.UpsertVM(s, vmRecord)
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+	state.UpsertVM(st, vmRecord)
+	return store.Save(st)
+}
+
+// recordVMIP puts the address on name's own VM record through a Store.Update
+// of its own.
 //
 // It deliberately does not take the caller's *state.State: runStart is
 // blocked in command.Wait() with a copy of the state it loaded before the VM
 // started, and saving that copy from here would undo every field written
-// since. Loading, setting the one field and saving is also what makes the
-// address visible to a `status` run from another terminal while this VM is
-// still running.
-func recordVMIP(store *state.Store, ip string) error {
-	st, err := store.Load()
-	if err != nil {
-		return err
-	}
-	st.VM.IPAddress = ip
-	return store.Save(st)
+// since -- by this same start's own later writes, and by any sibling VM's.
+// Update reloads fresh and changes only name's entry, which is what makes
+// the address visible to a `status` run from another terminal while this VM
+// is still running without disturbing anything else in state.json.
+func recordVMIP(store *state.Store, name, ip string) error {
+	return store.Update(func(st *state.State) error {
+		v := state.FindVM(st, name)
+		if v == nil {
+			return fmt.Errorf("vm %q no longer has a state record", name)
+		}
+		v.IPAddress = ip
+		return nil
+	})
 }
 
 func runStatus(stdout io.Writer, store *state.Store) error {
@@ -1410,7 +1595,6 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	p := platform.Detect()
 	req := deps.Required(p)
 	present := deps.PresentNames(req)
-	running, _ := vm.IsRunning(st.VM.PID)
 
 	platformLabel := st.Platform.OS + "/" + st.Platform.Arch
 	if st.Platform.OS == "" {
@@ -1441,57 +1625,73 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
 	writef(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
 	writef(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
-	writef(stdout, "iso source: %s\n", emptyAsNone(st.VM.ISOSource))
-	writef(stdout, "iso path: %s\n", emptyAsNone(st.VM.ISOLocal))
-	writef(stdout, "disk path: %s\n", emptyAsNone(st.VM.DiskPath))
-	writef(stdout, "network mode: %s\n", emptyAsNone(st.Network.Mode))
+
+	// One block per VM (M5), in the order state.json carries them -- disk
+	// name, mode, tap, running, pid, address are all per-VM now, where a
+	// single-VM host used to see them as top-level rows. iso source/path and
+	// disk path move into the block for the same reason: they are per-VM
+	// facts.
+	if len(st.VMs) == 0 {
+		writeLine(stdout, "vms: none")
+	}
+	for _, v := range st.VMs {
+		running := vm.VMIsLive(v)
+		name := v.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		writef(stdout, "vm: %s\n", planValue(name))
+		writef(stdout, "  iso source: %s\n", emptyAsNone(v.ISOSource))
+		writef(stdout, "  iso path: %s\n", emptyAsNone(v.ISOLocal))
+		writef(stdout, "  disk path: %s\n", emptyAsNone(v.DiskPath))
+		writef(stdout, "  network mode: %s\n", emptyAsNone(v.NetworkMode))
+		writef(stdout, "  vm ip address: %s%s\n", emptyAsNone(v.IPAddress), linkLocalAddressNote(v.IPAddress))
+		if v.NetworkMode == "user" {
+			sshPort, httpPort, _ := userModePortsForIndex(v.Index)
+			writef(stdout, "  user mode forwards: ssh localhost:%d, http localhost:%d\n", sshPort, httpPort)
+		}
+		writef(stdout, "  vm running: %t\n", running)
+		if running {
+			writef(stdout, "  vm pid: %d\n", v.PID)
+		}
+		if v.LastError != "" {
+			writef(stdout, "  last vm error: %s\n", planValue(v.LastError))
+		}
+	}
+
 	// The uplink stays a bridged-only row: shared clears the field on
 	// purpose, because the bridge it builds has the tap as its only port and
 	// attaches to no host interface.
 	if st.Network.Mode == "bridged" {
 		writef(stdout, "bridge iface: %s%s\n", emptyAsNone(st.Network.BridgeInterface), bridgeIfaceLinkNote(st.Network.BridgeInterface))
 	}
-	// The bridge and the tap are not bridged's alone: on Linux
-	// vm.PrepareLinuxShared records BridgeName and TapName exactly as the
-	// bridged path does, and both are what a user needs to name when a shared
-	// VM cannot be reached -- which is the default mode, so this row used to
-	// be missing from the status of nearly every Linux run.
+	// The bridge and the taps are not bridged's alone: on Linux
+	// vm.PrepareLinuxShared records BridgeName exactly as the bridged path
+	// does, and it is what a user needs to name when a shared VM cannot be
+	// reached -- which is the default mode. This row is rebuilt from the VM
+	// entries rather than from a single st.Network.TapName, which multi-VM
+	// support stops writing as a trusted value (M1/M2): every live VM may
+	// have its own tap on the one shared bridge.
 	//
-	// That is a LINUX sentence, and the row is gated on the two fields for
-	// exactly that reason: PrepareLinuxBridge and PrepareLinuxShared are the
-	// only writers of either. macOS hands the bridging to QEMU's vmnet
-	// backend and records neither in any mode, so a gate on the mode alone
-	// printed "bridge resources: bridge=none tap=none" under every shared and
-	// every bridged run there -- a row that could not say anything, in the
-	// status of the default mode on one of the two supported platforms.
-	//
-	// The mode term stays beside it, and is not the same question. user mode
-	// builds none of this, but the fields are left as an earlier bridged or
-	// shared run wrote them -- a user start clears neither -- so what the row
-	// would show there is the previous run's bridge, under a mode that is not
-	// using it. The reset and cleanup plans are where those leftovers are
-	// named, because they are what removes them.
-	if st.Network.Mode != "user" && (st.Network.BridgeName != "" || st.Network.TapName != "") {
-		writef(stdout, "bridge resources: bridge=%s tap=%s\n", emptyAsNone(st.Network.BridgeName), emptyAsNone(st.Network.TapName))
+	// That is a LINUX sentence, and the row is gated on BridgeName for
+	// exactly that reason: PrepareLinuxBridge and PrepareLinuxShared are its
+	// only writers. macOS hands the bridging to QEMU's vmnet backend and
+	// records no bridge name in any mode.
+	if st.Network.Mode != "user" && st.Network.BridgeName != "" {
+		var taps []string
+		for _, v := range st.VMs {
+			if v.TapName != "" {
+				taps = append(taps, v.TapName)
+			}
+		}
+		writef(stdout, "bridge resources: bridge=%s taps=%s\n", emptyAsNone(st.Network.BridgeName), joinOrNone(taps))
 	}
-	// Always printed, in every mode. This is the durable channel for the
-	// address: the block a start prints when it resolves one goes to the
-	// same terminal the guest's boot console is on and can scroll past
-	// unread, and this row is where it can be read back afterwards.
-	writef(stdout, "vm ip address: %s%s\n", emptyAsNone(st.VM.IPAddress), linkLocalAddressNote(st.VM.IPAddress))
-	if st.Network.Mode == "user" {
-		// Without this row user mode reports an address of none and nothing
-		// else, which reads like a failure rather than like the mode working
-		// as designed: a SLIRP guest has no address on the host's network
-		// and is reached on the two forwarded ports instead.
-		writef(stdout, "user mode forwards: ssh localhost:%s, http localhost:%s\n", userModeSSHPort, webUIPort)
-	}
-	writef(stdout, "vm running: %t\n", running)
-	if running {
-		writef(stdout, "vm pid: %d\n", st.VM.PID)
-	}
-	if st.VM.LastError != "" {
-		writef(stdout, "last vm error: %s\n", planValue(st.VM.LastError))
+
+	// Quarantined records (D9/M1): named rather than silently dropped, so a
+	// state.json a future or buggy binary corrupted is visible here instead
+	// of just missing a VM the user knows they started.
+	for _, q := range st.Quarantined {
+		writef(stdout, "quarantined vm record: %s (%s)\n", planValue(q.Name), planValue(q.Reason))
 	}
 	return nil
 }
@@ -1516,14 +1716,21 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		return err
 	}
 
-	running, _ := vm.IsRunning(st.VM.PID)
-	if running {
-		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+	// The refusal is per-VM (M5): with -disk X, only X's own VM being live
+	// blocks the reset; without it, every live VM blocks it, and each is
+	// named so the user knows which to exit first.
+	if *diskToRemove != "" {
+		if v := state.FindVM(st, *diskToRemove); v != nil && vm.VMIsLive(*v) {
+			return fmt.Errorf("vm %q is still running (PID %d). Exit it first (Ctrl-a x in serial console)", *diskToRemove, v.PID)
+		}
+	} else if names := liveVMNames(st); len(names) > 0 {
+		return fmt.Errorf("vm(s) still running: %s. Exit them first (Ctrl-a x in serial console)", strings.Join(names, ", "))
 	}
 
 	// Collect paths to remove
 	var paths []string
 	var disksToRemove []state.Disk
+	var vmsToRemove []state.VM
 
 	if *diskToRemove != "" {
 		// Remove specific disk
@@ -1533,16 +1740,36 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 		disksToRemove = append(disksToRemove, *disk)
 		paths = append(paths, disk.Path)
+		if v := state.FindVM(st, *diskToRemove); v != nil {
+			vmsToRemove = append(vmsToRemove, *v)
+		}
 	} else {
 		// Remove all disks
 		for _, d := range st.Disks {
 			disksToRemove = append(disksToRemove, d)
 			paths = append(paths, d.Path)
 		}
+		vmsToRemove = append(vmsToRemove, st.VMs...)
 	}
 
-	// Add runtime files
-	paths = append(paths, st.VM.LogPath, st.VM.QGASockPath)
+	// Add each targeted VM's own runtime files.
+	for _, v := range vmsToRemove {
+		paths = append(paths, v.LogPath, v.QGASockPath)
+	}
+
+	// Whether any VM NOT being removed is still live, which decides whether
+	// the shared bridge itself may come down once every targeted VM's own
+	// tap is gone (D2: one bridge, many taps).
+	removing := make(map[string]bool, len(vmsToRemove))
+	for _, v := range vmsToRemove {
+		removing[v.Name] = true
+	}
+	siblingLive := false
+	for _, v := range st.VMs {
+		if !removing[v.Name] && vm.VMIsLive(v) {
+			siblingLive = true
+		}
+	}
 
 	toRemove, toSkip := splitRemovalPaths(paths, st)
 
@@ -1567,10 +1794,20 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		// run still reads "bridge: kairoslab0". Escaping at this call site
 		// would protect these two rows and no others -- which is exactly the
 		// hole this replaced.
-		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
-		})
+		rows := []string{"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)}
+		if len(vmsToRemove) == 0 {
+			// No VM record to key off, which is what a fresh single-VM host
+			// (never started, or already reset) looks like; the default tap
+			// name is what a plain teardown has always shown here.
+			rows = append(rows, "tap: "+vm.DefaultTapName)
+		}
+		for _, v := range vmsToRemove {
+			rows = append(rows, "tap: "+nonEmpty(v.TapName, vm.DefaultTapName))
+		}
+		if siblingLive {
+			rows = append(rows, "(the bridge itself is left standing: another VM is still using it)")
+		}
+		printList(stdout, "Will clean up network resources", rows)
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
 			"bridge: " + vm.DefaultBridgeName,
@@ -1616,9 +1853,17 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up the network kairos-lab created...")
-		if err := vm.CleanupLinuxBridge(st); err != nil {
-			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
-			networkCleanupErr = err
+		// Sibling-aware, and ordered so the shared bridge comes down at most
+		// once (M3): every target but the last is cleaned up as though a
+		// sibling is live -- only its own tap goes -- and the last one
+		// actually removes the bridge, unless siblingLive says a VM outside
+		// this reset is still using it, in which case none of them do.
+		for i, v := range vmsToRemove {
+			last := i == len(vmsToRemove)-1
+			if err := vm.CleanupLinuxBridge(st, v, siblingLive || !last); err != nil {
+				writef(stdout, "warning: bridge cleanup failed for vm %q: %v\n", v.Name, err)
+				networkCleanupErr = err
+			}
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale network resources...")
@@ -1628,7 +1873,9 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		}
 	}
 
-	st.VM = state.VM{}
+	for _, v := range vmsToRemove {
+		state.RemoveVM(st, v.Name)
+	}
 	if err := store.Save(st); err != nil {
 		return err
 	}
@@ -1707,10 +1954,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		// run still reads "bridge: kairoslab0". Escaping at this call site
 		// would protect these two rows and no others -- which is exactly the
 		// hole this replaced.
-		printList(stdout, "Will clean up network resources", []string{
-			"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName),
-			"tap: " + nonEmpty(st.Network.TapName, vm.DefaultTapName),
-		})
+		rows := []string{"bridge: " + nonEmpty(st.Network.BridgeName, vm.DefaultBridgeName)}
+		if len(st.VMs) == 0 {
+			rows = append(rows, "tap: "+vm.DefaultTapName)
+		}
+		for _, v := range st.VMs {
+			rows = append(rows, "tap: "+nonEmpty(v.TapName, vm.DefaultTapName))
+		}
+		printList(stdout, "Will clean up network resources", rows)
 	} else if hasStaleNetwork {
 		printList(stdout, "Will clean up stale network resources (from failed/interrupted setup)", []string{
 			"bridge: " + vm.DefaultBridgeName,
@@ -1731,9 +1982,10 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		return fmt.Errorf("cleanup cancelled")
 	}
 
-	running, _ := vm.IsRunning(st.VM.PID)
-	if running {
-		return fmt.Errorf("a VM is still running (PID %d). Exit the VM first (Ctrl-a x in serial console)", st.VM.PID)
+	// cleanup removes everything unconditionally, so unlike reset's -disk
+	// case every live VM blocks it, named so the user knows which to exit.
+	if names := liveVMNames(st); len(names) > 0 {
+		return fmt.Errorf("vm(s) still running: %s. Exit them first (Ctrl-a x in serial console)", strings.Join(names, ", "))
 	}
 
 	// The error itself is kept, not a bool: it is the only thing that knows
@@ -1745,9 +1997,27 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	var networkCleanupErr error
 	if runtime.GOOS == "linux" && st.Network.CreatedByKairosLab {
 		writeLine(stdout, "Cleaning up the network kairos-lab created...")
-		if err := vm.CleanupLinuxBridge(st); err != nil {
-			writef(stdout, "warning: bridge cleanup failed: %v\n", err)
-			networkCleanupErr = err
+		if len(st.VMs) == 0 {
+			// No VM record to key off -- a state reached by hand-editing or
+			// by a sequence this binary does not otherwise produce. Fall
+			// back to index 0, which is what a single-VM host always
+			// cleaned up.
+			if err := vm.CleanupLinuxBridge(st, state.VM{}, false); err != nil {
+				writef(stdout, "warning: bridge cleanup failed: %v\n", err)
+				networkCleanupErr = err
+			}
+		} else {
+			// Every VM here is being removed, so only the last cleanup call
+			// (siblingLive=false) actually takes the shared bridge down;
+			// earlier ones remove just their own tap. See runReset for the
+			// same pattern.
+			for i, v := range st.VMs {
+				last := i == len(st.VMs)-1
+				if err := vm.CleanupLinuxBridge(st, v, !last); err != nil {
+					writef(stdout, "warning: bridge cleanup failed for vm %q: %v\n", v.Name, err)
+					networkCleanupErr = err
+				}
+			}
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale network resources...")
@@ -2869,4 +3139,18 @@ func requireSetup(st *state.State) error {
 		return errSetupRequired
 	}
 	return nil
+}
+
+// liveVMNames returns the name of every VM in st that vm.VMIsLive counts as
+// live, in state.json order. reset and cleanup both use it to name every VM
+// that has to be exited first, rather than refusing over just one of them
+// with no hint there were others.
+func liveVMNames(st *state.State) []string {
+	var names []string
+	for _, v := range st.VMs {
+		if vm.VMIsLive(v) {
+			names = append(names, v.Name)
+		}
+	}
+	return names
 }
