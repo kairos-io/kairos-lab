@@ -9,10 +9,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
-const SchemaVersion = 1
+const SchemaVersion = 2
+
+// maxVMIndex is the highest per-VM index this schema allocates. It bounds
+// both NextFreeVMIndex and the validation Load applies to a stored index: an
+// index above it is not a name TapNameForIndex or TapConnNameForIndex would
+// ever produce, so a record carrying one is quarantined rather than trusted.
+const maxVMIndex = 99
 
 type Platform struct {
 	OS             string `json:"os"`
@@ -56,7 +63,14 @@ type Disk struct {
 	MAC string `json:"mac,omitempty"`
 }
 
+// VM is one VM's record. D1 identifies a VM by its disk name, so Name is the
+// key every accessor below keys on; Index is the per-config-dir slot D6/D7
+// allocate it, and everything below TapName is additive for multi-VM support
+// (see the state package doc comment above Load for the migration that fills
+// these in for a pre-multi-VM file).
 type VM struct {
+	Name        string   `json:"name,omitempty"`
+	Index       int      `json:"index,omitempty"`
 	ISOSource   string   `json:"iso_source,omitempty"`
 	ISOInput    string   `json:"iso_input,omitempty"`
 	ISOLocal    string   `json:"iso_local_path,omitempty"`
@@ -72,6 +86,31 @@ type VM struct {
 	RuntimeDir  string   `json:"runtime_dir,omitempty"`
 	QGASockPath string   `json:"qga_socket_path,omitempty"`
 	IPAddress   string   `json:"ip_address,omitempty"`
+	// TapName and TapConnName are the per-VM network identity D2/D7 give this
+	// record. internal/vm derives both from Index rather than trusting these
+	// once a VM starts; they are carried here so status has something to show
+	// without recomputing the formula itself.
+	TapName     string `json:"tap_name,omitempty"`
+	TapConnName string `json:"tap_conn_name,omitempty"`
+	NetworkMode string `json:"network_mode,omitempty"`
+	SSHPort     int    `json:"ssh_port,omitempty"`
+	HTTPPort    int    `json:"http_port,omitempty"`
+	// StarterPID and StartingAt are D4's reservation half: written before
+	// command.Start() so a second start racing the first sees this record as
+	// live even before QEMU's own PID exists to check.
+	StarterPID int    `json:"starter_pid,omitempty"`
+	StartingAt string `json:"starting_at,omitempty"`
+}
+
+// QuarantinedVM names a VM record Load found in state.json but could not
+// trust, and why. It is never itself persisted -- state.json's "vms" array
+// carries only records that passed validation -- so a state file written by
+// an older or buggy binary cannot brick status, reset or cleanup: the bad
+// record is set aside instead of failing the whole file, and named here so
+// the user can see it rather than have it silently vanish.
+type QuarantinedVM struct {
+	Name   string
+	Reason string
 }
 
 type State struct {
@@ -79,10 +118,24 @@ type State struct {
 	Platform     Platform `json:"platform"`
 	Setup        Setup    `json:"setup"`
 	Network      Network  `json:"network"`
-	VM           VM       `json:"vm"`
+	VMs          []VM     `json:"vms,omitempty"`
+	// Legacy is the pre-multi-VM "vm" record. It is a pointer and not a VM
+	// value so Load can tell "absent from the file" (nil) from "present and
+	// the zero value" (non-nil, pointing at a VM that never started) -- the
+	// old field had no omitempty, so every real v1 file carries a "vm" key
+	// even when no VM has ever run, and the migration in Load needs to fold
+	// that in exactly once rather than mistake JSON's own zero value for
+	// "nothing to migrate". A save never repopulates this field: once a file
+	// has been through Load, Legacy is nil and stays out of the JSON entirely
+	// (omitempty), which is what makes the migration idempotent without any
+	// extra bookkeeping.
+	Legacy       *VM      `json:"vm,omitempty"`
 	Disks        []Disk   `json:"disks,omitempty"`
 	ManagedDirs  []string `json:"managed_dirs,omitempty"`
 	ManagedFiles []string `json:"managed_files,omitempty"`
+	// Quarantined is never persisted (json:"-"). It is populated by Load, from
+	// records this read could not trust; see QuarantinedVM.
+	Quarantined []QuarantinedVM `json:"-"`
 }
 
 type Store struct {
@@ -123,6 +176,12 @@ func NewState(s *Store) *State {
 	return st
 }
 
+// Load reads state.json, migrating a pre-multi-VM (schema 1) file into the
+// current shape and quarantining any VM record it cannot trust rather than
+// failing the whole read. It is idempotent and safe to call with no Save to
+// follow -- runStatus does exactly that -- because the migration only ever
+// folds Legacy (present only in a genuine v1 file) into VMs, and Legacy is
+// never written back once a file carries the current schema.
 func (s *Store) Load() (*State, error) {
 	b, err := os.ReadFile(s.StatePath)
 	if err != nil {
@@ -135,12 +194,145 @@ func (s *Store) Load() (*State, error) {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return nil, fmt.Errorf("parse state file: %w", err)
 	}
-	if st.Version == 0 {
-		st.Version = SchemaVersion
+	// A binary older than the file it is reading cannot know what a newer
+	// schema version dropped or changed meaning under it, so it must refuse
+	// rather than quietly write the file back out having silently discarded
+	// whatever it did not understand.
+	if st.Version > SchemaVersion {
+		return nil, fmt.Errorf("state file at %s is schema version %d, newer than this binary supports (%d); upgrade kairos-lab before using this config directory", s.StatePath, st.Version, SchemaVersion)
 	}
+
+	migrateLegacyVM(&st)
+	st.VMs, st.Quarantined = quarantineInvalidVMs(st.VMs)
+
+	// Re-stamped unconditionally, not only when it was 0: every successful
+	// Load has now brought the in-memory state fully up to the current
+	// schema, whatever version the file on disk carried.
+	st.Version = SchemaVersion
 	st.ManagedDirs = uniqueSorted(append(st.ManagedDirs, s.ConfigDir, s.CacheDir))
 	st.ManagedFiles = uniqueSorted(st.ManagedFiles)
 	return &st, nil
+}
+
+// migrateLegacyVM folds a schema-1 "vm" record into the VMs list, keyed on
+// Name so a file that somehow already carries a VMs entry of the same name
+// is never duplicated -- the existing entry wins, since it is the newer
+// schema's own data. Name falls back to DiskName and then to the base name
+// of DiskPath, for a file recorded before DiskName existed; a record that
+// still has neither is folded in with an empty Name; see runStart (M4) for
+// how the "any VM" refusal that keeps such a record safe. Index is always 0:
+// D7 makes index 0 byte-identical to a pre-multi-VM start, which is exactly
+// what a migrated record describes.
+func migrateLegacyVM(st *State) {
+	if st.Legacy == nil {
+		return
+	}
+	legacy := *st.Legacy
+	st.Legacy = nil
+
+	name := legacy.Name
+	if name == "" {
+		name = legacy.DiskName
+	}
+	if name == "" && legacy.DiskPath != "" {
+		name = filepath.Base(legacy.DiskPath)
+	}
+	legacy.Name = name
+	legacy.Index = 0
+
+	for i := range st.VMs {
+		if st.VMs[i].Name == name {
+			return
+		}
+	}
+	st.VMs = append(st.VMs, legacy)
+}
+
+// quarantineInvalidVMs partitions vms into the records Load can trust and the
+// ones it cannot, per D9: a state.json is a 0644 file anything running as the
+// user can write, so every field a VM record carries is validated on the way
+// in, and a record that fails is set aside rather than allowed to fail the
+// whole file or to reach a caller unchecked. Only Name, Index and
+// NetworkMode are checked here; TapName, TapConnName and the two ports are
+// deliberately not trusted at all -- internal/vm derives them fresh from
+// Index at every point that matters (M2/M3/M4), so a corrupted copy of them
+// in state.json can misinform status but cannot steer a root-run nmcli or ip
+// command anywhere the index-derived name would not already have sent it.
+func quarantineInvalidVMs(vms []VM) (valid []VM, quarantined []QuarantinedVM) {
+	valid = make([]VM, 0, len(vms))
+	for _, v := range vms {
+		if reason := invalidVMReason(v); reason != "" {
+			quarantined = append(quarantined, QuarantinedVM{Name: v.Name, Reason: reason})
+			continue
+		}
+		valid = append(valid, v)
+	}
+	return valid, quarantined
+}
+
+// invalidVMReason returns why v cannot be trusted, or "" when it can.
+//
+// An empty Name is deliberately not one of the reasons: it is what a v1 file
+// with no disk ever started migrates to (see migrateLegacyVM), and it is not
+// adversarial -- nothing about it can steer a destructive command anywhere,
+// since every such command is built from Index, not from Name. D9's
+// whitelist is enforced everywhere a NEW name is chosen -- flag parsing, the
+// interactive prompts -- which is where "no name" is actually a mistake
+// rather than a compatibility fact.
+func invalidVMReason(v VM) string {
+	if v.Name != "" {
+		if err := validDiskNameCharset(v.Name); err != nil {
+			return fmt.Sprintf("name: %v", err)
+		}
+	}
+	if v.Index < 0 || v.Index > maxVMIndex {
+		return fmt.Sprintf("index %d is outside the supported range 0..%d", v.Index, maxVMIndex)
+	}
+	if v.NetworkMode != "" && !validNetworkMode(v.NetworkMode) {
+		return fmt.Sprintf("network mode %q is not one this binary knows", v.NetworkMode)
+	}
+	return ""
+}
+
+// validNetworkMode mirrors internal/app's networkModes ("shared", "bridged",
+// "user"). It is duplicated rather than imported because internal/app
+// already imports internal/state, and importing back would cycle; the three
+// values are part of the user-facing CLI surface and change exactly as often
+// as that flag's help text does.
+func validNetworkMode(mode string) bool {
+	switch mode {
+	case "shared", "bridged", "user":
+		return true
+	default:
+		return false
+	}
+}
+
+// validDiskNameCharset is D9's one whitelist -- [A-Za-z0-9._-], rejecting
+// empty, ".", ".." and a leading '-' -- applied here on load, and by
+// internal/app at flag-parse time and at the interactive prompts, so the
+// write and read sides can never disagree about what name and Save wrote is
+// a name Load's next read will accept. An empty string is rejected here
+// because this function is only ever called with a non-empty v.Name (see
+// invalidVMReason); a genuinely nameless record is a different, permitted
+// case handled there, not here.
+func validDiskNameCharset(name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("name is empty")
+	case name == "." || name == "..":
+		return fmt.Errorf("name %q is not allowed", name)
+	case strings.HasPrefix(name, "-"):
+		return fmt.Errorf("name %q may not begin with '-'", name)
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			continue
+		}
+		return fmt.Errorf("name %q may contain only letters, digits, '.', '_' and '-'", name)
+	}
+	return nil
 }
 
 // Save publishes st at s.StatePath, by writing a complete temporary file
@@ -372,6 +564,112 @@ func RemoveDisk(st *State, name string) {
 		}
 	}
 	st.Disks = out
+}
+
+// FindVM returns the VM record named name, or nil when there is none. Name is
+// D1's identity for a VM.
+func FindVM(st *State, name string) *VM {
+	for i := range st.VMs {
+		if st.VMs[i].Name == name {
+			return &st.VMs[i]
+		}
+	}
+	return nil
+}
+
+// UpsertVM replaces the VM record named v.Name, or appends v when there is no
+// existing record of that name.
+func UpsertVM(st *State, v VM) {
+	for i := range st.VMs {
+		if st.VMs[i].Name == v.Name {
+			st.VMs[i] = v
+			return
+		}
+	}
+	st.VMs = append(st.VMs, v)
+}
+
+// RemoveVM removes the VM record named name, if there is one.
+func RemoveVM(st *State, name string) {
+	out := make([]VM, 0, len(st.VMs))
+	for _, v := range st.VMs {
+		if v.Name != name {
+			out = append(out, v)
+		}
+	}
+	st.VMs = out
+}
+
+// NextFreeVMIndex returns the lowest index in 0..maxVMIndex not held by a
+// live VM, per D6. "Not held by a live VM" and not "not held by any VM": a
+// config dir with two disks started one at a time would otherwise give the
+// second disk a rising index and non-default ports with only one VM ever
+// running, which is the ordinary case reset -disk and -new exist for. live
+// reports whether a given record currently counts as live; this package has
+// no process to signal and no host to probe, so it takes that answer from
+// the caller rather than deciding it -- see D3 and D4 for what "live" means.
+func NextFreeVMIndex(st *State, live func(VM) bool) (int, error) {
+	held := make(map[int]bool, len(st.VMs))
+	count := 0
+	for _, v := range st.VMs {
+		if live(v) {
+			held[v.Index] = true
+			count++
+		}
+	}
+	for i := 0; i <= maxVMIndex; i++ {
+		if !held[i] {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("no free VM index in 0..%d: %d VMs are live", maxVMIndex, count)
+}
+
+// lockAcquireTimeout and lockRetryInterval bound Update's wait for the
+// exclusive flock, per D8: a blocking acquire would let one wedged process
+// make reset and cleanup -- the recovery commands -- unusable, and a
+// re-entrant call (Update invoked again, on the same Store, from inside its
+// own fn, in the goroutine that is still holding the lock) would otherwise
+// hang for the full timeout rather than failing fast. Both are vars, not
+// constants, so a test can shrink them and observe that second behaviour in
+// well under a second instead of thirty.
+var (
+	lockAcquireTimeout = 30 * time.Second
+	lockRetryInterval  = 50 * time.Millisecond
+)
+
+// Update runs fn against freshly loaded state and saves the result back, the
+// load and the save both happening under one exclusive flock on the state
+// directory so two processes -- or two goroutines -- racing a start never
+// interleave their reads and writes. See D8 for the reasoning behind the
+// lock file's open mode, why O_NOFOLLOW, and the limits this does not
+// solve (an NFS mount, a cleanup that unlinks the lock file with
+// os.RemoveAll).
+//
+// fn's error is returned unsaved: a validation failure inside fn must not
+// publish a half-updated state.json. A panic inside fn is not recovered here
+// on purpose -- runStart has no revert of its own after command.Start(), so
+// swallowing a panic into a returned error here would hide exactly the
+// caller that most needs to see one.
+func (s *Store) Update(fn func(*State) error) error {
+	lockPath := filepath.Join(filepath.Dir(s.StatePath), ".state.lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	unlock, err := acquireLock(lockPath, lockAcquireTimeout, lockRetryInterval)
+	if err != nil {
+		return fmt.Errorf("acquire state lock: %w", err)
+	}
+	defer func() { _ = unlock() }()
+
+	st, err := s.Load()
+	if err != nil {
+		return err
+	}
+	if err := fn(st); err != nil {
+		return err
+	}
+	return s.Save(st)
 }
 
 func IsSetupComplete(st *State) bool {

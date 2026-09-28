@@ -69,7 +69,7 @@ func TestSaveLoadRoundTripKeepsMACAndIP(t *testing.T) {
 		Size:      "60G",
 		MAC:       "52:54:00:ab:cd:ef",
 	})
-	st.VM.IPAddress = "192.168.64.7"
+	UpsertVM(st, VM{Name: "kairos-core-20250101-120000", IPAddress: "192.168.64.7"})
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -84,8 +84,12 @@ func TestSaveLoadRoundTripKeepsMACAndIP(t *testing.T) {
 	if disk.MAC != "52:54:00:ab:cd:ef" {
 		t.Errorf("disk MAC = %q, want 52:54:00:ab:cd:ef", disk.MAC)
 	}
-	if loaded.VM.IPAddress != "192.168.64.7" {
-		t.Errorf("vm IP address = %q, want 192.168.64.7", loaded.VM.IPAddress)
+	loadedVM := FindVM(loaded, "kairos-core-20250101-120000")
+	if loadedVM == nil {
+		t.Fatal("vm missing after reload")
+	}
+	if loadedVM.IPAddress != "192.168.64.7" {
+		t.Errorf("vm IP address = %q, want 192.168.64.7", loadedVM.IPAddress)
 	}
 }
 
@@ -118,8 +122,8 @@ func TestLoadStateWrittenBeforeMACField(t *testing.T) {
 	if disk.MAC != "" {
 		t.Errorf("disk MAC = %q, want empty for a pre-MAC state file", disk.MAC)
 	}
-	if st.VM.IPAddress != "" {
-		t.Errorf("vm IP address = %q, want empty for a pre-MAC state file", st.VM.IPAddress)
+	if len(st.VMs) != 0 {
+		t.Errorf("vms = %#v, want none: this file carries no \"vm\" key to migrate", st.VMs)
 	}
 }
 
@@ -158,7 +162,7 @@ func TestStateJSONKeysForMACAndIP(t *testing.T) {
 	}
 
 	st.Disks[0].MAC = "52:54:00:ab:cd:ef"
-	st.VM.IPAddress = "192.168.64.7"
+	UpsertVM(st, VM{Name: "kairos-core-20250101-120000", IPAddress: "192.168.64.7"})
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +234,7 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 	}
 	st := NewState(store)
 	st.Platform.OS = "linux"
-	st.VM.IPAddress = "192.168.64.7"
+	UpsertVM(st, VM{Name: "test-vm", IPAddress: "192.168.64.7"})
 	if err := store.Save(st); err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +245,7 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 
 	sealDir(t, filepath.Dir(store.StatePath))
 	st.Platform.OS = "darwin"
-	st.VM.IPAddress = "10.0.0.1"
+	UpsertVM(st, VM{Name: "test-vm", IPAddress: "10.0.0.1"})
 	if err := store.Save(st); err == nil {
 		t.Fatal("saving into a directory that cannot be written should fail")
 	}
@@ -257,8 +261,12 @@ func TestSaveFailureLeavesPreviousStateIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the previous state file should still parse: %v", err)
 	}
-	if loaded.Platform.OS != "linux" || loaded.VM.IPAddress != "192.168.64.7" {
-		t.Errorf("previous state changed: os = %q, ip = %q", loaded.Platform.OS, loaded.VM.IPAddress)
+	loadedVM := FindVM(loaded, "test-vm")
+	if loadedVM == nil {
+		t.Fatal("vm missing after reload")
+	}
+	if loaded.Platform.OS != "linux" || loadedVM.IPAddress != "192.168.64.7" {
+		t.Errorf("previous state changed: os = %q, ip = %q", loaded.Platform.OS, loadedVM.IPAddress)
 	}
 }
 
@@ -406,7 +414,7 @@ func TestSavePreservesExistingStateFileMode(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			st.VM.IPAddress = "192.168.64.7"
+			UpsertVM(st, VM{Name: "test-vm", IPAddress: "192.168.64.7"})
 			if err := store.Save(st); err != nil {
 				t.Fatal(err)
 			}
@@ -421,8 +429,9 @@ func TestSavePreservesExistingStateFileMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if loaded.VM.IPAddress != "192.168.64.7" {
-				t.Errorf("vm IP address = %q, want 192.168.64.7", loaded.VM.IPAddress)
+			loadedVM := FindVM(loaded, "test-vm")
+			if loadedVM == nil || loadedVM.IPAddress != "192.168.64.7" {
+				t.Errorf("vm IP address after reload = %+v, want 192.168.64.7", loadedVM)
 			}
 		})
 	}
@@ -458,7 +467,7 @@ func TestConcurrentSaveAndLoad(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < saves; i++ {
 			st := NewState(store)
-			st.VM.LastError = strings.Repeat("x", i*8)
+			UpsertVM(st, VM{Name: "test-vm", LastError: strings.Repeat("x", i*8)})
 			if err := store.Save(st); err != nil {
 				saveErrs <- err
 				return
