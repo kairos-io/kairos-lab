@@ -38,6 +38,27 @@ brew tap kairos-io/kairos
 brew install kairos-lab
 ```
 
+### Linux
+
+```bash
+curl -sSL https://raw.githubusercontent.com/kairos-io/kairos-lab/main/install.sh | sh
+```
+
+Detects your architecture (amd64/arm64), downloads the matching release from
+the [releases page](https://github.com/kairos-io/kairos-lab/releases),
+verifies it against the release's `checksums.txt`, and installs the
+`kairos-lab` binary onto `PATH` (`/usr/local/bin` if writable or via `sudo`
+with your confirmation, otherwise `~/.local/bin`). It prints the version,
+download URL, and install path, and asks for confirmation before making any
+change; answering anything other than yes leaves your system untouched. See
+[`install.sh`](install.sh) for what it does, or download it first and read it
+before running:
+
+```bash
+curl -sSL -o install.sh https://raw.githubusercontent.com/kairos-io/kairos-lab/main/install.sh
+sh install.sh
+```
+
 ### Download Binary
 
 Pre-built binaries are available on the [releases page](https://github.com/kairos-io/kairos-lab/releases).
