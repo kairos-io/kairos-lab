@@ -87,7 +87,7 @@ func TestMigrateLegacyVMFallsBackToDiskPathBasename(t *testing.T) {
 // entirely zero, because no VM had ever been started. It must still migrate
 // without error, arriving with an empty Name (no disk_name, no disk_path to
 // fall back to): that unnamed record is what keeps today's "any VM" refusal
-// working for a config dir this old, per D9/M1.
+// working for a config dir this old.
 func TestMigrateLegacyVMNeverStarted(t *testing.T) {
 	store := newTestStore(t)
 	legacy := `{"version":1,"vm":{}}`
@@ -260,7 +260,8 @@ func TestQuarantinedRecordLeavesStatusWorking(t *testing.T) {
 }
 
 // TestQuarantinedRecordRejectsBadNetworkMode covers the other validated
-// field named in D9/M1: a network mode this binary does not recognise.
+// field, invalidVMReason's NetworkMode check: a network mode this binary
+// does not recognise.
 func TestQuarantinedRecordRejectsBadNetworkMode(t *testing.T) {
 	store := newTestStore(t)
 	writeRawState(t, store, `{"version":2,"vms":[{"name":"weird","network_mode":"carrier-pigeon"}]}`)
@@ -297,11 +298,12 @@ func TestQuarantineToleratesEmptyName(t *testing.T) {
 	}
 }
 
-// TestUpdateSerialisesConcurrentGoroutines is M1's seam-gate test for D8: two
-// goroutines both calling Update on the same Store must never lose a write,
-// which is only a real test when each Update opens a fresh file descriptor
-// -- two descriptors from one open() call in one process would share an open
-// file description and never contend at all. Run under -race.
+// TestUpdateSerialisesConcurrentGoroutines is the seam-gate test for
+// Update's locking: two goroutines both calling Update on the same Store
+// must never lose a write, which is only a real test when each Update opens
+// a fresh file descriptor -- two descriptors from one open() call in one
+// process would share an open file description and never contend at all.
+// Run under -race.
 func TestUpdateSerialisesConcurrentGoroutines(t *testing.T) {
 	store := newTestStore(t)
 	if err := store.Save(NewState(store)); err != nil {
@@ -396,7 +398,7 @@ func TestUpdateReentrantCallReturnsAnError(t *testing.T) {
 
 // TestSaveUsesTheStatePathDirectoryForItsLockFile pins that Update's lock
 // file, like Save's temporary file, lives beside StatePath and not inside
-// ConfigDir when the two differ -- D8 keys the lock off
+// ConfigDir when the two differ -- Update keys the lock off
 // filepath.Dir(s.StatePath), not ConfigDir, since nothing makes the two
 // agree.
 func TestUpdateLockFileLivesBesideStatePath(t *testing.T) {

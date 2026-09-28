@@ -63,11 +63,11 @@ type Disk struct {
 	MAC string `json:"mac,omitempty"`
 }
 
-// VM is one VM's record. D1 identifies a VM by its disk name, so Name is the
-// key every accessor below keys on; Index is the per-config-dir slot D6/D7
-// allocate it, and everything below TapName is additive for multi-VM support
-// (see the state package doc comment above Load for the migration that fills
-// these in for a pre-multi-VM file).
+// VM is one VM's record, identified by its disk name -- Name is the key
+// every accessor below keys on; Index is the per-config-dir slot
+// NextFreeVMIndex allocates it, and everything below TapName is additive for
+// multi-VM support (see the state package doc comment above Load for the
+// migration that fills these in for a pre-multi-VM file).
 type VM struct {
 	Name        string   `json:"name,omitempty"`
 	Index       int      `json:"index,omitempty"`
@@ -86,16 +86,16 @@ type VM struct {
 	RuntimeDir  string   `json:"runtime_dir,omitempty"`
 	QGASockPath string   `json:"qga_socket_path,omitempty"`
 	IPAddress   string   `json:"ip_address,omitempty"`
-	// TapName and TapConnName are the per-VM network identity D2/D7 give this
-	// record. internal/vm derives both from Index rather than trusting these
-	// once a VM starts; they are carried here so status has something to show
-	// without recomputing the formula itself.
+	// TapName and TapConnName are this VM's per-VM network identity, derived
+	// from Index. internal/vm derives both from Index rather than trusting
+	// these once a VM starts; they are carried here so status has something to
+	// show without recomputing the formula itself.
 	TapName     string `json:"tap_name,omitempty"`
 	TapConnName string `json:"tap_conn_name,omitempty"`
 	NetworkMode string `json:"network_mode,omitempty"`
 	SSHPort     int    `json:"ssh_port,omitempty"`
 	HTTPPort    int    `json:"http_port,omitempty"`
-	// StarterPID and StartingAt are D4's reservation half: written before
+	// StarterPID and StartingAt record this VM's reservation, written before
 	// command.Start() so a second start racing the first sees this record as
 	// live even before QEMU's own PID exists to check.
 	StarterPID int    `json:"starter_pid,omitempty"`
@@ -221,8 +221,8 @@ func (s *Store) Load() (*State, error) {
 // of DiskPath, for a file recorded before DiskName existed; a record that
 // still has neither is folded in with an empty Name; see runStart (M4) for
 // how the "any VM" refusal that keeps such a record safe. Index is always 0:
-// D7 makes index 0 byte-identical to a pre-multi-VM start, which is exactly
-// what a migrated record describes.
+// index 0 is defined to be byte-identical to a pre-multi-VM start, which is
+// exactly what a migrated record describes.
 func migrateLegacyVM(st *State) {
 	if st.Legacy == nil {
 		return
@@ -249,15 +249,15 @@ func migrateLegacyVM(st *State) {
 }
 
 // quarantineInvalidVMs partitions vms into the records Load can trust and the
-// ones it cannot, per D9: a state.json is a 0644 file anything running as the
-// user can write, so every field a VM record carries is validated on the way
-// in, and a record that fails is set aside rather than allowed to fail the
-// whole file or to reach a caller unchecked. Only Name, Index and
-// NetworkMode are checked here; TapName, TapConnName and the two ports are
-// deliberately not trusted at all -- internal/vm derives them fresh from
-// Index at every point that matters (M2/M3/M4), so a corrupted copy of them
-// in state.json can misinform status but cannot steer a root-run nmcli or ip
-// command anywhere the index-derived name would not already have sent it.
+// ones it cannot. state.json is a 0644 file anything running as the user can
+// write, so every field a VM record carries is validated on the way in, and a
+// record that fails is set aside rather than allowed to fail the whole file
+// or to reach a caller unchecked. Only Name, Index and NetworkMode are
+// checked here; TapName, TapConnName and the two ports are deliberately not
+// trusted at all -- internal/vm derives them fresh from Index at every point
+// that matters, so a corrupted copy of them in state.json can misinform
+// status but cannot steer a root-run nmcli or ip command anywhere the
+// index-derived name would not already have sent it.
 func quarantineInvalidVMs(vms []VM) (valid []VM, quarantined []QuarantinedVM) {
 	valid = make([]VM, 0, len(vms))
 	for _, v := range vms {
@@ -275,10 +275,10 @@ func quarantineInvalidVMs(vms []VM) (valid []VM, quarantined []QuarantinedVM) {
 // An empty Name is deliberately not one of the reasons: it is what a v1 file
 // with no disk ever started migrates to (see migrateLegacyVM), and it is not
 // adversarial -- nothing about it can steer a destructive command anywhere,
-// since every such command is built from Index, not from Name. D9's
-// whitelist is enforced everywhere a NEW name is chosen -- flag parsing, the
-// interactive prompts -- which is where "no name" is actually a mistake
-// rather than a compatibility fact.
+// since every such command is built from Index, not from Name. The name
+// whitelist (validDiskNameCharset) is enforced everywhere a NEW name is
+// chosen -- flag parsing, the interactive prompts -- which is where "no name"
+// is actually a mistake rather than a compatibility fact.
 func invalidVMReason(v VM) string {
 	if v.Name != "" {
 		if err := validDiskNameCharset(v.Name); err != nil {
@@ -308,12 +308,12 @@ func validNetworkMode(mode string) bool {
 	}
 }
 
-// validDiskNameCharset is D9's one whitelist -- [A-Za-z0-9._-], rejecting
-// empty, ".", ".." and a leading '-' -- applied here on load, and by
-// internal/app at flag-parse time and at the interactive prompts, so the
-// write and read sides can never disagree about what name and Save wrote is
-// a name Load's next read will accept. An empty string is rejected here
-// because this function is only ever called with a non-empty v.Name (see
+// validDiskNameCharset is the one whitelist for a VM name -- [A-Za-z0-9._-],
+// rejecting empty, ".", ".." and a leading '-' -- applied here on load, and
+// by internal/app at flag-parse time and at the interactive prompts, so the
+// write and read sides can never disagree: a name Save wrote is always a name
+// Load's next read will accept. An empty string is rejected here because this
+// function is only ever called with a non-empty v.Name (see
 // invalidVMReason); a genuinely nameless record is a different, permitted
 // case handled there, not here.
 func validDiskNameCharset(name string) error {
@@ -566,8 +566,7 @@ func RemoveDisk(st *State, name string) {
 	st.Disks = out
 }
 
-// FindVM returns the VM record named name, or nil when there is none. Name is
-// D1's identity for a VM.
+// FindVM returns the VM record named name, or nil when there is none.
 func FindVM(st *State, name string) *VM {
 	for i := range st.VMs {
 		if st.VMs[i].Name == name {
@@ -601,13 +600,14 @@ func RemoveVM(st *State, name string) {
 }
 
 // NextFreeVMIndex returns the lowest index in 0..MaxVMIndex not held by a
-// live VM, per D6. "Not held by a live VM" and not "not held by any VM": a
-// config dir with two disks started one at a time would otherwise give the
-// second disk a rising index and non-default ports with only one VM ever
-// running, which is the ordinary case reset -disk and -new exist for. live
-// reports whether a given record currently counts as live; this package has
-// no process to signal and no host to probe, so it takes that answer from
-// the caller rather than deciding it -- see D3 and D4 for what "live" means.
+// live VM. "Not held by a live VM" and not "not held by any VM": a config dir
+// with two disks started one at a time would otherwise give the second disk a
+// rising index and non-default ports with only one VM ever running, which is
+// the ordinary case reset -disk and -new exist for. live reports whether a
+// given record currently counts as live; this package has no process to
+// signal and no host to probe, so it takes that answer from the caller rather
+// than deciding it itself -- the caller (internal/vm.VMIsLive) is the one
+// that knows how to check a PID or a reservation for liveness.
 func NextFreeVMIndex(st *State, live func(VM) bool) (int, error) {
 	held := make(map[int]bool, len(st.VMs))
 	count := 0
@@ -626,13 +626,13 @@ func NextFreeVMIndex(st *State, live func(VM) bool) (int, error) {
 }
 
 // lockAcquireTimeout and lockRetryInterval bound Update's wait for the
-// exclusive flock, per D8: a blocking acquire would let one wedged process
-// make reset and cleanup -- the recovery commands -- unusable, and a
-// re-entrant call (Update invoked again, on the same Store, from inside its
-// own fn, in the goroutine that is still holding the lock) would otherwise
-// hang for the full timeout rather than failing fast. Both are vars, not
-// constants, so a test can shrink them and observe that second behaviour in
-// well under a second instead of thirty.
+// exclusive flock: a blocking acquire would let one wedged process make reset
+// and cleanup -- the recovery commands -- unusable, and a re-entrant call
+// (Update invoked again, on the same Store, from inside its own fn, in the
+// goroutine that is still holding the lock) would otherwise hang for the full
+// timeout rather than failing fast. Both are vars, not constants, so a test
+// can shrink them and observe that second behaviour in well under a second
+// instead of thirty.
 var (
 	lockAcquireTimeout = 30 * time.Second
 	lockRetryInterval  = 50 * time.Millisecond
@@ -641,10 +641,11 @@ var (
 // Update runs fn against freshly loaded state and saves the result back, the
 // load and the save both happening under one exclusive flock on the state
 // directory so two processes -- or two goroutines -- racing a start never
-// interleave their reads and writes. See D8 for the reasoning behind the
-// lock file's open mode, why O_NOFOLLOW, and the limits this does not
-// solve (an NFS mount, a cleanup that unlinks the lock file with
-// os.RemoveAll).
+// interleave their reads and writes. See acquireLock for the reasoning behind
+// the lock file's open mode and why O_NOFOLLOW. Two limits this does not
+// solve: an NFS mount, where flock is not reliably cross-host, and a cleanup
+// that unlinks the lock file with os.RemoveAll, after which a fresh open and
+// flock succeeds and any earlier holder's exclusion is silently lost.
 //
 // fn's error is returned unsaved: a validation failure inside fn must not
 // publish a half-updated state.json. A panic inside fn is not recovered here

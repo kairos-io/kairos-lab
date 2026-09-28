@@ -1,8 +1,9 @@
 // Tests for the multi-VM fixes in network_linux.go: hazard (A) (the
 // stale-cleanup branch tearing down a live sibling's bridge), hazard (B) (a
-// shared tap connection name re-pointing a sibling's live tap), and D5's
-// bridge-port exemption. Same fakeHost harness as network_linux_test.go, no
-// build tag, for the reasons given at the top of that file.
+// shared tap connection name re-pointing a sibling's live tap), and
+// bridgePortExempt's bridge-port exemption. Same fakeHost harness as
+// network_linux_test.go, no build tag, for the reasons given at the top of
+// that file.
 package vm
 
 import (
@@ -115,11 +116,11 @@ func TestPrepareLinuxSharedDoesNotRepointASiblingsTapConnection(t *testing.T) {
 	}
 }
 
-// TestIsRunningTreatsEPERMAsRunning is D3's fix for vm.IsRunning: a process
-// this test cannot signal (PID 1, owned by root, on any host this test runs
-// as non-root) must read as running, not as absent. On a host where this
-// test itself runs as root, EPERM cannot be produced against PID 1 and the
-// case is skipped rather than asserted falsely.
+// TestIsRunningTreatsEPERMAsRunning pins vm.IsRunning's EPERM handling: a
+// process this test cannot signal (PID 1, owned by root, on any host this
+// test runs as non-root) must read as running, not as absent. On a host
+// where this test itself runs as root, EPERM cannot be produced against PID
+// 1 and the case is skipped rather than asserted falsely.
 func TestIsRunningTreatsEPERMAsRunning(t *testing.T) {
 	running, err := IsRunning(1)
 	if err != nil {
@@ -146,8 +147,8 @@ func TestIsRunningReturnsFalseForAPIDThatDoesNotExist(t *testing.T) {
 	}
 }
 
-// TestBridgePortExemption is D5's table, pinning each of the three
-// conditions separately so none of them is unobservable.
+// TestBridgePortExemption is bridgePortExempt's table, pinning each of the
+// three conditions separately so none of them is unobservable.
 func TestBridgePortExemption(t *testing.T) {
 	tests := []struct {
 		name         string

@@ -21,10 +21,10 @@ const (
 
 // resolveLinuxBridgeName resolves and validates the host-level bridge name --
 // st.Network.BridgeName, or DefaultBridgeName when unset. Unlike the tap, the
-// bridge is not per-VM (D2: one bridge, many taps), so it is resolved once,
-// before either PrepareLinuxBridge or PrepareLinuxShared can compute this
-// VM's own tap connection name (TapConnNameForIndex takes the bridge as an
-// argument).
+// bridge is not per-VM -- every VM in this config dir shares one bridge and
+// gets its own tap on it -- so it is resolved once, before either
+// PrepareLinuxBridge or PrepareLinuxShared can compute this VM's own tap
+// connection name (TapConnNameForIndex takes the bridge as an argument).
 func resolveLinuxBridgeName(st *state.State) (string, error) {
 	bridge := st.Network.BridgeName
 	if bridge == "" {
@@ -48,12 +48,13 @@ func resolveLinuxBridgeName(st *state.State) (string, error) {
 // network mode ("bridged", "shared"); it appears in the NetworkManager error
 // so the message names the mode the caller actually asked for.
 //
-// siblingLive is D3's fix for hazard (A): when true, a live sibling already
-// holds this bridge and the stale-cleanup branch below is skipped entirely,
-// so this start joins the bridge instead of tearing down what the sibling is
-// using. When false -- no other VM in this config dir is live -- today's
-// teardown runs unchanged, so a single-VM host still recovers from a
-// genuinely stale bridge exactly as before this change.
+// siblingLive guards against a second VM's start tearing down a live
+// sibling's bridge: when true, a live sibling already holds this bridge and
+// the stale-cleanup branch below is skipped entirely, so this start joins the
+// bridge instead of tearing down what the sibling is using. When false -- no
+// other VM in this config dir is live -- today's teardown runs unchanged, so
+// a single-VM host still recovers from a genuinely stale bridge exactly as
+// before this change.
 func linuxNetworkPreflight(st *state.State, runtimeDir, mode, bridge, tapDevice, tapConn string, siblingLive bool) error {
 	if !networkManagerActive() {
 		return fmt.Errorf("NetworkManager is required for %s networking on Linux. Please install and enable NetworkManager, or use --network user for port-forwarded access", mode)
@@ -164,10 +165,9 @@ func hasStaleBridgeResources(bridge, tapConn string) bool {
 }
 
 // PrepareLinuxBridge prepares the host side of --network bridged for one VM,
-// identified by index (D6/D7). siblingLive is D3's fix for hazard (A): true
-// when another VM in this config dir is currently live, which skips the
-// stale-cleanup branch that would otherwise tear down a bridge a sibling is
-// using.
+// identified by index. siblingLive is true when another VM in this config
+// dir is currently live, which skips the stale-cleanup branch that would
+// otherwise tear down a bridge a sibling is using.
 func PrepareLinuxBridge(st *state.State, runtimeDir string, index int, siblingLive bool) error {
 	if runtime.GOOS != "linux" {
 		return nil
@@ -578,16 +578,15 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 			"Or use -network bridged, which attaches an interface to a bridge on purpose, or -network user, which builds no bridge at all",
 			bridge, bridge, err, bridge, bridge, revertSharedSetup(bridgeConn, tapConn, siblingLive))
 	}
-	// D5: a port is expected -- and therefore never refused -- when it is
-	// this VM's own tap (once attached) or when it satisfies
-	// bridgePortExempt's three-part test: a generated tap name, a tun/tap
-	// device (condition 2, which is what keeps a renamed physical NIC from
-	// ever qualifying), owned by the uid this start itself would create a
-	// tap as. That is the bounded weakening D5 accepts in exchange for
-	// letting a second VM join a bridge a live sibling already has a tap on
-	// -- a leftover from a crashed run used to be refused by the old,
-	// stricter "the list must be empty" rule; it is accepted now, and
-	// condition 2 is what still keeps a real host NIC out.
+	// A port is expected -- and therefore never refused -- when it is this
+	// VM's own tap (once attached) or when it satisfies bridgePortExempt's
+	// three-part test: a generated tap name, a tun/tap device (condition 2,
+	// which is what keeps a renamed physical NIC from ever qualifying), owned
+	// by the uid this start itself would create a tap as. That is a bounded
+	// weakening, accepted in exchange for letting a second VM join a bridge a
+	// live sibling already has a tap on -- a leftover from a crashed run used
+	// to be refused by the old, stricter "the list must be empty" rule; it is
+	// accepted now, and condition 2 is what still keeps a real host NIC out.
 	var unexpected []string
 	for _, port := range parseBridgePorts(out) {
 		if tapIsAttached && port == tap {
@@ -621,7 +620,7 @@ func refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap string, tapIsAttac
 		bridge, bridge, quoteNames(unexpected), expectation, bridge, bridge, revertSharedSetup(bridgeConn, tapConn, siblingLive))
 }
 
-// bridgePortExempt is D5's three-part test: a port already on the bridge is
+// bridgePortExempt is a three-part test: a port already on the bridge is
 // exempt from refusal only when all three hold --
 //
 //  1. the name parses as one this tool would itself generate for some VM
@@ -653,10 +652,10 @@ func bridgePortExempt(name string) bool {
 }
 
 // tapSysfsTunFlagsReadable and tapSysfsOwnerUID are swappable seams over the
-// two /sys reads D5 conditions 2 and 3 need, for the same reason
-// statNetDevice is one: a test drives them without a real tap device on the
-// host running it. Nothing in production assigns them; tests restore the
-// originals with t.Cleanup.
+// two /sys reads bridgePortExempt's tun/tap and ownership checks need, for
+// the same reason statNetDevice is one: a test drives them without a real tap
+// device on the host running it. Nothing in production assigns them; tests
+// restore the originals with t.Cleanup.
 var tapSysfsTunFlagsReadable = func(name string) bool {
 	_, err := os.Stat(filepath.Join(sysClassNet, name, "tun_flags"))
 	return err == nil
@@ -786,8 +785,8 @@ func revertSharedSetup(bridgeConn, tapConn string, siblingLive bool) string {
 }
 
 // CleanupLinuxBridge tears down one VM's (v's) network resources. siblingLive
-// (M3) is D4's liveness predicate applied to every OTHER VM in this config
-// dir: when true, only v's own tap connection and tap device are removed --
+// reports whether any OTHER VM in this config dir is live (VMIsLive applied
+// to each): when true, only v's own tap connection and tap device are removed --
 // never the bridge connection, never the bridge link -- and st.Network is
 // left intact, since CreatedByKairosLab must survive for whichever VM
 // eventually does remove the bridge. st.Network is cleared only when the

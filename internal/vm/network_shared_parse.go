@@ -12,10 +12,11 @@ import (
 	"github.com/kairos-io/kairos-lab/internal/state"
 )
 
-// TapNameForIndex returns the tap DEVICE name for a per-config-dir VM index,
-// per D7: index 0 is byte-identical to a pre-multi-VM host --
-// DefaultTapName, "kairoslab-tap0" -- and index N>=1 is "kairoslab-tapN".
-// This is a kernel interface name, so it goes through
+// TapNameForIndex returns the tap DEVICE name for a per-config-dir VM index.
+// Index 0 is byte-identical to a pre-multi-VM host -- DefaultTapName,
+// "kairoslab-tap0" -- and index N>=1 is "kairoslab-tapN", which keeps a host
+// upgrading from single-VM kairos-lab from ending up with two different names
+// both claiming the same device. This is a kernel interface name, so it goes through
 // validateStoredInterfaceName's 15-byte IFNAMSIZ limit wherever it reaches a
 // root-run command, which is where state.MaxVMIndex's 99 comes from:
 // "kairoslab-tap100" is 16 bytes.
@@ -27,7 +28,7 @@ func TapNameForIndex(index int) string {
 }
 
 // TapConnNameForIndex returns the tap NetworkManager connection name for
-// bridge at index, per D7: index 0 is "<bridge>-tap", byte-identical to a
+// bridge at index. Index 0 is "<bridge>-tap", byte-identical to a
 // pre-multi-VM host, and index N>=1 is "<bridge>-tapN".
 //
 // Unlike the device name this carries no IFNAMSIZ limit -- a NetworkManager
@@ -41,8 +42,11 @@ func TapConnNameForIndex(bridge string, index int) string {
 	return fmt.Sprintf("%s-tap%d", bridge, index)
 }
 
-// IsGeneratedTapName is D5 condition 1: does name parse as a tap device this
-// tool would itself generate for some index in 0..state.MaxVMIndex?
+// IsGeneratedTapName reports whether name parses as a tap device this tool
+// would itself generate for some index in 0..state.MaxVMIndex. It is the
+// first of bridgePortExempt's checks (network_linux.go): a port only ever
+// gets exempted from the "no foreign device on this bridge" refusal once it
+// is known to be a name this tool itself could have produced.
 //
 // It is a parse and not a regexp, so it accepts only what TapNameForIndex
 // itself would produce: no leading zero ("kairoslab-tap007" is rejected even
@@ -208,11 +212,11 @@ func validateStoredInterfaceName(field, name string) error {
 // created cannot make the old tap look like a physical slave; for the default
 // configuration the two are the same string and the behaviour is unchanged.
 //
-// Every OTHER generated tap name (M3) is skipped too, through
-// IsGeneratedTapName -- the same predicate D5's bridge-port exemption uses,
-// so the two cannot drift apart. With more than one VM sharing this bridge,
-// a sibling's tap is a legitimate port and must never be mistaken for a
-// physical uplink the way a foreign NIC would be.
+// Every OTHER generated tap name is skipped too, through IsGeneratedTapName
+// -- the same predicate bridgePortExempt (network_linux.go) uses for its own
+// exemption test, so the two cannot drift apart. With more than one VM
+// sharing this bridge, a sibling's tap is a legitimate port and must never be
+// mistaken for a physical uplink the way a foreign NIC would be.
 //
 // This is a teardown's question and not the shared path's assertion, which is
 // why parseBridgePorts below exists beside it rather than being built out of

@@ -45,17 +45,16 @@ type StartConfig struct {
 	BiosPath string
 	Detached bool
 	// SSHPort and HTTPPort are the host-side forwards user-mode networking
-	// publishes, per D7: 2222/8080 at index 0 (today's fixed defaults,
-	// unchanged) and 2222+index/8080+index above it. Zero means "use the
-	// index-0 default", so a StartConfig built before these fields existed
-	// keeps behaving exactly as it did.
+	// publishes: 2222/8080 at index 0 (today's fixed defaults, unchanged) and
+	// 2222+index/8080+index above it. Zero means "use the index-0 default", so
+	// a StartConfig built before these fields existed keeps behaving exactly
+	// as it did.
 	SSHPort  int
 	HTTPPort int
-	// UserModeHostBind is the address user-mode's forwarded ports bind, per
-	// D11: "" (INADDR_ANY, today's behaviour, unchanged) at index 0, because
-	// AC 5 forbids changing what index 0 already exposes, and "127.0.0.1"
-	// at every index above it, which is new surface with no compatibility
-	// constraint to keep.
+	// UserModeHostBind is the address user-mode's forwarded ports bind: ""
+	// (INADDR_ANY, today's behaviour, unchanged) at index 0, since index 0
+	// must not change what it already exposes, and "127.0.0.1" at every index
+	// above it, which is new surface with no compatibility constraint to keep.
 	UserModeHostBind string
 }
 
@@ -79,9 +78,9 @@ type StartConfig struct {
 //
 // The address is emitted in CanonicalMAC's zero-padded form, which is what
 // QEMU's parser wants -- never NormalizeMAC's zero-stripped comparison form.
-// userModeNetdevArg builds the -netdev value for user-mode networking, per
-// D7/D11: SSHPort/HTTPPort default to 2222/8080 when unset (a StartConfig
-// built before these fields existed keeps today's exact command line), and
+// userModeNetdevArg builds the -netdev value for user-mode networking.
+// SSHPort/HTTPPort default to 2222/8080 when unset (a StartConfig built
+// before these fields existed keeps today's exact command line), and
 // UserModeHostBind prefixes both forwards -- "" reproduces today's
 // INADDR_ANY bind at index 0, and "127.0.0.1" is what internal/app sets for
 // every index above it.
@@ -196,9 +195,9 @@ func Stop(pid int, timeout time.Duration) error {
 	return nil
 }
 
-// IsRunning reports whether pid names a live process, per D3.
+// IsRunning reports whether pid names a live process.
 //
-// The three-way split on the signal-0 probe is the fix: EPERM means the
+// The three-way split on the signal-0 probe is deliberate: EPERM means the
 // process exists and we merely may not signal it -- a root-recorded VM
 // probed by a later unprivileged start, which KAIROS_LAB_CONFIG_DIR and the
 // blessed root-writes-user's-state.json case make ordinary -- and that reads
@@ -207,8 +206,8 @@ func Stop(pid int, timeout time.Duration) error {
 // bad pid but is kept here for the platforms where it can) is returned to
 // the caller rather than swallowed into false: on unix, os.FindProcess
 // always succeeds and does no probing of its own, so every real answer comes
-// from the Signal call below, and "cannot tell" must not read the same as
-// "not running" -- see D3 for why the two are not symmetric.
+// from the Signal call below, and "cannot tell" must not be collapsed into
+// "not running" -- the two carry very different risk if acted on wrongly.
 func IsRunning(pid int) (bool, error) {
 	if pid <= 0 {
 		return false, nil
@@ -229,14 +228,15 @@ func IsRunning(pid int) (bool, error) {
 	}
 }
 
-// VMIsLive is D4's two-part liveness predicate: a VM counts as live when its
-// QEMU PID is running, or when it has no such PID yet but was reserved by a
-// starter process (StarterPID, written before command.Start() so the
-// allocator and the sibling-aware preflight both see the reservation for the
-// whole window that contains this VM's own privileged prepare) that is
-// itself still running.
+// VMIsLive reports whether a VM counts as live: its QEMU PID is running, or
+// it has no such PID yet but was reserved by a starter process (StarterPID,
+// written before command.Start() so the allocator and the sibling-aware
+// preflight both see the reservation for the whole window that contains this
+// VM's own privileged prepare) that is itself still running. A reservation
+// with PID 0 has to count as live too, or two concurrent starts would both
+// pick the same index before either QEMU process exists to check.
 //
-// Per D3, an IsRunning that cannot tell resolves to live here: skipping a
+// An IsRunning that cannot tell resolves to live here: skipping a
 // stale-cleanup step wrongly leaves a stale bridge for reset to clear, and
 // tearing one down wrongly kills a running VM, and those costs are not
 // symmetric. So both checks below treat an IsRunning error as "live" rather

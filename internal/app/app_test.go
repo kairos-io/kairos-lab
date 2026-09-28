@@ -369,10 +369,10 @@ func TestCleanupReportsAFailedNetworkCleanup(t *testing.T) {
 func withEveryFieldPoisoned(st *state.State) {
 	withNetworkNames(injectedBridgeName, injectedTapName)(st)
 	// The VM's own Name is deliberately NOT injectedDiskName here: Name goes
-	// through D9's whitelist on every Load (unlike DiskName, LogPath and the
-	// rest, which are carried through unchecked), so a malformed Name would
-	// be quarantined -- silently dropping the very record this test needs
-	// reset and cleanup to see and print.
+	// through validDiskNameCharset's whitelist on every Load (unlike
+	// DiskName, LogPath and the rest, which are carried through unchecked),
+	// so a malformed Name would be quarantined -- silently dropping the very
+	// record this test needs reset and cleanup to see and print.
 	state.UpsertVM(st, state.VM{
 		Name:        testVMName,
 		DiskName:    injectedDiskName,
@@ -4152,7 +4152,7 @@ func TestStatusIsInertForEveryStoredValueItPrints(t *testing.T) {
 // The same payload in the one field that decides which rows are printed at
 // all. A mode no version of this CLI accepts prints no bridge rows, so what
 // is asserted here is the row that is always printed.
-// A VM's own network mode is validated at Load now (D9/M1), which is a
+// A VM's own network mode is validated at Load now (M1), which is a
 // stronger defence than the escaping this test used to require: an invalid
 // mode is quarantined before status has any row left to print it in, rather
 // than reaching one that has to escape it.
@@ -4637,7 +4637,7 @@ func TestStartAllocatesTheNextFreeIndexForASecondLiveVM(t *testing.T) {
 	}
 
 	// vm-a's own record carries no PID (the launch never got that far), so
-	// D4's liveness predicate needs its StarterPID to still be a running
+	// VMIsLive's reservation half needs its StarterPID to still be a running
 	// process for vm-b's start to see it as a live sibling and allocate
 	// index 1 rather than reusing index 0. This process's own PID is
 	// guaranteed to still be running.
@@ -4681,14 +4681,14 @@ func TestStartAllocatesTheNextFreeIndexForASecondLiveVM(t *testing.T) {
 		t.Errorf("both VMs share a log path %q", a.LogPath)
 	}
 	if !strings.HasSuffix(a.QGASockPath, "qemu.sock") {
-		t.Errorf("vm-a (index 0) QGA socket = %q, want it to end in the byte-identical index-0 name qemu.sock (D7)", a.QGASockPath)
+		t.Errorf("vm-a (index 0) QGA socket = %q, want it to end in the byte-identical index-0 name qemu.sock", a.QGASockPath)
 	}
 	if !strings.HasSuffix(b.QGASockPath, "qemu-1.sock") {
 		t.Errorf("vm-b (index 1) QGA socket = %q, want it to end in qemu-1.sock", b.QGASockPath)
 	}
 	// User-mode ports: index 0 keeps the fixed 2222/8080, index 1 gets
-	// 2223/8081, per D7. The recorded QEMU command line is where this is
-	// externally observable.
+	// 2223/8081. The recorded QEMU command line is where this is externally
+	// observable.
 	if !slices.Contains(a.QemuArgs, "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080") {
 		t.Errorf("vm-a's user-mode netdev is not the unchanged index-0 default:\n%q", a.QemuArgs)
 	}

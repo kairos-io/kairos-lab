@@ -89,13 +89,13 @@ type fakeHost struct {
 	// answer.
 	invisibleBridges map[string]error
 	// notRealTapDevices names a port that parses as a generated tap name
-	// (D5 condition 1) but is not actually a tun/tap device -- modelling an
-	// attacker who named a real NIC "kairoslab-tap5". bridgePortExempt's
-	// condition 2 must answer false for it, so it is never exempt from
-	// refusal however it is named.
+	// (bridgePortExempt's condition 1) but is not actually a tun/tap device --
+	// modelling an attacker who named a real NIC "kairoslab-tap5".
+	// bridgePortExempt's condition 2 must answer false for it, so it is
+	// never exempt from refusal however it is named.
 	notRealTapDevices map[string]bool
 	// foreignOwnedTaps names a generated, real tap device (conditions 1 and
-	// 2 both hold) whose owner is not this run's own uid -- D5 condition 3
+	// 2 both hold) whose owner is not this run's own uid -- condition 3
 	// failing on its own. Absent from this map, a generated name that
 	// passes condition 1 is modelled as a real, self-owned tap device by
 	// default, which is what an ordinary kairos-lab-created tap is.
@@ -204,9 +204,9 @@ func newFakeHost(t *testing.T) *fakeHost {
 	}
 	bridgeSlaveLinks = h.slaveLinks
 	staleCleanupSettleDelay = 0
-	// D5's two /sys reads. A name that parses as generated (condition 1) is
-	// modelled as a real, self-owned tap device by default -- an ordinary
-	// kairos-lab-created tap -- unless the test opts a name into
+	// bridgePortExempt's two /sys reads. A name that parses as generated
+	// (condition 1) is modelled as a real, self-owned tap device by default --
+	// an ordinary kairos-lab-created tap -- unless the test opts a name into
 	// notRealTapDevices (condition 2 fails: not a tun/tap device at all) or
 	// foreignOwnedTaps (condition 3 fails: a real generated-name tap device
 	// this run did not create).
@@ -1039,10 +1039,10 @@ func TestPrepareLinuxSharedRefusesAHostNICStoredAsTheTapName(t *testing.T) {
 // before the tap is activated leaves no name exempt, this one included.
 func TestPrepareLinuxSharedRefusesAPortNamedLikeTheDefaultTap(t *testing.T) {
 	h := newFakeHost(t)
-	// Merely parsing as a generated tap name is not enough to be exempt
-	// (D5): it also has to be a real tap device (condition 2), which this
-	// one is modelled as not being -- a foreign NIC coincidentally named
-	// like the generated default, the scenario this test is about. Tap
+	// Merely parsing as a generated tap name is not enough to be exempt: it
+	// also has to be a real tap device (bridgePortExempt's condition 2),
+	// which this one is modelled as not being -- a foreign NIC coincidentally
+	// named like the generated default, the scenario this test is about. Tap
 	// identity is index-derived (M2) and no longer read from
 	// st.Network.TapName at all, so there is no state field left to set to
 	// keep this run's own tap from being the default one.
@@ -1450,8 +1450,8 @@ func TestPrepareLinuxBridgeClearsDHCPLeaseFile(t *testing.T) {
 // TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything no longer
 // carries a tap-name case (M2): the tap identity PrepareLinuxShared uses is
 // TapNameForIndex(index), computed from a validated integer, and
-// st.Network.TapName is never read to build it any more, per D9's
-// "recomputed from the index and never trusted". A malformed value stored
+// st.Network.TapName is never read to build it any more -- it is always
+// recomputed from the index and never trusted. A malformed value stored
 // there is inert -- there is nothing left for it to reach -- so a test
 // asserting it gets refused would be pinning dead code. TestVMFieldsAreNeverTrustedForTapIdentity
 // below is the test that replaces it: it plants a malformed TapName in state
@@ -1499,9 +1499,9 @@ func TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything(t *testing.T)
 	}
 }
 
-// TestVMFieldsAreNeverTrustedForTapIdentity is D9's "recomputed from the
-// index and never trusted" pinned as a test: a malformed st.Network.TapName
-// -- the kind of value TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything
+// TestVMFieldsAreNeverTrustedForTapIdentity pins that a stored tap name is
+// always recomputed from the index and never trusted: a malformed
+// st.Network.TapName -- the kind of value TestPrepareLinuxSharedRejectsStoredNamesBeforeIssuingAnything
 // used to refuse -- does not stop a start and is not the name anything ends
 // up on the wire. Only TapNameForIndex(index) is ever used.
 func TestVMFieldsAreNeverTrustedForTapIdentity(t *testing.T) {

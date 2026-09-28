@@ -392,12 +392,12 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	if err := requireSetup(st); err != nil {
 		return err
 	}
-	// The per-VM refusal replaces this early, single-VM check (D1/M4): which
-	// VM this start is about is not known until the disk is resolved below,
-	// and the check that matters is made just above the prepare blocks, per
-	// the hazard at the "[1/3] Preparing networking" step -- a prepare
-	// mutates the host before store.Save is reached. See the reservation
-	// below.
+	// The per-VM refusal replaces what used to be an early, single-VM check
+	// here: which VM this start is about is not known until the disk is
+	// resolved below, and the check that matters is made just above the
+	// prepare blocks, right before the "[1/3] Preparing networking" step --
+	// a prepare mutates the host before store.Save is reached. See the
+	// reservation below.
 
 	vmDir := filepath.Join(store.CacheDir, "vm")
 	runtimeDir := filepath.Join(store.CacheDir, "runtime")
@@ -672,14 +672,13 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		writeLine(stdout, "")
 	}
 
-	// The per-VM refusal, D1/D4's reservation, and D6's index allocation, all
-	// in one Update so the check, the allocation and the reservation are
-	// atomic against a sibling doing the same thing at the same time --
-	// without that, two concurrent starts could both read "index free" and
-	// both pick 0. This sits above both prepare blocks below and above every
-	// later write of this VM's own state, per the hazard at app.go's own
-	// note on why "[2/3] Recording VM state" is not reached until well after
-	// a prepare has already mutated the host.
+	// The per-VM refusal, the reservation, and the index allocation, all in
+	// one Update so the check, the allocation and the reservation are atomic
+	// against a sibling doing the same thing at the same time -- without
+	// that, two concurrent starts could both read "index free" and both pick
+	// 0. This sits above both prepare blocks below and above every later
+	// write of this VM's own state, because "[2/3] Recording VM state" is
+	// not reached until well after a prepare has already mutated the host.
 	//
 	// disk.Name is used, not vmConfig.DiskName: the review above renames a
 	// NEW disk only, and a new disk has no live VM by construction, so the
@@ -862,9 +861,8 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	}
 
 	// Use short names for socket (Unix socket path limit is ~108 chars), and
-	// index 0's paths are byte-identical to a pre-multi-VM host (D7); every
-	// index above it gets its own socket and log so two VMs never share
-	// either.
+	// index 0's paths are byte-identical to a pre-multi-VM host; every index
+	// above it gets its own socket and log so two VMs never share either.
 	qgaSock, logPath := runtimePathsForIndex(runtimeDir, vmIndex)
 	sshPort, httpPort, userModeHostBind := userModePortsForIndex(vmIndex)
 	binary, qemuArgs, err := buildQEMUCommand(vm.StartConfig{
@@ -912,11 +910,11 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 	// fresh under the same lock reservedAt was written under, so this
 	// merges instead of overwriting.
 	//
-	// The final Update also re-asserts on disk.Name (D4): if this VM's
-	// reservation somehow no longer names us (it always should, since
-	// nothing else can complete a start under this name while a live
-	// reservation stands), the error surfaces here rather than silently
-	// recording a PID nobody asked for.
+	// The final Update also re-asserts on disk.Name: if this VM's reservation
+	// somehow no longer names us (it always should, since nothing else can
+	// complete a start under this name while a live reservation stands), the
+	// error surfaces here rather than silently recording a PID nobody asked
+	// for.
 	st.Network.Mode = *network
 	st.Network.BridgeInterface = bridgeInterfaceForMode(*network, networkIface)
 	tapConnName := ""
@@ -1033,8 +1031,8 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		return fmt.Errorf("start qemu: %w", err)
 	}
 	vmRecord.PID = command.Process.Pid
-	// An Update that cannot complete here (D8: a timed-out lock, most likely)
-	// is logged and the run continues rather than treated as a start
+	// An Update that cannot complete here (a timed-out lock, most likely) is
+	// logged and the run continues rather than treated as a start
 	// failure: QEMU is already running, and killing it over a bookkeeping
 	// write would orphan nothing while still losing the VM the user asked
 	// for. The PID is recorded on the next successful write instead --
@@ -1134,7 +1132,7 @@ const (
 )
 
 // runtimePathsForIndex returns the QGA socket and log paths for a VM at
-// index, per D7: index 0 is "runtime/qemu.sock" and "runtime/qemu.log",
+// index. Index 0 is "runtime/qemu.sock" and "runtime/qemu.log",
 // byte-identical to a pre-multi-VM host, and index N>=1 is
 // "runtime/qemu-N.sock" and "runtime/qemu-N.log", so two VMs in the same
 // config dir never share either.
@@ -1147,10 +1145,10 @@ func runtimePathsForIndex(runtimeDir string, index int) (qgaSock, logPath string
 }
 
 // userModePortsForIndex returns the SSH/HTTP forwards and the host address
-// they bind, per D7/D11: index 0 keeps today's fixed 2222/8080 bound to
-// every host interface (AC 5 forbids changing what index 0 already
-// exposes), and index N>=1 gets 2222+N/8080+N bound to 127.0.0.1 only --
-// new surface with no compatibility constraint to keep.
+// they bind. Index 0 keeps today's fixed 2222/8080 bound to every host
+// interface -- index 0 must not change what it already exposes -- and index
+// N>=1 gets 2222+N/8080+N bound to 127.0.0.1 only, which is new surface with
+// no compatibility constraint to keep.
 func userModePortsForIndex(index int) (sshPort, httpPort int, hostBind string) {
 	if index == 0 {
 		return 2222, 8080, ""
@@ -1529,20 +1527,20 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 }
 
 // finalizeVMRecord writes vmRecord's final state (the exit-time write, both
-// on a clean exit and on a wait error) through a merge-safe store.Update, per
-// D8, falling back to a plain overwrite built from st when Update cannot
-// even complete a Load.
+// on a clean exit and on a wait error) through a merge-safe store.Update,
+// falling back to a plain overwrite built from st when Update cannot even
+// complete a Load.
 //
-// The fallback matters because a plain runStart's own write here is the
-// process's last act before it exits: a state.json this process cannot
-// currently parse -- corrupted by another write landing at exactly the
-// wrong moment, or by anything else -- must not mean the VM's exit goes
-// unrecorded forever. Before D8's Update, a bare store.Save(st) already
-// rebuilt the file unconditionally in that situation, since Save never reads
-// what is currently on disk; falling back to exactly that keeps the
-// property. st is this run's own last-known-good copy of everything else in
-// the file -- Setup, Disks, Network, the managed lists -- so the rebuild
-// loses nothing this run itself did not already have.
+// The fallback matters because runStart's own write here is the process's
+// last act before it exits: a state.json this process cannot currently parse
+// -- corrupted by another write landing at exactly the wrong moment, or by
+// anything else -- must not mean the VM's exit goes unrecorded forever.
+// Before store.Update existed, a bare store.Save(st) already rebuilt the file
+// unconditionally in that situation, since Save never reads what is currently
+// on disk; falling back to exactly that keeps the property. st is this run's
+// own last-known-good copy of everything else in the file -- Setup, Disks,
+// Network, the managed lists -- so the rebuild loses nothing this run itself
+// did not already have.
 func finalizeVMRecord(store *state.Store, st *state.State, vmRecord state.VM) error {
 	err := store.Update(func(s *state.State) error {
 		// Merge rather than overwrite: the IP poll's own Update (or a
@@ -1687,7 +1685,7 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 		writef(stdout, "bridge resources: bridge=%s taps=%s\n", emptyAsNone(st.Network.BridgeName), joinOrNone(taps))
 	}
 
-	// Quarantined records (D9/M1): named rather than silently dropped, so a
+	// Quarantined records (M1): named rather than silently dropped, so a
 	// state.json a future or buggy binary corrupted is visible here instead
 	// of just missing a VM the user knows they started.
 	for _, q := range st.Quarantined {
@@ -1759,7 +1757,9 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 
 	// Whether any VM NOT being removed is still live, which decides whether
 	// the shared bridge itself may come down once every targeted VM's own
-	// tap is gone (D2: one bridge, many taps).
+	// tap is gone -- every VM in this config dir shares one bridge, each with
+	// its own tap on it, so the bridge can only go once no sibling's tap
+	// still needs it.
 	removing := make(map[string]bool, len(vmsToRemove))
 	for _, v := range vmsToRemove {
 		removing[v.Name] = true
