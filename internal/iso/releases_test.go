@@ -190,3 +190,45 @@ func TestGetKubernetesOptionsListsEachVersionOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestParseISOAssetsRejectsAMixedDistroStamp pins the agreement between the
+// two halves of a standard image's name. `k3s` names the distribution and
+// `+k0s.0` stamps the build, so the name contradicts itself; the pattern's
+// two groups are independent and cannot catch that on their own.
+//
+// It matters because nothing downstream reads either half alone. The picker
+// groups by distro, FindByK8sVersion looks the pair up and the dedupe keys on
+// it, so an asset admitted here under "k3s" carrying a k0s version would
+// offer a k0s image to a user who asked for k3s. The well-formed asset in the
+// same list is what keeps this from passing by rejecting everything.
+func TestParseISOAssetsRejectsAMixedDistroStamp(t *testing.T) {
+	release := &Release{Assets: []Asset{
+		{Name: "kairos-hadron-core-ubuntu-amd64-generic-v4.3.0-k3sv1.36.4+k0s.0.iso"},
+		{Name: "kairos-hadron-core-ubuntu-amd64-generic-v4.3.0-k3sv1.36.4+k3s1.iso"},
+	}}
+
+	options := ParseISOAssets(release)
+	if len(options) != 1 {
+		t.Fatalf("got %d options, want only the well-formed one: %+v", len(options), options)
+	}
+	if options[0].K8sVersion != "v1.36.4+k3s1" {
+		t.Errorf("kept the wrong asset: K8sVersion = %q", options[0].K8sVersion)
+	}
+}
+
+// TestParseISOAssetsKeepsBothDistrosWhenTheyAgree is the other side of that
+// check: a k0s stamp under a k0s prefix has to stay. Without it the check
+// above is satisfied by a rule that drops every k0s image, which is the bug
+// this PR exists to fix.
+func TestParseISOAssetsKeepsBothDistrosWhenTheyAgree(t *testing.T) {
+	release := &Release{Assets: []Asset{
+		{Name: "kairos-hadron-core-ubuntu-amd64-generic-v4.3.0-k0sv1.34.1+k0s.0.iso"},
+		{Name: "kairos-hadron-core-ubuntu-amd64-generic-v4.3.0-k3sv1.36.4+k3s1.iso"},
+		{Name: "kairos-hadron-core-ubuntu-amd64-generic-v4.3.0.iso"},
+	}}
+
+	options := ParseISOAssets(release)
+	if len(options) != 3 {
+		t.Fatalf("got %d options, want all three: %+v", len(options), options)
+	}
+}
