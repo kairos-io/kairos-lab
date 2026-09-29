@@ -100,6 +100,18 @@ func ParseISOAssets(release *Release) []ISOOption {
 		if matches == nil {
 			continue
 		}
+		// The prefix group and the build-stamp group are independent terms
+		// of the pattern, so on its own it also matches a name that names
+		// one distribution and stamps the other -- `...-k3sv1.2.3+k0s.0`.
+		// No release publishes such a name, but the pair is what everything
+		// downstream keys on: the picker, the lookup and the dedupe all read
+		// distro and version together, so a name that disagrees with itself
+		// would seed a k0s version under the k3s heading. RE2 has no
+		// backreference to express the agreement in the pattern, so it is
+		// checked here, where it can say why.
+		if matches[4] != "" && !strings.Contains(matches[5], "+"+matches[4]) {
+			continue
+		}
 		opt := ISOOption{
 			Name:        asset.Name,
 			DownloadURL: asset.BrowserDownloadURL,
