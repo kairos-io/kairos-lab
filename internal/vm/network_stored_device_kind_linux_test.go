@@ -4,6 +4,7 @@
 package vm
 
 import (
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -123,6 +124,12 @@ func TestCleanupStillDeletesItsOwnTap(t *testing.T) {
 	h.links[DefaultBridgeName] = true
 	h.bridges[DefaultBridgeName] = true
 	h.links[DefaultTapName] = true
+	// Said out loud rather than left to the fake's default, which answers
+	// "is this a tun/tap device" from whether the name parses as a generated
+	// one. That default is the name-equals-device conflation this guard is
+	// about, so a test that leaned on it would pass for the wrong reason and
+	// would keep passing if the guard started asking the name again.
+	h.realTapDevices[DefaultTapName] = true
 
 	if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, "", false); err != nil {
 		t.Fatalf("the teardown refused its own tap: %v", err)
@@ -135,5 +142,97 @@ func TestCleanupStillDeletesItsOwnTap(t *testing.T) {
 	}
 	if !deletedTap {
 		t.Errorf("the teardown never deleted its own tap; commands: %v", h.commands)
+	}
+}
+
+// TestStaleCleanupRefusesWhenTheDeviceStatCannotAnswer covers the third of the
+// three answers refuseForeignStoredDevice gives, and the only one neither
+// test above reaches: /sys/class/net/<name> is there but the stat fails with
+// something other than "no such file or directory", so the host cannot say
+// what kind of device this is.
+//
+// It is a separate case from both others and not a shade of either. "No such
+// device" passes, because a leftover profile with no device is what the stale
+// cleanup exists for; "wrong kind of device" refuses, because that is the
+// bug. An unanswerable stat looks like the first to every probe on this path
+// -- isLinuxBridge is `os.Stat(...); return err == nil` and cannot tell them
+// apart -- which is exactly why netDeviceExists reports the error instead of
+// a bool, and why a regression here would be silent: the name would sail
+// through the guard into `sudo ip link delete`.
+func TestStaleCleanupRefusesWhenTheDeviceStatCannotAnswer(t *testing.T) {
+	h := newFakeHost(t)
+	h.conns[DefaultBridgeName] = true
+	h.invisibleBridges[DefaultBridgeName] = fs.ErrPermission
+
+	err := CleanupStaleNetworkResources(storedState(DefaultBridgeName))
+	if err == nil {
+		t.Fatal("the stale cleanup accepted a bridge name whose device stat failed, want a refusal")
+	}
+	if !strings.Contains(err.Error(), DefaultBridgeName) {
+		t.Errorf("the refusal does not name the interface it refused: %v", err)
+	}
+	for _, argv := range h.commands {
+		t.Errorf("the refusal still issued a command: %v", argv)
+	}
+}
+
+// TestCleanupRefusesWhenTheTapStatCannotAnswer is the same case on the second
+// name the choke point promises to guard. The bridge name is a real
+// kairos-lab bridge here, so the only thing that can refuse is the tap.
+func TestCleanupRefusesWhenTheTapStatCannotAnswer(t *testing.T) {
+	h := newFakeHost(t)
+	h.conns[DefaultBridgeName] = true
+	h.links[DefaultBridgeName] = true
+	h.bridges[DefaultBridgeName] = true
+	h.invisibleBridges[DefaultTapName] = fs.ErrPermission
+
+	err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, "", false)
+	if err == nil {
+		t.Fatal("the teardown accepted a tap name whose device stat failed, want a refusal")
+	}
+	if !strings.Contains(err.Error(), DefaultTapName) {
+		t.Errorf("the refusal does not name the interface it refused: %v", err)
+	}
+	for _, argv := range h.commands {
+		t.Errorf("the refusal still issued a command: %v", argv)
+	}
+}
+
+// TestPreflightRefusesAHostNICInEveryMode is the half of #5051 that the choke
+// point alone does not close.
+//
+// linuxNetworkPreflight reaches cleanupNMConnections through the stale-resource
+// branch, and used to read everything it returned as "a teardown ran and part
+// of it failed". A refusal is the opposite of that -- nothing ran -- and the
+// two modes got it wrong in two different ways: bridged DROPPED the refusal
+// and carried on into `nmcli connection modify <name>` over the name just
+// refused, and shared reported it in words describing a partial teardown.
+//
+// Both modes must stop, so both are driven here. The assertion that no
+// command was issued is the one that fails against the old bridged path.
+func TestPreflightRefusesAHostNICInEveryMode(t *testing.T) {
+	for _, mode := range []string{"bridged", "shared"} {
+		t.Run(mode, func(t *testing.T) {
+			h := newFakeHost(t)
+			seedHostNIC(h)
+
+			st := storedState(hostNIC)
+			st.Network.Mode = mode
+			err := linuxNetworkPreflight(st, t.TempDir(), mode, hostNIC, DefaultTapName, TapConnNameForIndex(hostNIC, 0), false)
+			if err == nil {
+				t.Fatal("the preflight started over a stored bridge name that is a physical NIC, want a refusal")
+			}
+			if !strings.Contains(err.Error(), hostNIC) {
+				t.Errorf("the refusal does not name the interface it refused: %v", err)
+			}
+			// The refusal fired before anything was issued, so the message
+			// must not tell the user their host has been changed.
+			if strings.Contains(err.Error(), "the host's networking has changed") {
+				t.Errorf("the refusal describes itself as a partial teardown: %v", err)
+			}
+			for _, argv := range h.commands {
+				t.Errorf("the preflight still issued a command over the refused name: %v", argv)
+			}
+		})
 	}
 }
