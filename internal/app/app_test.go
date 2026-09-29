@@ -5283,3 +5283,107 @@ func TestStartSharesOneStdinBetweenTheDiskPickerAndTheReview(t *testing.T) {
 		t.Fatalf("the pre-flight was asked %q, want %q", *calls, want)
 	}
 }
+
+// start polls for the guest's address for DefaultIPPollTimeout and records
+// what it finds. A guest that accepts its lease after that window -- an
+// installer ISO left at its first prompt is the ordinary case -- is never
+// polled again, so state.json keeps no address for it. status used to print
+// that recorded value alone, which meant a VM whose address the host's own
+// lease file and ARP cache had held for minutes still reported "none" for
+// the rest of its life.
+func TestStatusResolvesTheAddressOfARunningVMThatHasNoneRecorded(t *testing.T) {
+	var asked vm.IPLookup
+	restore := resolveVMIP
+	resolveVMIP = func(_ context.Context, l vm.IPLookup) (vm.IPResult, bool) {
+		asked = l
+		return vm.IPResult{IP: "192.168.2.5", Source: vm.IPSourceDHCPLease}, true
+	}
+	t.Cleanup(func() { resolveVMIP = restore })
+
+	out := runStatusOutput(t, func(st *state.State) {
+		st.Network.Mode = "shared"
+		st.Disks = append(st.Disks, state.Disk{Name: testVMName, MAC: "52:54:00:6e:f0:c4"})
+		withVMField(testVMName, func(v *state.VM) {
+			v.NetworkMode = "shared"
+			v.DiskName = testVMName
+			v.PID = os.Getpid()
+		})(st)
+	})
+
+	if !strings.Contains(out, "  vm ip address: 192.168.2.5\n") {
+		t.Errorf("status did not report the address the host knows:\n%s", out)
+	}
+	if asked.MAC != "52:54:00:6e:f0:c4" {
+		t.Errorf("status asked about MAC %q, want the disk's recorded one", asked.MAC)
+	}
+	if asked.Mode != "shared" {
+		t.Errorf("status asked in mode %q, want shared", asked.Mode)
+	}
+}
+
+// The recorded address always wins. It is what the start that watched this
+// guest resolved, and re-asking the host could answer from an ARP entry left
+// by an earlier boot of the same deterministic MAC.
+func TestStatusPrefersTheRecordedAddressOverALiveLookup(t *testing.T) {
+	restore := resolveVMIP
+	resolveVMIP = func(context.Context, vm.IPLookup) (vm.IPResult, bool) {
+		t.Error("status asked the host although the address was recorded")
+		return vm.IPResult{IP: "10.0.0.1"}, true
+	}
+	t.Cleanup(func() { resolveVMIP = restore })
+
+	out := runStatusOutput(t, func(st *state.State) {
+		st.Network.Mode = "shared"
+		withVMField(testVMName, func(v *state.VM) {
+			v.NetworkMode = "shared"
+			v.IPAddress = "192.168.64.12"
+			v.PID = os.Getpid()
+		})(st)
+	})
+	if !strings.Contains(out, "  vm ip address: 192.168.64.12\n") {
+		t.Errorf("status did not print the recorded address:\n%s", out)
+	}
+}
+
+// A VM that is not running has no address to ask about: whatever the host
+// still holds for that MAC is a previous boot's, and MACForDisk is
+// deterministic, so the stale entry would match and be reported as current.
+func TestStatusDoesNotAskTheHostAboutAStoppedVM(t *testing.T) {
+	restore := resolveVMIP
+	resolveVMIP = func(context.Context, vm.IPLookup) (vm.IPResult, bool) {
+		t.Error("status asked the host about a VM that is not running")
+		return vm.IPResult{IP: "10.0.0.1"}, true
+	}
+	t.Cleanup(func() { resolveVMIP = restore })
+
+	out := runStatusOutput(t, func(st *state.State) {
+		st.Network.Mode = "shared"
+		withVMField(testVMName, func(v *state.VM) { v.NetworkMode = "shared" })(st)
+	})
+	if !strings.Contains(out, "  vm ip address: none\n") {
+		t.Errorf("status did not report a stopped VM's address as none:\n%s", out)
+	}
+}
+
+// user mode has no host source at all: the DHCP server is inside QEMU and no
+// frame reaches the host's neighbour table. Asking would spend the timeout
+// to learn nothing, and the forwards row below is what that mode has.
+func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
+	restore := resolveVMIP
+	resolveVMIP = func(context.Context, vm.IPLookup) (vm.IPResult, bool) {
+		t.Error("status asked the host in user mode, which has no host source")
+		return vm.IPResult{IP: "10.0.2.15"}, true
+	}
+	t.Cleanup(func() { resolveVMIP = restore })
+
+	out := runStatusOutput(t, func(st *state.State) {
+		st.Network.Mode = "user"
+		withVMField(testVMName, func(v *state.VM) {
+			v.NetworkMode = "user"
+			v.PID = os.Getpid()
+		})(st)
+	})
+	if !strings.Contains(out, "  vm ip address: none\n") {
+		t.Errorf("status did not report user mode's address as none:\n%s", out)
+	}
+}

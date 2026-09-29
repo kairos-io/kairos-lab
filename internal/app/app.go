@@ -1198,6 +1198,87 @@ func userModePortsForIndex(index int) (sshPort, httpPort int, hostBind string) {
 	return 2222 + index, 8080 + index, "127.0.0.1"
 }
 
+// liveVMIP asks the host for the address of a running VM that state.json has
+// no record of.
+//
+// start polls for the address for DefaultIPPollTimeout and records what it
+// finds. A guest that takes longer than that to accept a lease -- an
+// installer ISO left sitting at its first prompt is the ordinary case -- gets
+// its address after the poll has already given up, and nothing polls again.
+// Before this existed, status read the recorded value alone, so that VM
+// reported "none" for the rest of its life while the host's own lease file
+// and ARP cache had held the answer for minutes.
+//
+// It is deliberately read-only and best effort. status is a reporting
+// command, so a failure here prints "none" exactly as before and never an
+// error: the sources are the same ones start already tried, and every way
+// they can fail is a way start already treats as "try the next one".
+//
+// user mode is skipped because IPLookup.Resolve has no host source for it --
+// the block start prints, and the forwards status prints below, are what
+// that mode has instead.
+func liveVMIP(st *state.State, v state.VM) string {
+	if v.NetworkMode == "user" {
+		return ""
+	}
+	mac := macForVM(st, v)
+	if mac == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), liveIPLookupTimeout)
+	defer cancel()
+	res, ok := resolveVMIP(ctx, vm.IPLookup{
+		MAC:           mac,
+		Mode:          v.NetworkMode,
+		LeaseFile:     st.Network.DHCPLeaseFile,
+		BridgeName:    st.Network.BridgeName,
+		QGASocketPath: v.QGASockPath,
+	})
+	if !ok {
+		return ""
+	}
+	return res.IP
+}
+
+// resolveVMIP is the seam liveVMIP asks through, and it exists for the reason
+// pollVMIP does: a test must be able to observe what status asks WITHOUT the
+// host it runs on deciding the answer. The real sources are a file under /var
+// and two subprocesses, so a test that called through would pass or fail on
+// whether the machine running it happens to have a vmnet guest. Nothing in
+// production assigns it; the tests restore it with t.Cleanup.
+var resolveVMIP = func(ctx context.Context, lookup vm.IPLookup) (vm.IPResult, bool) {
+	return lookup.Resolve(ctx)
+}
+
+// liveIPLookupTimeout bounds the lookup above. It is short on purpose: this
+// runs in front of a user waiting on `status`, not beside a booting VM, and
+// the sources it reads are a file and two subprocesses that answer at once or
+// not at all.
+const liveIPLookupTimeout = 3 * time.Second
+
+// macForVM is the disk MAC start would have used for this VM: the recorded
+// one, or the deterministic derivation for a disk recorded before state.Disk
+// .MAC existed. It matches on the disk name the VM record carries, falling
+// back to the VM name, which is what a disk-per-VM host has.
+func macForVM(st *state.State, v state.VM) string {
+	name := v.DiskName
+	if name == "" {
+		name = v.Name
+	}
+	if name == "" {
+		return ""
+	}
+	for _, d := range st.Disks {
+		if d.Name == name {
+			if d.MAC != "" {
+				return d.MAC
+			}
+			break
+		}
+	}
+	return vm.MACForDisk(name)
+}
+
 // vmUpBlock is what a start prints once the guest's address is known.
 //
 // The first three lines are the block the issue specifies, character for
@@ -1685,7 +1766,11 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 		writef(stdout, "  iso path: %s\n", emptyAsNone(v.ISOLocal))
 		writef(stdout, "  disk path: %s\n", emptyAsNone(v.DiskPath))
 		writef(stdout, "  network mode: %s\n", emptyAsNone(v.NetworkMode))
-		writef(stdout, "  vm ip address: %s%s\n", emptyAsNone(v.IPAddress), linkLocalAddressNote(v.IPAddress))
+		ipAddr := v.IPAddress
+		if ipAddr == "" && running {
+			ipAddr = liveVMIP(st, v)
+		}
+		writef(stdout, "  vm ip address: %s%s\n", emptyAsNone(ipAddr), linkLocalAddressNote(ipAddr))
 		if v.NetworkMode == "user" {
 			sshPort, httpPort, _ := userModePortsForIndex(v.Index)
 			writef(stdout, "  user mode forwards: ssh localhost:%d, http localhost:%d\n", sshPort, httpPort)
