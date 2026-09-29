@@ -94,6 +94,15 @@ type fakeHost struct {
 	// bridgePortExempt's condition 2 must answer false for it, so it is
 	// never exempt from refusal however it is named.
 	notRealTapDevices map[string]bool
+	// realTapDevices names a device that is a genuine tun/tap device even
+	// though its name does not parse as a generated one -- a tap created by a
+	// kairos-lab older than the generated-name scheme, or one a user
+	// configured. It is the converse of notRealTapDevices, and it exists
+	// because a name is not evidence either way: the two questions "does this
+	// name parse as ours" and "is this a tun/tap device" are separate /sys
+	// facts, and a fake that answers the second from the first cannot express
+	// a real tap with an unfamiliar name.
+	realTapDevices map[string]bool
 	// foreignOwnedTaps names a generated, real tap device (conditions 1 and
 	// 2 both hold) whose owner is not this run's own uid -- condition 3
 	// failing on its own. Absent from this map, a generated name that
@@ -135,6 +144,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 		invisibleLinks:    map[string]bool{},
 		invisibleBridges:  map[string]error{},
 		notRealTapDevices: map[string]bool{},
+		realTapDevices:    map[string]bool{},
 		foreignOwnedTaps:  map[string]bool{},
 	}
 
@@ -209,10 +219,14 @@ func newFakeHost(t *testing.T) *fakeHost {
 	// an ordinary kairos-lab-created tap -- unless the test opts a name into
 	// notRealTapDevices (condition 2 fails: not a tun/tap device at all) or
 	// foreignOwnedTaps (condition 3 fails: a real generated-name tap device
-	// this run did not create).
+	// this run did not create), or into realTapDevices (condition 2 holds for
+	// a name that does not parse as generated).
 	tapSysfsTunFlagsReadable = func(name string) bool {
 		if h.notRealTapDevices[name] {
 			return false
+		}
+		if h.realTapDevices[name] {
+			return true
 		}
 		_, ok := IsGeneratedTapName(name)
 		return ok
@@ -2146,6 +2160,11 @@ func TestCleanupNMConnectionsRefusesAMalformedStoredTapName(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.links["kltap0"] = true
+		// It is a real tun/tap device, it just does not carry a generated
+		// name. Saying so is what separates it from a host NIC for the
+		// refusal in cleanupNMConnections; on a real host the tun driver
+		// answers this, not the name.
+		h.realTapDevices["kltap0"] = true
 
 		if err := cleanupNMConnections(DefaultBridgeName, "kltap0", DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("cleanupNMConnections = %v, want nil", err)
