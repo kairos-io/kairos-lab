@@ -13,7 +13,11 @@ import (
 	"time"
 )
 
-const SchemaVersion = 2
+// SchemaVersion 3 adds State.AuroraBoot. The field is additive, so a schema 2
+// file loads with it zero; the bump exists so an older binary, which would
+// drop the field on its next Save and strand a tracked image and shim,
+// refuses the file instead.
+const SchemaVersion = 3
 
 // MaxVMIndex is the highest per-VM index this schema allocates. It bounds
 // both NextFreeVMIndex and the validation Load applies to a stored index: an
@@ -32,6 +36,23 @@ type Setup struct {
 	PreExistingDeps       []string `json:"pre_existing_deps,omitempty"`
 	InstalledByKairosLab  []string `json:"installed_by_kairos_lab,omitempty"`
 	DependencyCheckPassed bool     `json:"dependency_check_passed"`
+}
+
+// AuroraBoot records what `kairos-lab setup` did to provide the auroraboot
+// command, so cleanup removes exactly that and nothing the user had before.
+// Every value here is read back from a file anything running as the user can
+// write, so consumers validate each one before acting on it.
+type AuroraBoot struct {
+	// Runtime is the container runtime the shim runs, "docker" or "podman".
+	Runtime string `json:"runtime,omitempty"`
+	// PulledImages are the images setup pulled and cleanup may remove.
+	PulledImages []string `json:"pulled_images,omitempty"`
+	// PreExistingImages are images already present before setup; never removed.
+	PreExistingImages []string `json:"pre_existing_images,omitempty"`
+	// ShimPath is the auroraboot shim setup wrote.
+	ShimPath string `json:"shim_path,omitempty"`
+	// ShimDirCreated is the directory setup had to create to hold the shim.
+	ShimDirCreated string `json:"shim_dir_created,omitempty"`
 }
 
 type Network struct {
@@ -118,7 +139,9 @@ type State struct {
 	Platform Platform `json:"platform"`
 	Setup    Setup    `json:"setup"`
 	Network  Network  `json:"network"`
-	VMs      []VM     `json:"vms,omitempty"`
+	// AuroraBoot is additive: a file written before schema 3 loads with it zero.
+	AuroraBoot AuroraBoot `json:"auroraboot"`
+	VMs        []VM       `json:"vms,omitempty"`
 	// Legacy is the pre-multi-VM "vm" record. It is a pointer and not a VM
 	// value so Load can tell "absent from the file" (nil) from "present and
 	// the zero value" (non-nil, pointing at a VM that never started) -- the
@@ -515,6 +538,23 @@ func (s *Store) RemoveStateFile() error {
 		return fmt.Errorf("remove state file: %w", err)
 	}
 	return nil
+}
+
+// AddPulledImage records ref as pulled by kairos-lab, keeping the list sorted
+// and free of duplicates.
+func AddPulledImage(st *State, ref string) {
+	st.AuroraBoot.PulledImages = uniqueSorted(append(st.AuroraBoot.PulledImages, ref))
+}
+
+// RemovePulledImage drops ref from the pulled list.
+func RemovePulledImage(st *State, ref string) {
+	out := make([]string, 0, len(st.AuroraBoot.PulledImages))
+	for _, r := range st.AuroraBoot.PulledImages {
+		if r != ref {
+			out = append(out, r)
+		}
+	}
+	st.AuroraBoot.PulledImages = out
 }
 
 func AddManagedFile(st *State, path string) {

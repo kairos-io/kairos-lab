@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -492,5 +493,71 @@ func TestConcurrentSaveAndLoad(t *testing.T) {
 	}
 	for err := range loadErrs {
 		t.Errorf("concurrent load could not read the state file: %v", err)
+	}
+}
+
+func TestAuroraBootStateRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	st := NewState(store)
+	st.AuroraBoot.Runtime = "docker"
+	st.AuroraBoot.ShimPath = "/home/u/.local/bin/auroraboot"
+	st.AuroraBoot.ShimDirCreated = "/home/u/.local/bin"
+	st.AuroraBoot.PreExistingImages = []string{"quay.io/kairos/auroraboot:v0.1.0"}
+	AddPulledImage(st, "quay.io/kairos/auroraboot:v0.27.1")
+	AddPulledImage(st, "quay.io/kairos/auroraboot:v0.10.0")
+	AddPulledImage(st, "quay.io/kairos/auroraboot:v0.27.1")
+	want := []string{"quay.io/kairos/auroraboot:v0.10.0", "quay.io/kairos/auroraboot:v0.27.1"}
+	if !reflect.DeepEqual(st.AuroraBoot.PulledImages, want) {
+		t.Fatalf("pulled images = %v, want sorted and unique %v", st.AuroraBoot.PulledImages, want)
+	}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.AuroraBoot, st.AuroraBoot) {
+		t.Fatalf("auroraboot = %+v, want %+v", got.AuroraBoot, st.AuroraBoot)
+	}
+	RemovePulledImage(got, "quay.io/kairos/auroraboot:v0.10.0")
+	if !reflect.DeepEqual(got.AuroraBoot.PulledImages, want[1:]) {
+		t.Fatalf("after remove = %v, want %v", got.AuroraBoot.PulledImages, want[1:])
+	}
+}
+
+func TestLoadSchema2FileMigratesToSchema3(t *testing.T) {
+	store := newTestStore(t)
+	writeRawState(t, store, `{"version":2,"setup":{"installed_by_kairos_lab":["qemu"]}}`)
+	st, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Version != 3 {
+		t.Fatalf("version = %d, want 3", st.Version)
+	}
+	if !reflect.DeepEqual(st.AuroraBoot, AuroraBoot{}) {
+		t.Fatalf("auroraboot = %+v, want zero", st.AuroraBoot)
+	}
+	if len(st.Setup.InstalledByKairosLab) != 1 {
+		t.Fatalf("existing fields lost: %+v", st.Setup)
+	}
+	if err := store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(store.StatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"version": 3`) {
+		t.Fatalf("saved file is not schema 3:\n%s", raw)
+	}
+}
+
+func TestLoadRefusesNewerSchemaThan3(t *testing.T) {
+	store := newTestStore(t)
+	writeRawState(t, store, `{"version":4}`)
+	if _, err := store.Load(); err == nil {
+		t.Fatal("loading a schema 4 file should fail")
 	}
 }
