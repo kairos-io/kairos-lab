@@ -34,6 +34,47 @@ func Required(info platform.Info) []Dependency {
 	return deps
 }
 
+// Docker and Podman are the container runtimes the auroraboot shim can run on.
+// They are deliberately not part of Required: setup installs one only when the
+// machine has no runtime at all, and only on Linux, so they are asked for
+// separately and recorded under the runtime's own name. There is no brew entry
+// because on macOS setup installs nothing.
+//
+// dnf's moby-engine is Fedora's package; RHEL and its rebuilds have no docker
+// package at all, and setup reports the failure rather than guess at another
+// repository. Installing docker also leaves its service disabled and the user
+// outside the docker group; setup tells the user, it does not change either.
+func Docker() Dependency {
+	return Dependency{
+		Name:     "docker",
+		Binaries: []string{"docker"},
+		InstallPackages: map[string][]string{
+			"apt":    {"docker.io"},
+			"dnf":    {"moby-engine"},
+			"yum":    {"docker"},
+			"zypper": {"docker"},
+			"pacman": {"docker"},
+			"apk":    {"docker"},
+		},
+	}
+}
+
+// Podman is the daemonless alternative to Docker; see Docker.
+func Podman() Dependency {
+	return Dependency{
+		Name:     "podman",
+		Binaries: []string{"podman"},
+		InstallPackages: map[string][]string{
+			"apt":    {"podman"},
+			"dnf":    {"podman"},
+			"yum":    {"podman"},
+			"zypper": {"podman"},
+			"pacman": {"podman"},
+			"apk":    {"podman"},
+		},
+	}
+}
+
 func DetectPresent(dep Dependency) bool {
 	for _, b := range dep.Binaries {
 		if _, err := exec.LookPath(b); err != nil {
