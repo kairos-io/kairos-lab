@@ -1184,12 +1184,17 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 // webUIPort is the port the Kairos WebUI is served on inside the guest, and
 // userModeSSHPort is the host port user mode forwards to the guest's sshd.
 //
-// They are literals here because they are literals in internal/vm too: both
-// builders there carry a hostfwd list written out by hand -- tcp::2222-:22
-// and tcp::8080-:8080 -- and nothing in that package exports the numbers. A
-// shared constant would have to be declared there, which this change does not
-// touch, so what keeps the two in step instead is a test that builds a
-// user-mode QEMU command and looks for these ports in it.
+// They are literals here because they are literals in internal/vm too:
+// userModeNetdevArg there falls back to 2222 and 8080 for an unset port, and
+// nothing in that package exports the numbers. A shared constant would have
+// to be declared there, which this change does not touch, so what keeps the
+// two in step instead is a test that builds a user-mode QEMU command and
+// looks for these ports in it.
+//
+// The host address those ports bind is a different matter and IS exported,
+// as vm.DefaultUserModeHostBind: it is a security property rather than a
+// display detail, so the safe value has one home and the printed text below
+// is checked against it. See kairos-io/kairos#5053.
 const (
 	webUIPort       = "8080"
 	userModeSSHPort = "2222"
@@ -1209,15 +1214,18 @@ func runtimePathsForIndex(runtimeDir string, index int) (qgaSock, logPath string
 }
 
 // userModePortsForIndex returns the SSH/HTTP forwards and the host address
-// they bind. Index 0 keeps today's fixed 2222/8080 bound to every host
-// interface -- index 0 must not change what it already exposes -- and index
-// N>=1 gets 2222+N/8080+N bound to 127.0.0.1 only, which is new surface with
-// no compatibility constraint to keep.
+// they bind. Index 0 keeps the fixed 2222/8080 and index N>=1 gets
+// 2222+N/8080+N, so two VMs in one config dir never contend for a port.
+//
+// Every index binds vm.DefaultUserModeHostBind. Index 0 used to bind ""
+// instead, which QEMU reads as INADDR_ANY, on the grounds that index 0 must
+// not change what it already exposes -- but what it exposed was a live
+// Kairos guest's sshd and WebUI on every interface of the host, while the
+// start block, status and the macOS privilege error all told the user those
+// ports were on localhost. Keeping that is not compatibility, and the text
+// the user reads is now true at every index.
 func userModePortsForIndex(index int) (sshPort, httpPort int, hostBind string) {
-	if index == 0 {
-		return 2222, 8080, ""
-	}
-	return 2222 + index, 8080 + index, "127.0.0.1"
+	return 2222 + index, 8080 + index, vm.DefaultUserModeHostBind
 }
 
 // liveVMIP asks the host for the address of a running VM that state.json has
