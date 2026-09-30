@@ -15,6 +15,24 @@
         "patch"
       ],
       "automerge": true
+    },
+    {
+      "matchDepNames": [
+        "quay.io/kairos/auroraboot"
+      ],
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the pinned AuroraBoot image tag in internal/auroraboot/image.go",
+      "managerFilePatterns": [
+        "/^internal/auroraboot/image\\.go$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+ImageTag = \"(?<currentValue>[^\"]+)\""
+      ]
     }
   ]
 }
