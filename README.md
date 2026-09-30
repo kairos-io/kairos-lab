@@ -147,15 +147,23 @@ Checks for the tools kairos-lab needs, installs what is missing, and sets up the
   first one that works is used, Docker before podman. A runtime counts as
   usable when `<runtime> info` succeeds, and a `docker` that is really podman
   counts as podman.
-- If the machine has no runtime at all, on Linux setup installs one (after
-  asking, and asking again before it uses sudo): Docker by default, podman with
+- If the machine has no runtime at all, setup installs one, after asking (and
+  asking again before it uses sudo on Linux). Docker is the default, podman with
   `-runtime podman`. It never installs a runtime over one that is present but
-  broken, and it says why it skipped. After installing Docker you still need to
-  start the service and add yourself to the `docker` group. Setup prints the
-  commands and changes neither itself.
-- On macOS setup installs no runtime. With none present it prints a hint and
-  skips the AuroraBoot step. Install Docker Desktop, Colima or podman and run
-  `setup` again.
+  broken, and it says why it skipped.
+  - Linux: the distribution's `docker` or `podman` package. Docker still needs
+    its service started and your user in the `docker` group. Setup prints the
+    commands and changes neither itself.
+  - macOS: with Homebrew, `brew install --cask docker-desktop` for Docker, or
+    `brew install podman`. Neither needs sudo.
+- Setup never starts anything and never creates a VM. A runtime it just
+  installed is not usable yet, so that run stops after printing what to do, and
+  skips the image pull and the shim without failing: open Docker Desktop once
+  and wait until it reports it is running (Docker), or run `podman machine init`
+  and `podman machine start` (podman on macOS). Then run `setup` again. The
+  second run finds the runtime usable, pulls the image and installs the
+  `auroraboot` command. The runtime is recorded as installed by kairos-lab, so
+  `cleanup` can remove it.
 - Setup pulls the pinned image (`quay.io/kairos/auroraboot`, an exact tag, never
   `latest`) after asking, since it is about 2.2 GB. Declining skips this step
   and the rest of setup still completes.
@@ -248,7 +256,11 @@ Removes everything created by `kairos-lab`:
 - Network configuration
 - The `auroraboot` shim, and `~/.local/bin` if setup created it and it is empty
 - The AuroraBoot image, if setup pulled it (an image that was already there is kept)
-- Dependencies installed by the tool (not pre-existing ones), including a container runtime setup installed
+- Dependencies installed by the tool (not pre-existing ones), including a
+  container runtime setup installed. On macOS that is `brew uninstall --cask
+  docker-desktop` or `brew uninstall podman`, and the plan labels the cask as a
+  Homebrew cask. A podman machine you created is not removed; remove it with
+  `podman machine rm`
 
 ## Networking
 
@@ -392,8 +404,9 @@ Override with environment variables:
 
 - Cleanup only removes what the tool created
 - Dependencies that existed before setup are never removed. That includes a
-  container runtime and an AuroraBoot image that were there before setup: they
-  are recorded as pre-existing and cleanup keeps them
+  container runtime and an AuroraBoot image that were there before setup, on
+  Linux and on macOS: they are recorded as pre-existing and cleanup keeps them.
+  Only a runtime that setup itself installed is uninstalled
 - Cleanup removes the `auroraboot` shim only if it is a regular file that
   carries the line `# kairos-lab-managed: auroraboot shim`, so a script of your
   own with that name is never touched. It removes `~/.local/bin` only when
