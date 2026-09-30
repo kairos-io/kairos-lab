@@ -1768,6 +1768,13 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	writef(stdout, "dependencies installed by kairos-lab: %s\n", joinOrNone(st.Setup.InstalledByKairosLab))
 	writef(stdout, "managed dirs: %s\n", joinOrNone(st.ManagedDirs))
 	writef(stdout, "managed files: %s\n", joinOrNone(st.ManagedFiles))
+	if hasAuroraBootState(st.AuroraBoot) {
+		// Stored values again, so the same two renderers that escape them.
+		writef(stdout, "auroraboot runtime: %s\n", emptyAsNone(st.AuroraBoot.Runtime))
+		writef(stdout, "auroraboot shim: %s\n", emptyAsNone(st.AuroraBoot.ShimPath))
+		writef(stdout, "auroraboot images pulled by kairos-lab: %s\n", joinOrNone(st.AuroraBoot.PulledImages))
+		writef(stdout, "auroraboot images pre-existing: %s\n", joinOrNone(st.AuroraBoot.PreExistingImages))
+	}
 
 	// One block per VM (M5), in the order state.json carries them -- disk
 	// name, mode, tap, running, pid, address are all per-VM now, where a
@@ -2084,9 +2091,12 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	}
 	removeDeps := cleanup.DependenciesToRemove(st.Setup.PreExistingDeps, st.Setup.InstalledByKairosLab)
 	required := deps.Required(pinfo)
+	// A container runtime is looked up beside the required dependencies, but
+	// never part of them: setup installs one only on request.
+	removable := append(append([]deps.Dependency{}, required...), runtimeDepsFor(pm)...)
 	pkgRemovals := []string{}
 	if len(removeDeps) > 0 && pm != "" {
-		pkgRemovals, err = deps.UninstallablePackages(pm, removeDeps, required)
+		pkgRemovals, err = deps.UninstallablePackages(pm, removeDeps, removable)
 		if err != nil {
 			return err
 		}
@@ -2094,12 +2104,15 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 
 	filesToRemove, filesToSkip := splitRemovalPaths(st.ManagedFiles, st)
 	dirsToRemove, dirsToSkip := splitRemovalPaths(st.ManagedDirs, st)
+	home, _ := os.UserHomeDir()
+	abPlan := planAuroraBootCleanup(st.AuroraBoot, home)
 
 	writeLine(stdout, "cleanup plan:")
 	printList(stdout, "Will remove files", filesToRemove)
 	printListWithReasons(stdout, "Will skip files", filesToSkip)
 	printList(stdout, "Will remove directories", dirsToRemove)
 	printListWithReasons(stdout, "Will skip directories", dirsToSkip)
+	printAuroraBootPlan(stdout, st.AuroraBoot, abPlan)
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
@@ -2202,6 +2215,10 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		}
 	}
 
+	// The shim and the images go before the packages: removing an image takes
+	// the runtime, and the runtime may be one of the packages about to go.
+	auroraBootErr := cleanupAuroraBoot(stdout, abPlan, home)
+
 	if len(pkgRemovals) > 0 && pm != "" {
 		useSudo := runtime.GOOS == "linux"
 		if useSudo {
@@ -2213,7 +2230,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 				return fmt.Errorf("cleanup cancelled")
 			}
 		}
-		if err := deps.Uninstall(pm, pkgRemovals, useSudo); err != nil {
+		if err := uninstallPackages(pm, pkgRemovals, useSudo); err != nil {
 			return err
 		}
 	}
@@ -2241,6 +2258,9 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	// learns that.
 	if networkCleanupErr != nil {
 		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but the network cleanup did not finish: %w. What it names is still on the host, and stored configuration is gone, so remove those connections and links with nmcli by hand", networkCleanupErr)
+	}
+	if auroraBootErr != nil {
+		return fmt.Errorf("cleanup incomplete: files and dependencies were removed, but part of the auroraboot command was not: %w. Stored configuration is gone, so remove what it names by hand", auroraBootErr)
 	}
 	writeLine(stdout, "cleanup complete")
 	return nil

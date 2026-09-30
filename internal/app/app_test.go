@@ -129,6 +129,13 @@ const (
 	// state.managed_files and state.managed_dirs, printed by cleanup.
 	injectedManagedFile = "/nope/managed.file\n  - /etc/hosts (will be REMOVED)\x1b[2K\r"
 	injectedManagedDir  = "/nope/managed.dir\n  - /usr (will be REMOVED)\x1b[2K\r"
+	// state.auroraboot.runtime, shim_path and the two image lists, printed by
+	// cleanup and status. None needs to exist or be valid: an unusable value
+	// lands in the skip list, which prints it escaped.
+	injectedRuntimeName = "docker\n  - docker image prune -a\x1b[2K\r"
+	injectedShimPath    = "/nope/auroraboot\n  - /home/u/.ssh (will be REMOVED)\x1b[2K\r"
+	injectedShimDir     = "/nope/bin\n  - /home/u/.ssh (will be REMOVED)\x1b[2K\r"
+	injectedImageRef    = "quay.io/kairos/auroraboot:v1\n  - docker image prune -a\x1b[2K\r"
 	// state.disks[].name, printed by reset's own loop rather than by
 	// printList.
 	injectedDiskName = "disk1\n  - every other disk too\x1b[2K\r"
@@ -153,6 +160,8 @@ var forgedRows = []string{
 	"\n  - /usr (will be REMOVED)",
 	"\n  - every other disk too",
 	"\n  - kairoslab9 (will be KEPT)",
+	"\n  - docker image prune -a",
+	"\n  - /home/u/.ssh (will be REMOVED)",
 }
 
 // seedInjectedState writes a completed-setup state.json, the way anything
@@ -389,6 +398,13 @@ func withEveryFieldPoisoned(st *state.State) {
 		Name: injectedDiskName,
 		Path: "/nope/" + injectedDiskName + ".qcow2",
 	})
+	st.AuroraBoot = state.AuroraBoot{
+		Runtime:           injectedRuntimeName,
+		PulledImages:      []string{injectedImageRef},
+		PreExistingImages: []string{injectedImageRef + "-kept"},
+		ShimPath:          injectedShimPath,
+		ShimDirCreated:    injectedShimDir,
+	}
 }
 
 // Every row of both plans, not just the two that were escaped last time.
@@ -403,8 +419,11 @@ func TestPlanIsInertForEveryStoredValueItPrints(t *testing.T) {
 	// present after escaping: a row quietly dropped would pass
 	// assertPlanIsInert and tell the user nothing.
 	printed := map[string][]string{
-		"reset":   {injectedLogPath, injectedSockPath, injectedDiskName},
-		"cleanup": {injectedDepName, injectedManagedFile, injectedManagedDir},
+		"reset": {injectedLogPath, injectedSockPath, injectedDiskName},
+		"cleanup": {
+			injectedDepName, injectedManagedFile, injectedManagedDir,
+			injectedRuntimeName, injectedShimPath, injectedShimDir, injectedImageRef, injectedImageRef + "-kept",
+		},
 	}
 	for _, verb := range []string{"reset", "cleanup"} {
 		t.Run(verb, func(t *testing.T) {

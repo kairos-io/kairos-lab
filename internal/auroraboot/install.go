@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -110,18 +111,29 @@ func hasMarkerLine(b []byte) bool {
 
 // RemoveShim removes the shim at path. It removes nothing, and returns
 // ErrNotManaged, unless IsManagedShim holds. A path that is already gone is
-// not an error.
+// not an error. The errors it returns never carry the path.
 func RemoveShim(path string) error {
 	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if !IsManagedShim(path) {
-		return fmt.Errorf("%s: %w", path, ErrNotManaged)
+		return ErrNotManaged
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove %s: %w", path, err)
+		return bareError(err)
 	}
 	return nil
+}
+
+// bareError strips the path an *os.PathError carries. The path in a removal
+// comes out of state.json, so the caller prints it once, escaped, and the
+// copy inside the error would reach the terminal raw.
+func bareError(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	return err
 }
 
 // RemoveShimDirIfEmpty removes dir, and reports whether it did, only when dir
@@ -140,7 +152,7 @@ func RemoveShimDirIfEmpty(dir, home string) (bool, error) {
 		return false, nil
 	}
 	if err := os.Remove(dir); err != nil {
-		return false, fmt.Errorf("remove %s: %w", dir, err)
+		return false, bareError(err)
 	}
 	return true, nil
 }

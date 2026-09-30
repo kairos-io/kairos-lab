@@ -16,11 +16,12 @@ import (
 	"github.com/kairos-io/kairos-lab/internal/state"
 )
 
-// Swapped by tests: host platform detection and the package install, neither
-// of which a test may run for real.
+// Swapped by tests: host platform detection and the package install and
+// uninstall, none of which a test may run for real.
 var (
-	detectPlatform  = platform.Detect
-	installPackages = deps.Install
+	detectPlatform    = platform.Detect
+	installPackages   = deps.Install
+	uninstallPackages = deps.Uninstall
 )
 
 // auroraBootPullSize is what setup tells the user before pulling the image.
@@ -226,4 +227,153 @@ func dirOnPath(dir string) bool {
 		}
 	}
 	return false
+}
+
+// auroraBootPlan is what cleanup will do about the auroraboot command, worked
+// out from state.json. Every field of the stored record is untrusted, so a
+// value only reaches the removal lists after it has passed the same check the
+// removal itself relies on; everything else goes to skip with a reason.
+type auroraBootPlan struct {
+	shim    string
+	shimDir string
+	runtime string
+	images  []string
+	skip    map[string]string
+}
+
+func planAuroraBootCleanup(ab state.AuroraBoot, home string) auroraBootPlan {
+	plan := auroraBootPlan{skip: map[string]string{}}
+	if ab.ShimPath != "" {
+		switch _, err := os.Lstat(ab.ShimPath); {
+		case errors.Is(err, os.ErrNotExist):
+			plan.skip[ab.ShimPath] = "not found"
+		case !auroraboot.IsManagedShim(ab.ShimPath):
+			plan.skip[ab.ShimPath] = "not an auroraboot shim written by kairos-lab"
+		default:
+			plan.shim = ab.ShimPath
+		}
+	}
+	if ab.ShimDirCreated != "" {
+		if home != "" && ab.ShimDirCreated == auroraboot.ShimDir(home) {
+			plan.shimDir = ab.ShimDirCreated
+		} else {
+			plan.skip[ab.ShimDirCreated] = "not the directory setup creates"
+		}
+	}
+	if ab.Runtime != "" {
+		if auroraboot.ValidRuntime(ab.Runtime) {
+			plan.runtime = ab.Runtime
+		} else {
+			plan.skip[ab.Runtime] = "unsupported container runtime"
+		}
+	}
+	for _, ref := range ab.PulledImages {
+		switch {
+		case !auroraboot.ValidImageRef(ref):
+			plan.skip[ref] = "not an auroraboot image reference"
+		case plan.runtime == "":
+			plan.skip[ref] = "no supported runtime is recorded"
+		default:
+			plan.images = append(plan.images, ref)
+		}
+	}
+	return plan
+}
+
+func hasAuroraBootState(ab state.AuroraBoot) bool {
+	return ab.Runtime != "" || ab.ShimPath != "" || ab.ShimDirCreated != "" ||
+		len(ab.PulledImages) > 0 || len(ab.PreExistingImages) > 0
+}
+
+func printAuroraBootPlan(w io.Writer, ab state.AuroraBoot, plan auroraBootPlan) {
+	if !hasAuroraBootState(ab) {
+		return
+	}
+	printList(w, "Will remove auroraboot shim", nonEmptyStrings(plan.shim))
+	if plan.shimDir != "" {
+		printList(w, "Will remove the shim directory (only if empty)", []string{plan.shimDir})
+	}
+	title := "Will remove images"
+	if plan.runtime != "" {
+		title += " (" + plan.runtime + ")"
+	}
+	printList(w, title, plan.images)
+	if len(ab.PreExistingImages) > 0 {
+		printList(w, "Will keep images (pre-existing)", ab.PreExistingImages)
+	}
+	if len(plan.skip) > 0 {
+		printListWithReasons(w, "Will skip auroraboot items", plan.skip)
+	}
+}
+
+func nonEmptyStrings(values ...string) []string {
+	out := []string{}
+	for _, v := range values {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// cleanupAuroraBoot carries out plan: the shim, its directory when it is empty,
+// then the images. It runs before the packages are uninstalled because the
+// images need the runtime. Nothing here stops the rest of cleanup; failures
+// are returned together for the caller to report at the end.
+func cleanupAuroraBoot(stdout io.Writer, plan auroraBootPlan, home string) error {
+	var errs []error
+	if plan.shim != "" {
+		writef(stdout, "Removing auroraboot shim: %s\n", planValue(plan.shim))
+		if err := auroraboot.RemoveShim(plan.shim); err != nil {
+			writef(stdout, "warning: could not remove %s: %v\n", planValue(plan.shim), err)
+			errs = append(errs, fmt.Errorf("shim: %w", err))
+		}
+	}
+	if plan.shimDir != "" {
+		if removed, err := auroraboot.RemoveShimDirIfEmpty(plan.shimDir, home); err != nil {
+			writef(stdout, "warning: could not remove %s: %v\n", planValue(plan.shimDir), err)
+			errs = append(errs, fmt.Errorf("shim directory: %w", err))
+		} else if removed {
+			writef(stdout, "Removing directory: %s\n", planValue(plan.shimDir))
+		}
+	}
+	for _, ref := range plan.images {
+		writef(stdout, "Removing image %s (%s)\n", ref, plan.runtime)
+		if err := removeTrackedImage(stdout, plan.runtime, ref); err != nil {
+			writef(stdout, "warning: could not remove image %s: %v\n", ref, err)
+			errs = append(errs, fmt.Errorf("image %s: %w", ref, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// removeTrackedImage removes ref with runtime rt. A runtime that does not
+// work is an error rather than "the image is gone": from outside there is no
+// telling the two apart, and cleanup is about to delete the record of it.
+func removeTrackedImage(stdout io.Writer, rt, ref string) error {
+	ctx := context.Background()
+	if name, _, reason := auroraboot.DetectRuntime(rt); name != rt {
+		return fmt.Errorf("%s is not usable: %s", rt, reason)
+	}
+	exists, err := auroraboot.ImageExists(ctx, rt, ref)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		writeLine(stdout, "  already gone")
+		return nil
+	}
+	return auroraboot.RemoveImage(ctx, rt, ref, stdout)
+}
+
+// runtimeDepsFor returns the runtime dependencies that can be uninstalled with
+// pm, for looking up the packages of a runtime setup installed.
+func runtimeDepsFor(pm string) []deps.Dependency {
+	var out []deps.Dependency
+	for _, d := range []deps.Dependency{deps.Docker(), deps.Podman()} {
+		if _, ok := d.InstallPackages[pm]; ok {
+			out = append(out, d)
+		}
+	}
+	return out
 }
