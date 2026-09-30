@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/kairos-io/kairos-lab/internal/auroraboot"
 	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/deps"
 	"github.com/kairos-io/kairos-lab/internal/iso"
@@ -105,22 +106,27 @@ func rejectPositionalArgs(fs *flag.FlagSet, hint string) error {
 func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	autoYes := fs.Bool("yes", false, "auto-confirm installs and sudo operations")
+	noAuroraBoot := fs.Bool("no-auroraboot", false, "do not provide the auroraboot command")
+	runtimeFlag := fs.String("runtime", "", "container runtime for the auroraboot command: docker or podman (default: the first one that works, else docker)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := rejectPositionalArgs(fs, ""); err != nil {
 		return err
 	}
+	if *runtimeFlag != "" && !auroraboot.ValidRuntime(*runtimeFlag) {
+		return fmt.Errorf("invalid -runtime %q: use docker or podman", *runtimeFlag)
+	}
 
-	writeLine(stdout, "[1/4] Detecting platform and package manager")
+	writeLine(stdout, "[1/5] Detecting platform and package manager")
 	st, err := store.Load()
 	if err != nil {
 		return err
 	}
-	p := platform.Detect()
+	p := detectPlatform()
 	st.Platform = state.Platform{OS: p.OS, Arch: p.Arch, PackageManager: p.PackageManager}
 
-	writeLine(stdout, "[2/4] Checking required dependencies")
+	writeLine(stdout, "[2/5] Checking required dependencies")
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
@@ -153,20 +159,36 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 				return fmt.Errorf("sudo permission denied")
 			}
 		}
-		writeLine(stdout, "[3/4] Installing missing dependencies")
-		if err := deps.Install(p.PackageManager, pkgs, useSudo); err != nil {
+		writeLine(stdout, "[3/5] Installing missing dependencies")
+		if err := installPackages(p.PackageManager, pkgs, useSudo); err != nil {
 			return err
 		}
 		st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, missingNames)
+		// Saved now rather than at the end: the packages are on the machine
+		// whatever happens next, and cleanup can only remove what state names.
+		if err := store.Save(st); err != nil {
+			return err
+		}
 	} else {
-		writeLine(stdout, "[3/4] All dependencies already present")
+		writeLine(stdout, "[3/5] All dependencies already present")
 	}
 
-	writeLine(stdout, "[4/4] Writing state")
+	writeLine(stdout, "[4/5] Writing state")
 	st.Setup.DependencyCheckPassed = true
 	st.Setup.CompletedAt = state.NowRFC3339()
 	if err := store.Save(st); err != nil {
 		return err
+	}
+
+	// After the state is written, so a failure here cannot leave the VM
+	// workflow unusable.
+	if *noAuroraBoot {
+		writeLine(stdout, "[5/5] Skipping the auroraboot command (-no-auroraboot)")
+	} else {
+		writeLine(stdout, "[5/5] Setting up the auroraboot command")
+		if err := setupAuroraBoot(stdin, stdout, *autoYes, *runtimeFlag, p, st, store); err != nil {
+			return fmt.Errorf("the qemu dependencies are set up, but the auroraboot command is not: %w", err)
+		}
 	}
 	writef(stdout, "setup complete (%s/%s, pkg manager: %s)\n", p.OS, p.Arch, p.PackageManager)
 	return nil
@@ -2233,7 +2255,7 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  kairos-lab start                Boot existing disk (after install)")
 	writeLine(w, "")
 	writeLine(w, "Commands:")
-	writeLine(w, "  setup                Detect/install dependencies")
+	writeLine(w, "  setup [flags]        Detect/install dependencies and the auroraboot command")
 	writeLine(w, "  download             Download a Kairos ISO (interactive selection)")
 	writeLine(w, "  start [flags]        Boot VM (select/create disk, optionally attach ISO)")
 	writeLine(w, "  status               Show state and runtime information")
@@ -2270,6 +2292,11 @@ func printUsage(w io.Writer) {
 	writeLine(w, "  -iso <path>          Use specific ISO file")
 	writef(w, "  -network <mode>      %s\n", modeUsageDescription("Network mode", networkModes, defaultNetworkMode))
 	writef(w, "  -display <mode>      %s\n", modeUsageDescription("Display mode", displayModes, defaultDisplayMode))
+	writeLine(w, "")
+	writeLine(w, "Setup flags:")
+	writeLine(w, "  -yes                 Auto-confirm installs, sudo and the image pull")
+	writeLine(w, "  -runtime <name>      Container runtime for auroraboot: docker|podman")
+	writeLine(w, "  -no-auroraboot       Do not provide the auroraboot command")
 	writeLine(w, "")
 	writeLine(w, "Exit VM with Ctrl-a x (QEMU serial console quit)")
 }
