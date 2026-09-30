@@ -315,8 +315,18 @@ func TestShimRefusesReservedCWD(t *testing.T) {
 		if res.argv != nil {
 			t.Errorf("cwd %s: the runtime was called: %q", cwd, res.argv)
 		}
-		if !strings.Contains(res.stderr, cwd) {
-			t.Errorf("cwd %s: stderr %q does not name it", cwd, res.stderr)
+		// The message names the directory as resolved too, and on macOS
+		// /etc resolves to /private/etc, so either spelling will do.
+		names := []string{cwd}
+		if phys, err := filepath.EvalSymlinks(cwd); err == nil {
+			names = append(names, phys)
+		}
+		named := false
+		for _, n := range names {
+			named = named || strings.Contains(res.stderr, n)
+		}
+		if !named {
+			t.Errorf("cwd %s: stderr %q names none of %q", cwd, res.stderr, names)
 		}
 	}
 	colon := filepath.Join(tempDir(t), "a:b")
@@ -625,4 +635,144 @@ func TestShimPathRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// reservedFunc returns the is_reserved function out of the shim, for tests
+// that exercise the list itself.
+func reservedFunc(t *testing.T) string {
+	t.Helper()
+	start := strings.Index(shimTemplate, "is_reserved() {")
+	if start < 0 {
+		t.Fatal("is_reserved not found in the shim")
+	}
+	end := strings.Index(shimTemplate[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("end of is_reserved not found in the shim")
+	}
+	return "nl='\n'\n" + shimTemplate[start:start+end+3]
+}
+
+func TestShimReservedList(t *testing.T) {
+	fn := reservedFunc(t)
+	check := func(path string) bool {
+		t.Helper()
+		err := exec.Command("sh", "-c", fn+"\nis_reserved \"$1\"", "sh", path).Run()
+		var ee *exec.ExitError
+		if err != nil && !errors.As(err, &ee) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	for _, p := range []string{
+		"/", "/tmp", "/etc", "/etc/x", "/usr/bin", "/bin", "/lib64", "/var/run/docker", "/run/user", "/proc/1", "/sys", "/dev/null", "/boot", "/sbin", "/amd", "/arm/x", "/riscv64",
+		"/private/etc", "/private/etc/ssl", "/private/tmp", "/private/var/run", "/private/var/run/x",
+		"/System", "/System/Library", "/Library", "/Library/x", "/Applications", "/Applications/x.app",
+		"//etc", "//private/etc", "//usr/bin", "/a:b", "/a,b", "/a\nb",
+	} {
+		if !check(p) {
+			t.Errorf("%q is not reserved, want reserved", p)
+		}
+	}
+	for _, p := range []string{
+		"/tmp/work", "/private/tmp/work", "/private/var/folders/x", "/private/var/folders/ab/cd/T/x",
+		"/Users/me", "/Users/me/work", "/Volumes/disk", "/home/me", "/opt/x", "/srv/x", "/var/lib/x",
+	} {
+		if check(p) {
+			t.Errorf("%q is reserved, want allowed", p)
+		}
+	}
+}
+
+// symlinkTo makes dir/name a symlink to target and returns its path.
+func symlinkTo(t *testing.T, dir, name, target string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.Symlink(target, p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// On macOS /etc is itself a link to /private/etc, so a system directory is
+// reached through a link there. These use links of our own to the same
+// places, in a working directory that is itself reached through a link.
+func TestShimReservedThroughSymlinks(t *testing.T) {
+	for _, target := range []string{"/etc", "/usr"} {
+		if _, err := os.Stat(target); err != nil {
+			continue
+		}
+		root := tempDir(t)
+		link := symlinkTo(t, root, "sys", target)
+		work := filepath.Join(root, "work")
+		if err := os.Mkdir(work, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		viaLink := symlinkTo(t, root, "workln", work)
+
+		// (a) as the working directory.
+		res := runShim(t, "linux", "docker", shimOpts{}, link, "genkey")
+		if res.exit != 2 || res.argv != nil {
+			t.Errorf("cwd %s: exit=%d argv=%q, want exit 2 and no run", link, res.exit, res.argv)
+		}
+		// (b) as a table-flag input, from a plain and from a linked cwd.
+		for _, cwd := range []string{work, viaLink} {
+			res = runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--cloud-config", link, "img")
+			if res.exit != 2 || res.argv != nil {
+				t.Errorf("cwd %s, input %s: exit=%d argv=%q, want exit 2 and no run", cwd, link, res.exit, res.argv)
+			}
+			// (c) as a generic token: skipped, nothing mounted.
+			res = runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", "o", link, "img")
+			if res.exit != 0 {
+				t.Errorf("cwd %s, token %s: exit=%d, want 0; stderr %s", cwd, link, res.exit, res.stderr)
+				continue
+			}
+			if m := mountedPaths(res.argv, work); len(m) != 0 {
+				t.Errorf("cwd %s, token %s: mounted %q, want nothing", cwd, link, m)
+			}
+		}
+	}
+}
+
+// A link that sits directly in / and has a relative target, /bin -> usr/bin on
+// most Linux hosts and /etc -> private/etc on macOS, used to resolve to
+// //usr/bin: not on the reserved list, and mounted as such.
+func TestShimNeverMountsADoubleSlashPath(t *testing.T) {
+	var links []string
+	for _, p := range []string{"/bin", "/sbin", "/lib", "/etc", "/tmp", "/var"} {
+		if fi, err := os.Lstat(p); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			links = append(links, p)
+		}
+	}
+	if len(links) == 0 {
+		t.Skip("no symlink directly under / to test with")
+	}
+	root := tempDir(t)
+	cwd := filepath.Join(root, "work")
+	if err := os.Mkdir(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	noDouble := func(what string, argv []string) {
+		t.Helper()
+		for i, a := range argv {
+			if i > 0 && argv[i-1] == "-v" && (strings.HasPrefix(a, "//") || strings.Contains(a, ":/"+"/")) {
+				t.Errorf("%s: mount argument %q has a doubled slash", what, a)
+			}
+		}
+	}
+	for _, l := range links {
+		res := runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", "o", l, "img")
+		noDouble("generic "+l, res.argv)
+		if m := mountedPaths(res.argv, cwd); len(m) != 0 {
+			t.Errorf("generic token %s: mounted %q, want nothing", l, m)
+		}
+		res = runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--cloud-config", l, "img")
+		noDouble("input "+l, res.argv)
+		if l != "/tmp" && l != "/var" && (res.exit != 2 || res.argv != nil) {
+			t.Errorf("input %s: exit=%d argv=%q, want exit 2 and no run", l, res.exit, res.argv)
+		}
+	}
+	// And for an ordinary run, no mount argument ever starts with two slashes.
+	other := tempDir(t)
+	res := runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", other+"/out", "dir:"+other, "img")
+	noDouble("ordinary", res.argv)
 }

@@ -27,15 +27,26 @@ die() {
 
 # is_reserved reports whether a path must never be mounted into the container:
 # it would shadow something the image itself needs, or it cannot be written as
-# a -v argument.
+# a -v argument. Callers check a path both as written and after symlinks are
+# resolved: on macOS /etc, /tmp and /var are links into /private, so the
+# resolved spelling of a system directory is not the one people type.
 is_reserved() {
-	case $1 in
+	r=$1
+	while :; do
+		case $r in
+		//*) r=${r#/} ;;
+		*) break ;;
+		esac
+	done
+	case $r in
 	*:* | *,* | *"$nl"*) return 0 ;;
 	/ | /tmp) return 0 ;;
 	/bin | /bin/* | /boot | /boot/* | /dev | /dev/* | /etc | /etc/*) return 0 ;;
 	/lib | /lib/* | /lib64 | /lib64/* | /proc | /proc/* | /run | /run/*) return 0 ;;
 	/sbin | /sbin/* | /sys | /sys/* | /usr | /usr/* | /var/run | /var/run/*) return 0 ;;
 	/amd | /amd/* | /arm | /arm/* | /riscv64 | /riscv64/*) return 0 ;;
+	/private/etc | /private/etc/* | /private/tmp | /private/var/run | /private/var/run/*) return 0 ;;
+	/System | /System/* | /Library | /Library/* | /Applications | /Applications/*) return 0 ;;
 	esac
 	return 1
 }
@@ -194,7 +205,14 @@ resolve_existing() {
 		t=$(readlink "$f") || return 1
 		case $t in
 		/*) f=$t ;;
-		*) f=$(dirname "$f")/$t ;;
+		*)
+			f=$(dirname "$f")
+			if [ "$f" = / ]; then
+				f=/$t
+			else
+				f=$f/$t
+			fi
+			;;
 		esac
 		n=$((n + 1))
 	done
@@ -257,6 +275,13 @@ add_path() {
 	/*) a=$v ;;
 	*) a=$cwd/$v ;;
 	esac
+	# Never let a doubled leading slash through into a mount argument.
+	while :; do
+		case $a in
+		//*) a=${a#/} ;;
+		*) break ;;
+		esac
+	done
 	created=0
 	if [ -e "$a" ] || [ -L "$a" ]; then
 		p=$(resolve_existing "$a") || return 0
@@ -269,9 +294,9 @@ add_path() {
 	if is_under "$p" "$cwd"; then
 		return 0
 	fi
-	if is_reserved "$p"; then
+	if is_reserved "$a" || is_reserved "$p"; then
 		if [ "$3" = strict ]; then
-			die "refusing to mount $p: it cannot be shared with the container"
+			die "refusing to mount $a (resolves to $p): it cannot be shared with the container"
 		fi
 		return 0
 	fi
@@ -340,8 +365,9 @@ scan_args() {
 }
 
 cwd=$(pwd -P) || die 'cannot resolve the current directory'
-if is_reserved "$cwd"; then
-	die "refusing to run in $cwd: it cannot be mounted into the container"
+logical=$(pwd)
+if is_reserved "$cwd" || is_reserved "$logical"; then
+	die "refusing to run in $logical ($cwd): it cannot be mounted into the container"
 fi
 
 subcommand=$(find_subcommand "$@")
