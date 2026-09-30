@@ -303,6 +303,9 @@ func TestResetReportsAFailedNetworkCleanup(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", cfg)
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	store := seedInjectedState(t, withNetworkNames(injectedBridgeName, ""))
+	// The refusal under test is vm's own, so this one runs the real teardown.
+	// The bridge name is malformed, which is what keeps that off the host.
+	useRealNetworkTeardown(t)
 
 	// A file reset is supposed to remove, to pin that the failure above does
 	// not abort the rest of the command.
@@ -356,6 +359,9 @@ func TestCleanupReportsAFailedNetworkCleanup(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 	seedInjectedState(t, withNetworkNames(injectedBridgeName, ""))
+	// Same as the reset case above: vm's refusal is the subject, and the
+	// malformed name is what makes running the real teardown safe here.
+	useRealNetworkTeardown(t)
 
 	var stdout, stderr bytes.Buffer
 	err := Run([]string{"cleanup", "-yes"}, strings.NewReader(""), &stdout, &stderr, "test")
@@ -5404,5 +5410,182 @@ func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
 	})
 	if !strings.Contains(out, "  vm ip address: none\n") {
 		t.Errorf("status did not report user mode's address as none:\n%s", out)
+	}
+}
+
+// productionNetworkTeardown captures what the app package wires the network
+// teardown seams to before TestMain below replaces them.
+//
+// Package-level initialisation runs before TestMain, and Go orders it by
+// dependency, so these three read the real functions from app.go and not the
+// stubs. TestNetworkTeardownSeamsAreTheRealFunctions is what turns that into
+// an assertion.
+var (
+	productionHasStaleNetworkResources     = hasStaleNetworkResources
+	productionCleanupStaleNetworkResources = cleanupStaleNetworkResources
+	productionCleanupLinuxBridge           = cleanupLinuxBridge
+)
+
+// TestMain takes the whole package off the host's network before a single
+// test runs.
+//
+// `reset` and `cleanup` ask vm.HasStaleNetworkResources whether the bridge
+// and the nmcli profiles named in state still exist, and remove them if they
+// do. On CI the answer is always no, so the suite is green and says nothing.
+// On a developer's machine that has actually used kairos-lab the answer is
+// yes, and with passwordless sudo `go test ./internal/app/` then ran
+// `sudo nmcli connection delete kairoslab0` and `sudo ip link delete
+// kairoslab0` against their own network. See kairos-io/kairos#5059.
+//
+// Defaulting the probe to "no stale resources" is what CI already sees, so
+// no existing expectation moves; defaulting the two teardowns to a recorded
+// no-op keeps the branch gated on CreatedByKairosLab reachable without
+// letting it out of the process. A test that wants the real teardown has to
+// say so through useRealNetworkTeardown, which documents why its own state
+// makes that safe.
+func TestMain(m *testing.M) {
+	hasStaleNetworkResources = func(*state.State) bool { return false }
+	cleanupStaleNetworkResources = func(*state.State) error { return nil }
+	cleanupLinuxBridge = func(*state.State, state.VM, bool) error { return nil }
+	os.Exit(m.Run())
+}
+
+// useRealNetworkTeardown puts the real vm teardown back for one test.
+//
+// It is only sound for a state whose stored bridge name cannot be resolved --
+// vm refuses a malformed name before it probes or touches anything, which is
+// the property the tests that call this already rely on and say so in their
+// own comments. Calling it with a well-formed name hands the test the host,
+// which is the whole of kairos-io/kairos#5059.
+func useRealNetworkTeardown(t *testing.T) {
+	t.Helper()
+	savedStale, savedBridge := cleanupStaleNetworkResources, cleanupLinuxBridge
+	t.Cleanup(func() {
+		cleanupStaleNetworkResources, cleanupLinuxBridge = savedStale, savedBridge
+	})
+	cleanupStaleNetworkResources = productionCleanupStaleNetworkResources
+	cleanupLinuxBridge = productionCleanupLinuxBridge
+}
+
+// The seams have to BE the vm functions, not closures around them, for the
+// same reason the Wi-Fi and bridge-interface seams above do: every test in
+// this file replaces them, so if the production wiring drifts to something
+// else the tests keep passing while a real run does something they never
+// exercised.
+func TestNetworkTeardownSeamsAreTheRealFunctions(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"hasStaleNetworkResources", productionHasStaleNetworkResources, vm.HasStaleNetworkResources},
+		{"cleanupStaleNetworkResources", productionCleanupStaleNetworkResources, vm.CleanupStaleNetworkResources},
+		{"cleanupLinuxBridge", productionCleanupLinuxBridge, vm.CleanupLinuxBridge},
+	} {
+		if reflect.ValueOf(c.got).Pointer() != reflect.ValueOf(c.want).Pointer() {
+			t.Errorf("the app layer's %s seam is not vm.%s, so what a real run does is not what the tests pin", c.name, strings.ToUpper(c.name[:1])+c.name[1:])
+		}
+	}
+}
+
+// The regression test for kairos-io/kairos#5059 itself.
+//
+// A well-formed bridge name is the case the refusal tests deliberately avoid,
+// and it is the one a developer's machine is always in. Every teardown call
+// reset and cleanup can make has to land on this package's seam and stop
+// there; the next thing vm does is sudo.
+//
+// All five call sites are here on purpose. Four of them were reachable by no
+// test at all when the seams went in, so a later edit could have put any one
+// of them back on the host without turning the suite red.
+func TestTeardownCallSitesAllStopAtTheSeam(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the network teardown only runs on linux")
+	}
+	for _, c := range []struct {
+		name      string
+		args      []string
+		stdin     string
+		seed      func(*state.State)
+		stale     bool
+		wantBridg []string
+		wantStale int
+	}{
+		{
+			name: "reset tears down the bridge it created",
+			args: []string{"reset"}, stdin: "y\n",
+			seed: withNetworkNames("kairoslab0", "kairoslab-tap0"),
+			// The single seeded VM is the last one, so siblingLive is false
+			// and this is the call that takes the shared bridge down.
+			wantBridg: []string{testVMName + "/false"},
+		},
+		{
+			name:      "cleanup tears down the bridge it created",
+			args:      []string{"cleanup", "-yes"},
+			seed:      withNetworkNames("kairoslab0", "kairoslab-tap0"),
+			wantBridg: []string{testVMName + "/false"},
+		},
+		{
+			// The no-VM arm: a state reached by hand-editing, which falls
+			// back to index 0 with an empty VM record.
+			name:      "cleanup with no VM record falls back to index 0",
+			args:      []string{"cleanup", "-yes"},
+			seed:      withNetworkNames("kairoslab0", ""),
+			wantBridg: []string{"/false"},
+		},
+		{
+			name: "reset tears down stale resources it did not create",
+			args: []string{"reset"}, stdin: "y\n",
+			seed: func(st *state.State) {
+				withNetworkNames("kairoslab0", "kairoslab-tap0")(st)
+				st.Network.CreatedByKairosLab = false
+			},
+			stale:     true,
+			wantStale: 1,
+		},
+		{
+			name: "cleanup tears down stale resources it did not create",
+			args: []string{"cleanup", "-yes"},
+			seed: func(st *state.State) {
+				withNetworkNames("kairoslab0", "kairoslab-tap0")(st)
+				st.Network.CreatedByKairosLab = false
+			},
+			stale:     true,
+			wantStale: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			seedInjectedState(t, c.seed)
+			stubStaleNetwork(t, c.stale)
+
+			var bridge []string
+			var stale int
+			savedBridge, savedStale := cleanupLinuxBridge, cleanupStaleNetworkResources
+			t.Cleanup(func() {
+				cleanupLinuxBridge, cleanupStaleNetworkResources = savedBridge, savedStale
+			})
+			cleanupLinuxBridge = func(_ *state.State, v state.VM, siblingLive bool) error {
+				bridge = append(bridge, fmt.Sprintf("%s/%t", v.Name, siblingLive))
+				return nil
+			}
+			cleanupStaleNetworkResources = func(*state.State) error { stale++; return nil }
+
+			var stdout, stderr bytes.Buffer
+			_ = Run(c.args, strings.NewReader(c.stdin), &stdout, &stderr, "test")
+
+			// Non-vacuity: without this every assertion below is satisfied by
+			// a run that stopped before the teardown block entirely.
+			if !strings.Contains(stdout.String(), "Cleaning up") {
+				t.Fatalf("the flow stopped before the teardown, so nothing was exercised:\n%s", stdout.String())
+			}
+			if !slices.Equal(bridge, c.wantBridg) {
+				t.Errorf("bridge teardown ran as %v, want %v", bridge, c.wantBridg)
+			}
+			if stale != c.wantStale {
+				t.Errorf("stale teardown ran %d times, want %d", stale, c.wantStale)
+			}
+		})
 	}
 }
