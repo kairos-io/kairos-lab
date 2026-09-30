@@ -734,6 +734,55 @@ func TestRunningLineIsInertForAStoredDiskPath(t *testing.T) {
 	}
 }
 
+// A disk record written before memory_gb and cpus existed loads with both at
+// zero: state.Disk gained the two fields after the record itself, they are
+// `omitempty`, and nothing migrates an old state.json. runStart reseeds the
+// flags from the disk only when the saved value is positive, and those two
+// `> 0` checks are the only thing standing between such a record and a VM
+// started as `-m 0 -smp 0`.
+//
+// The checks were unguarded: with `disk.MemoryGB > 0 &&` and `disk.CPUs > 0 &&`
+// removed from the two conditions, `go test ./...` passed in every package.
+// seedStartableState writes exactly the old-style record -- name, path, size
+// and CreatedAt, no memory_gb, no cpus -- so the gap was never about a missing
+// fixture, only about nobody reading the command line the run prints.
+func TestStartKeepsTheDefaultsForADiskRecordedWithoutMemoryOrCPUs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("this test reads the qemu command a Linux start prints, and %s is not Linux: on darwin the run needs a firmware path from `brew --prefix qemu` before it gets that far, and this test's isolation from host binaries denies it one", runtime.GOOS)
+	}
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+	isolateFromHostBinaries(t)
+	stubLinuxARM64Firmware(t)
+	seedStartableState(t, "kairos-disk0")
+
+	var stdout, stderr bytes.Buffer
+	runErr := Run([]string{"start", "-name", "kairos-disk0", "-no-iso", "-network", "user", "-yes"},
+		strings.NewReader(""), &stdout, &stderr, "test")
+	out := stdout.String()
+	if runErr == nil || !strings.Contains(runErr.Error(), "start qemu") {
+		t.Fatalf("start returned %v, want it to have printed the command and then failed to launch it; stdout:\n%s", runErr, out)
+	}
+	if !strings.Contains(out, "Running: ") {
+		t.Fatalf("the run never printed the command line, so nothing was exercised:\n%s", out)
+	}
+
+	// The flag defaults, read the way runStart's own flag set declares them,
+	// so this stays true on a host where defaultMemoryMB differs.
+	wantMemory := fmt.Sprintf("-m %d", defaultMemoryMB())
+	const wantCPUs = "-smp 2"
+
+	if strings.Contains(out, "-m 0") || strings.Contains(out, "-smp 0") {
+		t.Fatalf("a disk saved without memory_gb/cpus reseeded the flags with its zeroes, so qemu is asked for no memory and no vCPUs:\n%s", out)
+	}
+	if !strings.Contains(out, wantMemory) {
+		t.Errorf("qemu was not given the default memory %q:\n%s", wantMemory, out)
+	}
+	if !strings.Contains(out, wantCPUs) {
+		t.Errorf("qemu was not given the default vCPU count %q:\n%s", wantCPUs, out)
+	}
+}
+
 // The removal echo and its error sibling both carry a stored path, and both
 // run AFTER the consent prompt -- so neither is the consent vector, and that
 // is exactly why they went unguarded twice. The escape at those call sites
