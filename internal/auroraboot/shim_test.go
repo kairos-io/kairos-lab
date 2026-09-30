@@ -664,7 +664,7 @@ func TestShimReservedList(t *testing.T) {
 		return err == nil
 	}
 	for _, p := range []string{
-		"/", "/tmp", "/etc", "/etc/x", "/usr/bin", "/bin", "/lib64", "/var/run/docker", "/run/user", "/proc/1", "/sys", "/dev/null", "/boot", "/sbin", "/amd", "/arm/x", "/riscv64",
+		"/", "/tmp", "/var", "/private", "/private/var", "/etc", "/etc/x", "/usr/bin", "/bin", "/lib64", "/var/run/docker", "/run/user", "/proc/1", "/sys", "/dev/null", "/boot", "/sbin", "/amd", "/arm/x", "/riscv64",
 		"/private/etc", "/private/etc/ssl", "/private/tmp", "/private/var/run", "/private/var/run/x",
 		"/System", "/System/Library", "/Library", "/Library/x", "/Applications", "/Applications/x.app",
 		"//etc", "//private/etc", "//usr/bin", "/a:b", "/a,b", "/a\nb",

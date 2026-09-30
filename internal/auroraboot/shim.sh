@@ -40,12 +40,12 @@ is_reserved() {
 	done
 	case $r in
 	*:* | *,* | *"$nl"*) return 0 ;;
-	/ | /tmp) return 0 ;;
+	/ | /tmp | /var) return 0 ;;
 	/bin | /bin/* | /boot | /boot/* | /dev | /dev/* | /etc | /etc/*) return 0 ;;
 	/lib | /lib/* | /lib64 | /lib64/* | /proc | /proc/* | /run | /run/*) return 0 ;;
 	/sbin | /sbin/* | /sys | /sys/* | /usr | /usr/* | /var/run | /var/run/*) return 0 ;;
 	/amd | /amd/* | /arm | /arm/* | /riscv64 | /riscv64/*) return 0 ;;
-	/private/etc | /private/etc/* | /private/tmp | /private/var/run | /private/var/run/*) return 0 ;;
+	/private | /private/var | /private/etc | /private/etc/* | /private/tmp | /private/var/run | /private/var/run/*) return 0 ;;
 	/System | /System/* | /Library | /Library/* | /Applications | /Applications/*) return 0 ;;
 	esac
 	return 1
