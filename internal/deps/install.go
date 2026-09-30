@@ -42,6 +42,8 @@ func installCommands(pm string, pkgs []string, useSudo bool) ([][]string, error)
 	switch pm {
 	case "brew":
 		return [][]string{append([]string{"brew", "install"}, pkgs...)}, nil
+	case BrewCask:
+		return [][]string{append([]string{"brew", "install", "--cask"}, pkgs...)}, nil
 	case "apt":
 		return [][]string{
 			append(append([]string{}, pre...), "apt-get", "update"),
@@ -68,6 +70,8 @@ func uninstallCommand(pm string, pkgs []string, useSudo bool) ([]string, error) 
 	switch pm {
 	case "brew":
 		return append(pre, append([]string{"brew", "uninstall"}, pkgs...)...), nil
+	case BrewCask:
+		return append(pre, append([]string{"brew", "uninstall", "--cask"}, pkgs...)...), nil
 	case "apt":
 		return append(pre, append([]string{"apt-get", "remove", "-y"}, pkgs...)...), nil
 	case "dnf", "yum":

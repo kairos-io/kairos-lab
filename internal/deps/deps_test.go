@@ -132,6 +132,7 @@ var packageProviders = map[string]map[string][]string{
 		"brew":   {"qemu"},
 	},
 	"docker": {
+		"brew":   {"docker-desktop"},
 		"apt":    {"docker.io"},
 		"dnf":    {"moby-engine", "docker-ce"},
 		"yum":    {"docker", "docker-ce"},
@@ -140,6 +141,7 @@ var packageProviders = map[string]map[string][]string{
 		"apk":    {"docker"},
 	},
 	"podman": {
+		"brew":   {"podman"},
 		"apt":    {"podman"},
 		"dnf":    {"podman"},
 		"yum":    {"podman"},
@@ -239,5 +241,44 @@ func TestRuntimeDepsNotInRequired(t *testing.T) {
 				t.Errorf("%s/%s: Required includes %q, which setup must only install on request", info.OS, info.Arch, dep.Name)
 			}
 		}
+	}
+}
+
+func TestRuntimeDepsBrewUsesCaskForDockerOnly(t *testing.T) {
+	docker, podman := Docker(), Podman()
+	if pkgs, err := InstallablePackages("brew", []Dependency{docker}); err != nil || !slices.Equal(pkgs, []string{"docker-desktop"}) {
+		t.Errorf("docker on brew = %v, %v; want [docker-desktop]", pkgs, err)
+	}
+	if pkgs, err := InstallablePackages("brew", []Dependency{podman}); err != nil || !slices.Equal(pkgs, []string{"podman"}) {
+		t.Errorf("podman on brew = %v, %v; want [podman]", pkgs, err)
+	}
+	if got := docker.ManagerFor("brew"); got != BrewCask {
+		t.Errorf("docker manager on brew = %q, want %q", got, BrewCask)
+	}
+	if got := docker.ManagerFor("apt"); got != "apt" {
+		t.Errorf("docker manager on apt = %q, want apt", got)
+	}
+	if got := podman.ManagerFor("brew"); got != "brew" {
+		t.Errorf("podman manager on brew = %q, want brew", got)
+	}
+}
+
+func TestBrewCaskCommands(t *testing.T) {
+	inst, err := installCommands(BrewCask, []string{"docker-desktop"}, false)
+	if err != nil || len(inst) != 1 || !slices.Equal(inst[0], []string{"brew", "install", "--cask", "docker-desktop"}) {
+		t.Errorf("cask install = %v, %v", inst, err)
+	}
+	un, err := uninstallCommand(BrewCask, []string{"docker-desktop"}, false)
+	if err != nil || !slices.Equal(un, []string{"brew", "uninstall", "--cask", "docker-desktop"}) {
+		t.Errorf("cask uninstall = %v, %v", un, err)
+	}
+	// The formula path is unchanged.
+	inst, _ = installCommands("brew", []string{"qemu"}, false)
+	if !slices.Equal(inst[0], []string{"brew", "install", "qemu"}) {
+		t.Errorf("formula install = %v", inst)
+	}
+	un, _ = uninstallCommand("brew", []string{"qemu"}, false)
+	if !slices.Equal(un, []string{"brew", "uninstall", "qemu"}) {
+		t.Errorf("formula uninstall = %v", un)
 	}
 }
