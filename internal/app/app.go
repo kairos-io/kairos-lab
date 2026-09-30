@@ -2095,12 +2095,21 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	// never part of them: setup installs one only on request.
 	removable := append(append([]deps.Dependency{}, required...), runtimeDepsFor(pm)...)
 	pkgRemovals := []string{}
+	caskRemovals := []string{}
 	if len(removeDeps) > 0 && pm != "" {
-		pkgRemovals, err = deps.UninstallablePackages(pm, removeDeps, removable)
+		// A runtime that brew installed as a cask is uninstalled with
+		// --cask, so it is looked up and reported apart from the formulas.
+		caskNames, formulaNames := splitCaskNames(pm, removeDeps)
+		pkgRemovals, err = deps.UninstallablePackages(pm, formulaNames, removable)
+		if err != nil {
+			return err
+		}
+		caskRemovals, err = deps.UninstallablePackages(pm, caskNames, runtimeDepsFor(pm))
 		if err != nil {
 			return err
 		}
 	}
+	podmanRemoved := slices.Contains(removeDeps, "podman") && len(pkgRemovals) > 0 && pm == "brew"
 
 	filesToRemove, filesToSkip := splitRemovalPaths(st.ManagedFiles, st)
 	dirsToRemove, dirsToSkip := splitRemovalPaths(st.ManagedDirs, st)
@@ -2114,6 +2123,12 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	printListWithReasons(stdout, "Will skip directories", dirsToSkip)
 	printAuroraBootPlan(stdout, st.AuroraBoot, abPlan)
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
+	if len(caskRemovals) > 0 {
+		printList(stdout, "Will uninstall dependencies (Homebrew cask)", caskRemovals)
+	}
+	if podmanRemoved {
+		writeLine(stdout, "note: a podman machine you created is not removed; remove it with 'podman machine rm'")
+	}
 	printList(stdout, "Will keep dependencies (pre-existing)", st.Setup.PreExistingDeps)
 
 	hasStaleNetwork := hasStaleNetworkResources(st)
@@ -2219,7 +2234,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	// the runtime, and the runtime may be one of the packages about to go.
 	auroraBootErr := cleanupAuroraBoot(stdout, abPlan, home)
 
-	if len(pkgRemovals) > 0 && pm != "" {
+	if len(pkgRemovals)+len(caskRemovals) > 0 && pm != "" {
 		useSudo := runtime.GOOS == "linux"
 		if useSudo {
 			ok, err := confirm(stdin, stdout, *autoYes, "remove kairos-lab-installed dependencies with sudo")
@@ -2230,8 +2245,15 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 				return fmt.Errorf("cleanup cancelled")
 			}
 		}
-		if err := uninstallPackages(pm, pkgRemovals, useSudo); err != nil {
-			return err
+		if len(pkgRemovals) > 0 {
+			if err := uninstallPackages(pm, pkgRemovals, useSudo); err != nil {
+				return err
+			}
+		}
+		if len(caskRemovals) > 0 {
+			if err := uninstallPackages(deps.BrewCask, caskRemovals, useSudo); err != nil {
+				return err
+			}
 		}
 	}
 

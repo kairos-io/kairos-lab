@@ -279,26 +279,6 @@ func TestSetupNoAuroraBootFlag(t *testing.T) {
 	}
 }
 
-func TestSetupSkipsWithoutRuntimeOnDarwin(t *testing.T) {
-	e := newABEnv(t)
-	detectPlatform = func() platform.Info {
-		return platform.Info{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
-	}
-	out, err := e.setup("", "-yes")
-	if err != nil {
-		t.Fatalf("setup: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "Docker Desktop") {
-		t.Errorf("no install hint:\n%s", out)
-	}
-	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
-		t.Errorf("state recorded %+v, want nothing", ab)
-	}
-	if _, err := os.Lstat(filepath.Join(e.home, ".local")); err == nil {
-		t.Error("~/.local was created")
-	}
-}
-
 func TestSetupSavesStateBeforePullFailure(t *testing.T) {
 	e := newABEnv(t)
 	e.runtime(t, "docker")
@@ -753,5 +733,160 @@ func TestStatusShowsAuroraBoot(t *testing.T) {
 		if !strings.Contains(stdout.String(), strconv.Quote(v)) {
 			t.Errorf("status does not carry %q in escaped form:\n%q", v, stdout.String())
 		}
+	}
+}
+
+type installCall struct {
+	pm      string
+	pkgs    []string
+	useSudo bool
+}
+
+func darwinPlatform() platform.Info {
+	return platform.Info{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+}
+
+// TestAuroraBootStepDarwinInstallsDockerDesktopThenCompletesOnRerun is the
+// two-run flow on macOS: the first run installs the cask and stops with
+// instructions because Docker Desktop is not running, the second finds it
+// running and pulls the image and writes the shim.
+func TestAuroraBootStepDarwinInstallsDockerDesktopThenCompletesOnRerun(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	var calls []installCall
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		e.runtime(t, "docker")
+		t.Setenv("INFO_EXIT", "1")
+		return nil
+	}
+	// One "y" only: any second prompt, such as a sudo one, would read EOF and
+	// decline, and the install would not happen.
+	out, err := e.setup("y\n")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(calls) != 1 || calls[0].pm != "brew-cask" || !slices.Equal(calls[0].pkgs, []string{"docker-desktop"}) || calls[0].useSudo {
+		t.Errorf("install calls = %+v, want one brew-cask docker-desktop without sudo", calls)
+	}
+	want := "open Docker Desktop once and wait until it reports it is running, then run 'kairos-lab setup' again to pull the image and install the auroraboot command"
+	if !strings.Contains(out, want) {
+		t.Errorf("no follow-up instruction:\n%s", out)
+	}
+	if strings.Contains(e.logText(), "pull") {
+		t.Errorf("an image was pulled with a runtime that is not running: %q", e.logText())
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") || slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("installed=%v pre-existing=%v: the runtime must be tracked as installed", st.Setup.InstalledByKairosLab, st.Setup.PreExistingDeps)
+	}
+	if st.AuroraBoot.ShimPath != "" || len(st.AuroraBoot.PulledImages) != 0 {
+		t.Errorf("state recorded %+v for a skipped step", st.AuroraBoot)
+	}
+	if !st.Setup.DependencyCheckPassed {
+		t.Error("the rest of setup did not complete")
+	}
+
+	// Docker Desktop is running now.
+	t.Setenv("INFO_EXIT", "0")
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		t.Errorf("installed again: %s %v", pm, pkgs)
+		return nil
+	}
+	out, err = e.setup("", "-yes")
+	if err != nil {
+		t.Fatalf("second setup: %v\n%s", err, out)
+	}
+	st = e.load(t)
+	if !strings.Contains(e.logText(), "docker pull "+auroraboot.ImageRef()) {
+		t.Errorf("the second run did not pull: %q", e.logText())
+	}
+	if st.AuroraBoot.ShimPath == "" || st.AuroraBoot.Runtime != "docker" {
+		t.Errorf("the second run did not finish: %+v", st.AuroraBoot)
+	}
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "docker") || slices.Contains(st.Setup.PreExistingDeps, "docker") {
+		t.Errorf("the re-run lost track of the install: installed=%v pre-existing=%v", st.Setup.InstalledByKairosLab, st.Setup.PreExistingDeps)
+	}
+}
+
+func TestAuroraBootStepDarwinInstallsPodmanFormula(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	var calls []installCall
+	installPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		e.runtime(t, "podman")
+		t.Setenv("INFO_EXIT", "125")
+		return nil
+	}
+	out, err := e.setup("y\n", "-runtime", "podman")
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if len(calls) != 1 || calls[0].pm != "brew" || !slices.Equal(calls[0].pkgs, []string{"podman"}) || calls[0].useSudo {
+		t.Errorf("install calls = %+v, want one brew podman without sudo", calls)
+	}
+	want := "run 'podman machine init' and 'podman machine start', then run 'kairos-lab setup' again to pull the image and install the auroraboot command"
+	if !strings.Contains(out, want) {
+		t.Errorf("no follow-up instruction:\n%s", out)
+	}
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "podman") || st.AuroraBoot.ShimPath != "" {
+		t.Errorf("installed=%v auroraboot=%+v", st.Setup.InstalledByKairosLab, st.AuroraBoot)
+	}
+}
+
+func TestAuroraBootStepDarwinDeclinedInstallSkips(t *testing.T) {
+	e := newABEnv(t)
+	detectPlatform = darwinPlatform
+	if out, err := e.setup("n\n"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	if ab := e.load(t).AuroraBoot; !isZeroAuroraBoot(ab) {
+		t.Errorf("state recorded %+v, want nothing", ab)
+	}
+}
+
+func TestCleanupUninstallsInstalledRuntimesOnDarwin(t *testing.T) {
+	e := newABEnv(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Platform = state.Platform{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+		st.Setup.InstalledByKairosLab = []string{"docker", "podman"}
+	})
+	var calls []installCall
+	uninstallPackages = func(pm string, pkgs []string, useSudo bool) error {
+		calls = append(calls, installCall{pm, pkgs, useSudo})
+		return nil
+	}
+	plan, err := e.cleanup(t, "-dry-run")
+	if err != nil {
+		t.Fatalf("dry-run: %v\n%s", err, plan)
+	}
+	for _, want := range []string{"Will uninstall dependencies (Homebrew cask):\n  - docker-desktop", "Will uninstall dependencies:\n  - podman", "podman machine rm"} {
+		if !strings.Contains(plan, want) {
+			t.Errorf("plan lacks %q:\n%s", want, plan)
+		}
+	}
+	if out, err := e.cleanup(t, "-yes"); err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	for _, c := range calls {
+		got[c.pm] = strings.Join(c.pkgs, ",")
+	}
+	if len(calls) != 2 || got["brew-cask"] != "docker-desktop" || got["brew"] != "podman" {
+		t.Errorf("uninstall calls = %+v, want brew-cask docker-desktop and brew podman", calls)
+	}
+}
+
+func TestCleanupKeepsPreExistingRuntimeOnDarwin(t *testing.T) {
+	e := newABEnv(t)
+	e.seedCleanupState(t, func(st *state.State) {
+		st.Platform = state.Platform{OS: "darwin", Arch: "arm64", PackageManager: "brew"}
+		st.Setup.PreExistingDeps = []string{"docker", "podman"}
+		st.Setup.InstalledByKairosLab = []string{"docker", "podman"}
+	})
+	if out, err := e.cleanup(t, "-yes"); err != nil {
+		t.Fatalf("cleanup: %v\n%s", err, out)
 	}
 }

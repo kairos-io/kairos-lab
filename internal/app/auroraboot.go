@@ -28,7 +28,7 @@ var (
 const auroraBootPullSize = "about 2.2 GB"
 
 // setupAuroraBoot provides the `auroraboot` command: it settles on a container
-// runtime, installing one on Linux only when the machine has none, pulls the
+// runtime, installing one when the machine has none, pulls the
 // pinned image, and writes the shim. Every action it takes and may later have
 // to undo is recorded in st and saved at once, so a failure part way leaves
 // state that cleanup can act on.
@@ -108,8 +108,8 @@ func foreignAuroraBoot(shimPath string) string {
 
 // chooseRuntime returns the runtime the shim will use, or "" when the step
 // should end without one. A runtime is installed only when the machine has
-// none at all, and only on Linux; a runtime that is present but not working is
-// never installed over.
+// none at all, with the package manager already detected (brew on macOS); a
+// runtime that is present but not working is never installed over.
 func chooseRuntime(stdin io.Reader, stdout io.Writer, autoYes bool, runtimeFlag string, p platform.Info, st *state.State, store *state.Store) (string, error) {
 	name, present, reason := auroraboot.DetectRuntime(runtimeFlag)
 	if name != "" {
@@ -117,11 +117,6 @@ func chooseRuntime(stdin io.Reader, stdout io.Writer, autoYes bool, runtimeFlag 
 	}
 	if len(present) > 0 || (runtimeFlag != "" && !auroraboot.ValidRuntime(runtimeFlag)) {
 		writef(stdout, "skipping the auroraboot command: %s\n", reason)
-		return "", nil
-	}
-	if p.OS != "linux" {
-		writeLine(stdout, "skipping the auroraboot command: no container runtime is installed")
-		writeLine(stdout, "install Docker Desktop, Colima or podman, then run 'kairos-lab setup' again")
 		return "", nil
 	}
 	if p.PackageManager == "" {
@@ -149,15 +144,19 @@ func chooseRuntime(stdin io.Reader, stdout io.Writer, autoYes bool, runtimeFlag 
 	if err != nil {
 		return "", err
 	}
-	ok, err = confirm(stdin, stdout, autoYes, "this step needs sudo to install packages")
-	if err != nil {
-		return "", err
+	// brew needs no sudo; every Linux package manager does.
+	useSudo := p.OS == "linux"
+	if useSudo {
+		ok, err = confirm(stdin, stdout, autoYes, "this step needs sudo to install packages")
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			writeLine(stdout, "skipping the auroraboot command: sudo permission denied")
+			return "", nil
+		}
 	}
-	if !ok {
-		writeLine(stdout, "skipping the auroraboot command: sudo permission denied")
-		return "", nil
-	}
-	if err := installPackages(p.PackageManager, pkgs, true); err != nil {
+	if err := installPackages(dep.ManagerFor(p.PackageManager), pkgs, useSudo); err != nil {
 		return "", err
 	}
 	st.Setup.InstalledByKairosLab = mergeUnique(st.Setup.InstalledByKairosLab, []string{dep.Name})
@@ -170,7 +169,14 @@ func chooseRuntime(stdin io.Reader, stdout io.Writer, autoYes bool, runtimeFlag 
 		return name, nil
 	}
 	writef(stdout, "%s was installed but is not usable yet: %s\n", choice, reason)
-	if choice == "docker" {
+	switch {
+	case p.OS == "darwin" && choice == "docker":
+		writeLine(stdout, "open Docker Desktop once and wait until it reports it is running, then run 'kairos-lab setup' again to pull the image and install the auroraboot command")
+		writeLine(stdout, "kairos-lab does not start Docker Desktop itself")
+	case p.OS == "darwin":
+		writeLine(stdout, "run 'podman machine init' and 'podman machine start', then run 'kairos-lab setup' again to pull the image and install the auroraboot command")
+		writeLine(stdout, "kairos-lab does not create or start a podman machine itself")
+	case choice == "docker":
 		writeLine(stdout, "start it and let your user talk to it, then run 'kairos-lab setup' again:")
 		writeLine(stdout, "  sudo systemctl enable --now docker")
 		writeLine(stdout, "  sudo usermod -aG docker \"$USER\"   (then log out and back in)")
@@ -376,4 +382,21 @@ func runtimeDepsFor(pm string) []deps.Dependency {
 		}
 	}
 	return out
+}
+
+// splitCaskNames divides dependency names into those pm installs as a
+// Homebrew cask and the rest.
+func splitCaskNames(pm string, names []string) (casks, rest []string) {
+	isCask := map[string]bool{}
+	for _, d := range runtimeDepsFor(pm) {
+		isCask[d.Name] = d.ManagerFor(pm) == deps.BrewCask
+	}
+	for _, n := range names {
+		if isCask[n] {
+			casks = append(casks, n)
+		} else {
+			rest = append(rest, n)
+		}
+	}
+	return casks, rest
 }
