@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3377,7 +3378,7 @@ func TestUserModeBlockNamesTheForwardedPortsAndTheLimit(t *testing.T) {
 		"  Note:   those two forwarded ports are the only way in. The guest\n" +
 		"          has no address on your network, so this mode supports a\n" +
 		"          single VM and cannot form a cluster."
-	got := userModeBlock()
+	got := userModeBlock(2222, 8080)
 	if got != want {
 		t.Errorf("userModeBlock() =\n%q\nwant\n%q", got, want)
 	}
@@ -3422,7 +3423,11 @@ func TestUserModeBlockNamesThePortsQEMUIsToldToForward(t *testing.T) {
 			t.Errorf("the block names a port QEMU does not forward: %q is not in %q", want, netdev)
 		}
 	}
-	block := userModeBlock()
+	// Index 0 is the one index whose ports the command line above carries as
+	// literals, so it is the one index at which the block can be checked
+	// against a real command line without being told the answer.
+	sshPort, httpPort, _ := userModePortsForIndex(0)
+	block := userModeBlock(sshPort, httpPort)
 	for _, want := range []string{"localhost:" + webUIPort, "-p " + userModeSSHPort} {
 		if !strings.Contains(block, want) {
 			t.Errorf("the block does not name %q:\n%s", want, block)
@@ -3846,7 +3851,8 @@ func TestStartInUserModeSaysWhereTheVMIsAndClearsTheOldAddress(t *testing.T) {
 	if !strings.Contains(out, "vm exited") {
 		t.Fatalf("the run did not reach the end of the VM's life, so the branch that starts a poll was never passed:\n%s", out)
 	}
-	if !strings.Contains(out, userModeBlock()) {
+	startSSHPort, startHTTPPort, _ := userModePortsForIndex(0)
+	if !strings.Contains(out, userModeBlock(startSSHPort, startHTTPPort)) {
 		t.Errorf("the run does not say where a user-mode VM is reached; got:\n%s", out)
 	}
 	if strings.Contains(out, "VM is up.") {
@@ -3911,7 +3917,7 @@ func TestStatusNetworkRowsForEachMode(t *testing.T) {
 				"bridge resources: bridge=kairoslab0 taps=kairoslab-tap0\n",
 				"  vm ip address: 192.168.64.12\n",
 			},
-			notWant: []string{"bridge iface:", "user mode forwards:"},
+			notWant: []string{"bridge iface:", "  SSH:", "  WebUI:"},
 		},
 		{
 			name: "bridged shows the uplink as well",
@@ -3922,14 +3928,15 @@ func TestStatusNetworkRowsForEachMode(t *testing.T) {
 				"bridge resources: bridge=kairoslab0 taps=kairoslab-tap0\n",
 				"  vm ip address: 192.168.64.12\n",
 			},
-			notWant: []string{"user mode forwards:"},
+			notWant: []string{"  SSH:", "  WebUI:"},
 		},
 		{
 			name: "user shows the forwarded ports instead of a bare address",
 			mode: "user",
 			want: []string{
 				"  network mode: user\n",
-				"  user mode forwards: ssh localhost:2222, http localhost:8080\n",
+				"  WebUI:  http://localhost:8080\n",
+				"  SSH:    ssh -p 2222 kairos@localhost\n",
 				"  vm ip address: 192.168.64.12\n",
 			},
 			notWant: []string{"bridge iface:", "bridge resources:"},
@@ -5385,5 +5392,145 @@ func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
 	})
 	if !strings.Contains(out, "  vm ip address: none\n") {
 		t.Errorf("status did not report user mode's address as none:\n%s", out)
+	}
+}
+
+// Both halves of kairos-io/kairos#5054, one test each.
+
+// What the two lines say has to be runnable, because a user pastes them.
+//
+// `status` used to print "user mode forwards: ssh localhost:2222, http
+// localhost:8080". ssh reads "localhost:2222" as a host name -- the port is
+// -p, never a colon -- so that command resolves nothing and fails, the
+// kairos@ login was missing from it, and "http localhost:8080" is not a URL
+// a browser or curl takes either. The start block printed working forms the
+// whole time, so this is checked as a property of each line rather than
+// against an expected string: one function produces both call sites' lines
+// now, and the point is that neither can go back to naming a port in a way
+// the tool named beside it does not read.
+func TestUserModeReachLinesAreRunnableCommands(t *testing.T) {
+	for _, index := range []int{0, 1, 7} {
+		sshPort, httpPort, _ := userModePortsForIndex(index)
+		lines := userModeReachLines(sshPort, httpPort)
+		if len(lines) != 2 {
+			t.Fatalf("index %d: %d lines, want 2: %q", index, len(lines), lines)
+		}
+		webUI, ssh := lines[0], lines[1]
+
+		wantURL := fmt.Sprintf("http://localhost:%d", httpPort)
+		if !strings.Contains(webUI, wantURL) {
+			t.Errorf("index %d: the WebUI line does not carry a URL %q: %q", index, wantURL, webUI)
+		}
+		if u, err := url.Parse(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(webUI), "WebUI:"))); err != nil {
+			t.Errorf("index %d: the WebUI line is not a parseable URL: %q: %v", index, webUI, err)
+		} else if u.Scheme != "http" || u.Port() != strconv.Itoa(httpPort) {
+			t.Errorf("index %d: the WebUI line parses to scheme %q port %q, want http and %d: %q", index, u.Scheme, u.Port(), httpPort, webUI)
+		}
+
+		// ssh's own grammar: the port is an argument to -p, and the host is
+		// a bare host name with the login on it.
+		if !strings.Contains(ssh, fmt.Sprintf("ssh -p %d kairos@localhost", sshPort)) {
+			t.Errorf("index %d: the SSH line is not a runnable ssh command: %q", index, ssh)
+		}
+		if strings.Contains(ssh, fmt.Sprintf("localhost:%d", sshPort)) {
+			t.Errorf("index %d: the SSH line puts the port on the host name, where ssh reads it as part of the name: %q", index, ssh)
+		}
+	}
+}
+
+// The ports the block names are the ports the VM it is printed for is on.
+//
+// userModeBlock took no index, so it printed the 2222/8080 constants for
+// every VM. Since multi-VM support a VM at index N is forwarded 2222+N and
+// 8080+N, so the block told the second user-mode VM's owner to ssh into the
+// first VM: a live guest answering on the named port, with the same default
+// login, which is the way this fails silently rather than with a refused
+// connection.
+//
+// The ports come from the command line that is actually built for that
+// index, not from userModePortsForIndex, so this fails if either side moves.
+func TestUserModeBlockNamesThePortsOfTheVMItIsPrintedFor(t *testing.T) {
+	for _, index := range []int{0, 1, 2} {
+		sshPort, httpPort, hostBind := userModePortsForIndex(index)
+		_, args, err := vm.BuildQEMUCommand(vm.StartConfig{
+			DiskPath:         "/nope/kairos-disk0.qcow2",
+			QGASocketPath:    "/nope/qemu.sock",
+			CPUs:             2,
+			MemoryMB:         2048,
+			NetworkMode:      "user",
+			DisplayMode:      "serial",
+			MACAddress:       vm.MACForDisk("kairos-disk0"),
+			BiosPath:         "/nope/edk2-aarch64-code.fd",
+			SSHPort:          sshPort,
+			HTTPPort:         httpPort,
+			UserModeHostBind: hostBind,
+		})
+		if err != nil {
+			t.Fatalf("index %d: BuildQEMUCommand: %v", index, err)
+		}
+		netdev := ""
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "user,id=net0") {
+				netdev = arg
+			}
+		}
+		if netdev == "" {
+			t.Fatalf("index %d: no user-mode netdev on the command line:\n%q", index, args)
+		}
+
+		block := userModeBlock(sshPort, httpPort)
+		guestSSH, guestWebUI := 22, 8080
+		for _, want := range []struct{ host, guest int }{{sshPort, guestSSH}, {httpPort, guestWebUI}} {
+			fwd := fmt.Sprintf("-:%d", want.guest)
+			at := strings.Index(netdev, fwd)
+			if at < 0 {
+				t.Fatalf("index %d: nothing forwards to guest port %d: %q", index, want.guest, netdev)
+			}
+			if !strings.Contains(netdev, fmt.Sprintf("%d-:%d", want.host, want.guest)) {
+				t.Errorf("index %d: QEMU forwards something other than host port %d to guest %d: %q", index, want.host, want.guest, netdev)
+			}
+			if !strings.Contains(block, strconv.Itoa(want.host)) {
+				t.Errorf("index %d: the block does not name host port %d, which is where this VM is:\n%s", index, want.host, block)
+			}
+		}
+		// The failure this reproduces: index 1's block naming index 0's ports.
+		if index > 0 {
+			zeroSSH, zeroHTTP, _ := userModePortsForIndex(0)
+			for _, stale := range []int{zeroSSH, zeroHTTP} {
+				if strings.Contains(block, strconv.Itoa(stale)) {
+					t.Errorf("index %d's block names port %d, which belongs to the VM at index 0:\n%s", index, stale, block)
+				}
+			}
+		}
+	}
+}
+
+// start and status have to say the same thing about the same VM, because a
+// user reads one after the other. They print one function's output now; this
+// is what fails if a later change gives either its own copy again.
+func TestStatusAndStartPrintTheSameUserModeLines(t *testing.T) {
+	out := runStatusOutput(t, func(st *state.State) {
+		st.Network.Mode = "user"
+		withVMField(testVMName, func(v *state.VM) {
+			v.NetworkMode = "user"
+			v.Index = 0
+			// A state.json whose stored ports disagree with the index: not
+			// trusted, per quarantineInvalidVMs, so status must print the
+			// index-derived ports and not these.
+			v.SSHPort = 9999
+			v.HTTPPort = 9998
+		})(st)
+	})
+
+	sshPort, httpPort, _ := userModePortsForIndex(0)
+	for _, line := range userModeReachLines(sshPort, httpPort) {
+		if !strings.Contains(out, line+"\n") {
+			t.Errorf("status does not print %q, which start's block does:\n%s", line, out)
+		}
+	}
+	for _, stored := range []string{"9999", "9998"} {
+		if strings.Contains(out, stored) {
+			t.Errorf("status printed the port stored in state.json (%s) rather than the one derived from the index:\n%s", stored, out)
+		}
 	}
 }
