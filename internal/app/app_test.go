@@ -953,65 +953,32 @@ func TestStartUsageListsEveryNetworkModeAndItsDefault(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 
-	usage, err := captureOSStderr(t, func() error {
-		return Run([]string{"start", "-h"}, strings.NewReader(""), io.Discard, io.Discard, "test")
-	})
-	// -h is not a flag runStart declares, so the flag package handles it:
-	// print the usage, return ErrHelp. Anything else means the run got past
-	// parsing and what was captured is not the usage message.
-	if !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, usage)
-	}
+	usage := captureSubcommandUsage(t, "start", "-h")
 	want := `network mode: shared|bridged|user (default "shared")`
 	if !strings.Contains(usage, want) {
 		t.Fatalf("start -h does not print %q, so either a mode is undocumented or the default moved; got:\n%s", want, usage)
 	}
 }
 
-// captureOSStderr returns what fn wrote to the process's standard error,
-// along with fn's error.
+// captureSubcommandUsage runs kairos-lab with args and returns what it wrote
+// to the stderr writer it was handed, failing the test if the run reported an
+// error.
 //
-// It has to reach for the process-wide file rather than the stderr writer Run
-// is handed, because those are not the same destination for a usage message:
-// runStart builds its flag set with flag.NewFlagSet and never calls
-// SetOutput, so flag.FlagSet.Output() falls through to os.Stderr. Giving the
-// flag set the writer instead would be a change to production code made only
-// so a test could see it, and the point here is to observe what a user at a
-// terminal actually gets.
-//
-// The swap works because Output() reads the os.Stderr variable at the moment
-// it prints rather than at flag-set construction. A temp file rather than an
-// os.Pipe means there is no reader to schedule and no way to deadlock on a
-// full pipe buffer, whatever the usage message grows to.
-func captureOSStderr(t *testing.T, fn func() error) (string, error) {
+// Both halves of that are what kairos-io/kairos#5055 changed. The usage
+// arrives here rather than on the process's own standard error because each
+// subcommand's flag set is now given this writer with fs.SetOutput; before
+// that, flag.FlagSet.Output() fell through to os.Stderr and a caller passing
+// its own writer -- a test, or anything embedding this package -- could see
+// neither the usage nor a parse error. And a served help request now reports
+// success: fs.Parse answers -h with flag.ErrHelp, which Run translates to
+// nil, so `kairos-lab start -h` exits 0 like the top-level `kairos-lab -h`.
+func captureSubcommandUsage(t *testing.T, args ...string) string {
 	t.Helper()
-	f, err := os.CreateTemp(t.TempDir(), "stderr-*.txt")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
+	var stderr bytes.Buffer
+	if err := Run(args, strings.NewReader(""), io.Discard, &stderr, "test"); err != nil {
+		t.Fatalf("kairos-lab %s returned %v, want nil; captured:\n%s", strings.Join(args, " "), err, stderr.String())
 	}
-	saved := os.Stderr
-	// A defer as well as the plain restore below, so a panicking fn still
-	// leaves the process as it was found. What that is worth is narrower than
-	// it looks and worth stating, because the obvious claim is false: the
-	// testing package writes failures and recovered panics to os.Stdout, and
-	// the runtime writes an unrecovered panic to fd 2 directly rather than
-	// through this variable, so a missed restore would silence neither. What
-	// it would break is anything that reads the os.Stderr variable at write
-	// time -- a later call to this helper, or production code handed
-	// os.Stderr -- which would be writing into a file this function has
-	// already closed, in a directory t.TempDir removes when the test ends.
-	defer func() { os.Stderr = saved }()
-	os.Stderr = f
-	fnErr := fn()
-	os.Stderr = saved
-	if err := f.Close(); err != nil {
-		t.Fatalf("close captured stderr: %v", err)
-	}
-	out, err := os.ReadFile(f.Name())
-	if err != nil {
-		t.Fatalf("read captured stderr: %v", err)
-	}
-	return string(out), fnErr
+	return stderr.String()
 }
 
 // The no-argument usage is the other place the network modes are written
@@ -1051,12 +1018,7 @@ func TestUsageAdvertisesOnlyFlagsStartDeclares(t *testing.T) {
 	if err := Run(nil, strings.NewReader(""), &stdout, io.Discard, "test"); err != nil {
 		t.Fatalf("Run with no arguments: %v", err)
 	}
-	startUsage, err := captureOSStderr(t, func() error {
-		return Run([]string{"start", "-h"}, strings.NewReader(""), io.Discard, io.Discard, "test")
-	})
-	if !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, startUsage)
-	}
+	startUsage := captureSubcommandUsage(t, "start", "-h")
 	for _, row := range usageBlock(t, stdout.String(), "Start flags:") {
 		name := strings.Fields(row)[0]
 		// flag prints one declaration per row as the name, then either the
@@ -1474,12 +1436,7 @@ func TestStartUsageListsEveryDisplayModeAndItsDefault(t *testing.T) {
 	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
 	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
 
-	usage, err := captureOSStderr(t, func() error {
-		return Run([]string{"start", "-h"}, strings.NewReader(""), io.Discard, io.Discard, "test")
-	})
-	if !errors.Is(err, flag.ErrHelp) {
-		t.Fatalf("start -h returned %v, want flag.ErrHelp; captured:\n%s", err, usage)
-	}
+	usage := captureSubcommandUsage(t, "start", "-h")
 	want := `display mode: window|serial (default "window")`
 	if !strings.Contains(usage, want) {
 		t.Fatalf("start -h does not print %q, so either a mode is undocumented or the default moved; got:\n%s", want, usage)
@@ -5404,5 +5361,63 @@ func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
 	})
 	if !strings.Contains(out, "  vm ip address: none\n") {
 		t.Errorf("status did not report user mode's address as none:\n%s", out)
+	}
+}
+
+// Asking any subcommand for help is served, and says so in the exit status.
+//
+// Every flag set is built with flag.ContinueOnError, so fs.Parse answers -h
+// by printing the usage and returning flag.ErrHelp. That error used to travel
+// out through Run and main, which prints "error: flag: help requested" and
+// exits 1, while the top-level `kairos-lab -h` exited 0. The two help paths
+// disagreed, and a `set -e` script or CI step that ran `kairos-lab start -h`
+// died on the answer (kairos-io/kairos#5055).
+//
+// download and status declare no flags, so they have no flag set to print and
+// no ErrHelp to translate; they rejected -h as a stray argument instead. They
+// are in the table because the defect a user meets is the same one, and the
+// command list is the help they have to give.
+func TestSubcommandHelpIsServedRatherThanReportedAsAnError(t *testing.T) {
+	for _, verb := range []string{"setup", "start", "reset", "cleanup", "download", "status"} {
+		for _, flagName := range []string{"-h", "--help"} {
+			t.Run(verb+" "+flagName, func(t *testing.T) {
+				t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+				t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+				// captureSubcommandUsage fails the test on a non-nil error,
+				// which is the exit-status half of the assertion: main turns
+				// any error it is given into exit 1.
+				usage := captureSubcommandUsage(t, verb, flagName)
+				if usage == "" {
+					t.Fatalf("%s %s printed nothing to the stderr writer, so a user asking for help gets a silent success", verb, flagName)
+				}
+			})
+		}
+	}
+}
+
+// The translation is narrow: it covers a help request and nothing else, so a
+// subcommand that cannot parse its arguments still fails.
+//
+// Worth pinning separately, because the cheap version of the fix above --
+// swallowing every error fs.Parse returns, or testing the message rather than
+// the sentinel -- would make a typo in a flag name exit 0 with the VM never
+// started, which is a worse bug than the one being fixed.
+func TestSubcommandParseErrorStillFails(t *testing.T) {
+	t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+	t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+	var stderr bytes.Buffer
+	err := Run([]string{"start", "-nosuchflag"}, strings.NewReader(""), io.Discard, &stderr, "test")
+	if err == nil {
+		t.Fatal("start -nosuchflag returned nil, so a mistyped flag would be reported as a successful run")
+	}
+	if errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("start -nosuchflag returned flag.ErrHelp, which Run translates to success; got %v", err)
+	}
+	// The parse error reaches the writer the caller passed, not the process
+	// file it used to fall through to.
+	if !strings.Contains(stderr.String(), "nosuchflag") {
+		t.Fatalf("the parse error does not name the flag on the stderr writer, so an embedder cannot report it; got:\n%s", stderr.String())
 	}
 }
