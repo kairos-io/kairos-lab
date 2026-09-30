@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -351,5 +352,277 @@ func TestRenderShimRejectsBadInputs(t *testing.T) {
 		if _, err := RenderShim(tc.runtime, tc.image, tc.goos); err == nil {
 			t.Errorf("RenderShim(%q, %q, %q) succeeded, want an error", tc.runtime, tc.image, tc.goos)
 		}
+	}
+}
+
+// mountedPaths returns the host paths the shim mounted at themselves, other
+// than the working directory and the runtime socket.
+func mountedPaths(argv []string, cwd string) []string {
+	var out []string
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] != "-v" {
+			continue
+		}
+		src, dst, ok := strings.Cut(argv[i+1], ":")
+		if !ok || src != dst || src == cwd {
+			continue
+		}
+		out = append(out, src)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestShimPathRules(t *testing.T) {
+	mk := func(t *testing.T, paths ...string) {
+		t.Helper()
+		for _, p := range paths {
+			if strings.HasSuffix(p, "/") {
+				if err := os.MkdirAll(p, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tests := []struct {
+		name string
+		// setup runs with root = the parent of the working directory and
+		// returns the arguments and the expected extra mounts.
+		setup func(t *testing.T, root string) (args []string, mounts []string)
+		exit  int
+		// created lists paths under root that must exist afterwards
+		// (created=true) or must not (created=false).
+		created map[string]bool
+	}{
+		{
+			name: "relative under cwd needs no mount",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/work/rootfs/")
+				return []string{"build-iso", "--output", "./build", "--overlay-rootfs", "rootfs", "img"}, nil
+			},
+			created: map[string]bool{"work/build": false},
+		},
+		{
+			name: "output outside cwd is created and mounted",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "../out", "img"}, []string{root + "/out"}
+			},
+			created: map[string]bool{"out": true},
+		},
+		{
+			name: "output with equals and an absolute path",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output=" + root + "/abs/deep", "img"}, []string{root + "/abs/deep"}
+			},
+			created: map[string]bool{"abs/deep": true},
+		},
+		{
+			name: "short output flag with equals",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"bi", "-o=../short", "img"}, []string{root + "/short"}
+			},
+			created: map[string]bool{"short": true},
+		},
+		{
+			name: "build-uki -o is an input and is never created",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/rootfs/")
+				return []string{"build-uki", "-o", "../rootfs", "-d", "../uki", "img"}, []string{root + "/rootfs", root + "/uki"}
+			},
+			created: map[string]bool{"uki": true},
+		},
+		{
+			name: "missing input is left for auroraboot to report",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-uki", "--overlay-rootfs", "../nope", "img"}, nil
+			},
+			created: map[string]bool{"nope": false},
+		},
+		{
+			name: "dir source",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/rootfs/")
+				return []string{"build-iso", "--output", "o", "dir:../rootfs"}, []string{root + "/rootfs"}
+			},
+		},
+		{
+			name: "dir source with an absolute path after two slashes",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/rootfs/")
+				return []string{"build-iso", "--output", "o", "dir://" + root + "/rootfs"}, []string{root + "/rootfs"}
+			},
+		},
+		{
+			name: "file source",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/files/a.tar")
+				return []string{"build-iso", "--output", "o", "file:../files/a.tar"}, []string{root + "/files/a.tar"}
+			},
+		},
+		{
+			name: "image references need no mount",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "o", "docker:img"}, nil
+			},
+		},
+		{
+			name: "oci and bare references need no mount",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/work/quay.io/kairos/")
+				return []string{"build-iso", "--output", "o", "oci:img", "quay.io/kairos/alpine:3.21"}, nil
+			},
+		},
+		{
+			name: "stdin and URLs for cloud-config",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"--cloud-config", "-", "build-iso", "-c", "https://example.test/c.yaml", "--cloud-config=http://x/y", "--output", "o", "img"}, nil
+			},
+		},
+		{
+			name: "pkcs11 key",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-uki", "--tpm-pcr-private-key", "pkcs11:token=x;object=y", "img"}, nil
+			},
+		},
+		{
+			name: "directory symlink under cwd is mounted through its target",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/target/")
+				if err := os.Symlink(root+"/target", root+"/work/link"); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"build-iso", "--output", "o", "--overlay-rootfs", "link", "img"}, []string{root + "/target"}
+			},
+		},
+		{
+			name: "file symlink under cwd is mounted through its target",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/target/c.yaml")
+				if err := os.Symlink("../target/c.yaml", root+"/work/c.yaml"); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"build-iso", "--output", "o", "--cloud-config", "c.yaml", "img"}, []string{root + "/target/c.yaml"}
+			},
+		},
+		{
+			name: "unpack destination after a value flag",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/amd64/")
+				return []string{"unpack", "--arch", "amd64", "quay.io/kairos/alpine:3.21", "../dest"}, []string{root + "/dest"}
+			},
+			created: map[string]bool{"dest": true},
+		},
+		{
+			name: "netboot positionals",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/x.iso")
+				return []string{"netboot", "../x.iso", "../netout"}, []string{root + "/netout", root + "/x.iso"}
+			},
+			created: map[string]bool{"netout": true},
+		},
+		{
+			name: "table flag at a reserved path stops the run",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "/etc/x", "img"}, nil
+			},
+			exit: 2,
+		},
+		{
+			name: "table input at a reserved path stops the run",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--cloud-config", "/etc/passwd", "img"}, nil
+			},
+			exit: 2,
+		},
+		{
+			name: "generic token at a reserved path is skipped",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "o", "/etc", "img"}, nil
+			},
+		},
+		{
+			name: "path with a colon stops the run",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "../a:b", "img"}, nil
+			},
+			exit:    2,
+			created: map[string]bool{"a:b": false},
+		},
+		{
+			name: "global flag before the subcommand",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"--debug", "build-iso", "--output", "../out2", "img"}, []string{root + "/out2"}
+			},
+			created: map[string]bool{"out2": true},
+		},
+		{
+			name: "top level config file",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/cfg/aurora.yaml")
+				return []string{"../cfg/aurora.yaml"}, []string{root + "/cfg/aurora.yaml"}
+			},
+		},
+		{
+			name: "one mount covers a nested path and a repeat",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/shared/iso/")
+				return []string{"build-iso", "--output", "o", "--overlay-rootfs", "../shared", "--overlay-iso", "../shared/iso", "--extensions-catalog", "../shared", "img"}, []string{root + "/shared"}
+			},
+		},
+		{
+			name: "set values are not scanned",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				mk(t, root+"/rootfs/")
+				return []string{"--set", "../rootfs", "--set=x=../rootfs", "build-iso", "--output", "o", "img"}, nil
+			},
+		},
+		{
+			name: "awkward arguments pass through byte for byte",
+			setup: func(t *testing.T, root string) ([]string, []string) {
+				return []string{"build-iso", "--output", "o", "--set", "a=b c\nd", "", "  ", "*", "img"}, nil
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := tempDir(t)
+			cwd := filepath.Join(root, "work")
+			if err := os.MkdirAll(cwd, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			args, want := tc.setup(t, root)
+			res := runShim(t, "linux", "docker", shimOpts{}, cwd, args...)
+			if res.exit != tc.exit {
+				t.Fatalf("exit = %d, want %d; stderr: %s", res.exit, tc.exit, res.stderr)
+			}
+			for rel, shouldExist := range tc.created {
+				_, err := os.Stat(filepath.Join(root, rel))
+				if (err == nil) != shouldExist {
+					t.Errorf("%s exists = %v, want %v", rel, err == nil, shouldExist)
+				}
+			}
+			if tc.exit != 0 {
+				if res.argv != nil {
+					t.Errorf("the runtime was called: %q", res.argv)
+				}
+				return
+			}
+			sort.Strings(want)
+			if got := mountedPaths(res.argv, cwd); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Errorf("mounts = %q, want %q (argv %q)", got, want, res.argv)
+			}
+			tail := append([]string{ImageRef()}, args...)
+			got := res.argv[len(res.argv)-len(tail):]
+			if strings.Join(got, "\x00") != strings.Join(tail, "\x00") {
+				t.Errorf("arguments changed: got %q, want %q", got, tail)
+			}
+		})
 	}
 }
