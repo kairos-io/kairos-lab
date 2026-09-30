@@ -109,6 +109,28 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode, bridge, tapDevice,
 		// was not deleted. Which of them issued anything is not knowable from
 		// the joined error, so the message names the gates instead of
 		// listing the steps as though they had all run.
+		// A refusal is not a failed teardown, and the two must not be
+		// answered the same way. cleanupNMConnections refuses a name it was
+		// handed before it issues anything, so nothing was touched and the
+		// host is as it was; what is wrong is the stored configuration, and
+		// no later step of this start makes it right. Reading it as a
+		// teardown failure got it wrong in both directions: the message
+		// below would tell a shared user that "every step after the one
+		// above was still attempted" and that "the host's networking has
+		// changed" when no command ran, and the bridged path -- which drops
+		// the error because it rewrites every connection this teardown
+		// deletes -- would carry on into `nmcli connection modify <name>`
+		// over the name just refused, against what may be the host's own
+		// profile. Neither mode may proceed past a name this tool will not
+		// touch, so the refusal is intercepted here, ahead of the split.
+		var refusal storedNameRefusal
+		if errors.As(cleanupErr, &refusal) {
+			return fmt.Errorf("%s networking cannot start with this stored network configuration: %w. "+
+				"Nothing was changed on the host: this refusal comes before the cleanup issues any command, so no connection was deleted and no interface was removed. "+
+				"The name above was read from the state file in this config directory, and it names a device on this host that is not the kind of device kairos-lab creates -- deleting it would take that device, and whatever runs over it, off the network. "+
+				"Correct or remove that name in the state file and start again, or start in a fresh config directory",
+				mode, cleanupErr)
+		}
 		if cleanupErr != nil && mode == "shared" {
 			return fmt.Errorf("shared networking cannot start until the leftover network configuration is gone, and removing it failed: %w. "+
 				"The cleanup does not stop at its first failure, so every step after the one above was still attempted where it had anything to attempt, and the failure above names each one that failed. Several steps do nothing when there is nothing to do: the `ip link delete`s run only for an interface `ip link show` can see, and the reconnect runs only when an interface was found on the bridge AND this cleanup deleted the connection that would otherwise be reactivated over it -- so a reconnect can be skipped for a NIC that is on the bridge, and the line above this refusal says so when it is. After a reboot, where the connection keyfiles survive and the interfaces do not, the delete that failed above can be the only command this cleanup issued at all. "+
@@ -888,24 +910,35 @@ func cleanupNMConnections(bridgeConn, tapDevice, tapConn string, siblingLive boo
 	// out of state.json -- a 0644 file any process running as the user can
 	// write. linuxNetworkPreflight validates them before a start, but reset
 	// and cleanup reach here without passing through the preflight, so the
-	// same check has to sit at the choke point too. Without it a stored name
-	// of "eth0" turns into `sudo nmcli connection delete eth0` and
-	// `sudo ip link delete eth0`, and the host loses its network. The tap
-	// device name is checked for exactly the same reason as the bridge name:
-	// it is the argument of an `ip link delete` below. tapConn is not
-	// separately validated here: it is always TapConnNameForIndex's own
-	// output, built from a bridge name that has already passed this same
-	// check and an integer index, never a string read fresh from
-	// state.json.
+	// same check has to sit at the choke point too. The tap device name is
+	// checked for exactly the same reason as the bridge name: it is the
+	// argument of an `ip link delete` below. tapConn is not separately
+	// validated here: it is always TapConnNameForIndex's own output, built
+	// from a bridge name that has already passed this same check and an
+	// integer index, never a string read fresh from state.json.
+	//
+	// Two checks per name, because the name alone does not say enough. This
+	// comment used to claim that validateStoredInterfaceName was what stopped
+	// a stored name of "eth0" turning into `sudo nmcli connection delete eth0`
+	// and `sudo ip link delete eth0`. It was not: that rule is a charset and
+	// a length, and "eth0" satisfies both (kairos-io/kairos#5051).
+	// refuseForeignStoredDevice is the check that actually stops it, by
+	// looking at the device the name resolves to rather than at the name.
 	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
-		return fmt.Errorf("refusing to clean up network resources: %w", err)
+		return refuseStoredName(err)
+	}
+	if err := refuseForeignStoredDevice("bridge name", bridgeConn, isLinuxBridge, "a Linux bridge"); err != nil {
+		return refuseStoredName(err)
 	}
 	tap := tapDevice
 	if tap == "" {
 		tap = DefaultTapName
 	}
 	if err := validateStoredInterfaceName("tap name", tap); err != nil {
-		return fmt.Errorf("refusing to clean up network resources: %w", err)
+		return refuseStoredName(err)
+	}
+	if err := refuseForeignStoredDevice("tap name", tap, isTapDevice, "a tun/tap device"); err != nil {
+		return refuseStoredName(err)
 	}
 	if tapConn == "" {
 		tapConn = bridgeConn + "-tap"
@@ -1329,6 +1362,90 @@ func netDeviceExists(name string) (bool, error) {
 	default:
 		return false, err
 	}
+}
+
+// storedNameRefusal marks the refusals cleanupNMConnections makes over a name
+// it was given, BEFORE it issues any command.
+//
+// It exists because the two things cleanupNMConnections can return are the
+// opposite of each other and its callers cannot otherwise tell them apart. A
+// joined failure means the teardown ran and some of it did not work, so the
+// host's networking has changed in a way nobody has a full account of. A
+// refusal means nothing ran at all: the host is exactly as it was, and what
+// is wrong is the stored configuration. linuxNetworkPreflight used to read
+// both as the first, which made it describe a refusal to a shared start in
+// the words of a partial teardown -- and, on the bridged path, drop the
+// refusal entirely and carry on into `nmcli connection modify` over the very
+// name that was just refused.
+//
+// The wrapped error is returned unchanged by Error, so the marker costs the
+// message nothing; it is read with errors.As, never printed.
+type storedNameRefusal struct{ err error }
+
+func (r storedNameRefusal) Error() string { return r.err.Error() }
+func (r storedNameRefusal) Unwrap() error { return r.err }
+
+// refuseStoredName is the one way cleanupNMConnections refuses a name it was
+// handed, so that every such refusal carries the marker and no later caller
+// has to guess which returns are which.
+func refuseStoredName(err error) error {
+	return storedNameRefusal{fmt.Errorf("refusing to clean up network resources: %w", err)}
+}
+
+// refuseForeignStoredDevice refuses a stored interface name that names a
+// device of the wrong KIND on this host: something is there under that name,
+// and it is not the kind of device the caller says kairos-lab builds.
+//
+// What this does NOT establish is ownership. A device of the right kind
+// passes whoever made it, so a stored bridge name of "docker0", "virbr0" or a
+// hypervisor host's own "br0" still reaches the teardown. Closing that needs
+// a signal state.json cannot vouch for -- an NM profile property set at
+// creation, or a marker on the bridge -- and it cannot be a name rule:
+// bridged mode exists precisely so a user can name a bridge the host already
+// has, and CreatedByKairosLab lives in the same untrusted file. The narrower
+// case of libvirt's virbr0 inherited from the dropped `--network virbr` mode
+// is handled a layer up, in managedBridgeName. What is closed here is the one
+// kairos-io/kairos#5051 reports: a name that resolves to a device which is
+// not a bridge at all, which is what every physical NIC on the host is.
+//
+// validateStoredInterfaceName, which runs just before this, is a rule about
+// the SHAPE of a name: it rejects a name that would be read as an option, walk
+// out of a directory or carry an escape sequence into the terminal. It has no
+// opinion about what the name refers to, so it accepts "eth0", "bond0" and
+// every other real interface name -- see the note on it. This is the other
+// half: a rule about the DEVICE the name resolves to, which is the only thing
+// that separates a bridge kairos-lab made from the host's own NIC.
+//
+// Three answers and not two, because "no such device" is not evidence of a
+// foreign one. An interrupted setup routinely leaves a NetworkManager profile
+// behind with no device of that name left to go with it, and the stale cleanup
+// exists to remove exactly that, so a name that resolves to nothing has to
+// pass. What is refused is the narrow, destructive case: the device is there
+// and it is the wrong kind of device.
+//
+// A stat that fails for any other reason refuses too. That is the fail-closed
+// direction: the commands behind this guard run under sudo and delete, so a
+// host whose /sys cannot answer "what kind of device is this" is a host where
+// the question has not been answered, not one where the answer was yes.
+func refuseForeignStoredDevice(field, name string, ours func(string) bool, want string) error {
+	exists, err := netDeviceExists(name)
+	if err != nil {
+		return fmt.Errorf("invalid %s %q in stored configuration: cannot tell what kind of device this is: %w", field, name, err)
+	}
+	if !exists || ours(name) {
+		return nil
+	}
+	return fmt.Errorf("invalid %s %q in stored configuration: %s is a device on this host and is not %s, so this teardown will not delete it", field, name, name, want)
+}
+
+// isTapDevice reports whether name is a tun/tap device, by the presence of the
+// tun_flags attribute the tun driver publishes and no other link type has. It
+// is deliberately weaker than bridgePortExempt, which also requires a
+// kairos-lab-generated name and this user's ownership: this is a refusal at a
+// teardown choke point, and a state.json written by an older version records
+// tap names that predate the generated-name scheme.
+func isTapDevice(name string) bool {
+	return name != "" && tapSysfsTunFlagsReadable(name)
 }
 
 func detectDefaultUplink() (string, error) {
