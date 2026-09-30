@@ -1,0 +1,26 @@
+# Mirrors kairos-io/kairos' own .yamllint, which the reusable lint
+# workflow this repo calls runs with --strict, with one difference:
+# kairos forbids an explicit document start and this repo's files are
+# split on it (.goreleaser.yaml, release.yaml and osv-scanner-pr.yaml
+# open with ---, the five .yml workflows do not), so the rule is off
+# rather than rewriting six files to settle a question of taste.
+extends: default
+
+rules:
+  # 80 chars should be enough, but don't fail if a line is longer
+  line-length:
+    max: 305
+    level: warning
+
+  # accept both     key:
+  #                   - item
+  #
+  # and             key:
+  #                 - item
+  indentation:
+    indent-sequences: whatever
+
+  truthy:
+    check-keys: false
+
+  document-start: disable
