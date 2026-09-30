@@ -12,6 +12,6 @@ concurrency:
 
 jobs:
   call-workflow:
-    uses: kairos-io/linting-composite-action/.github/workflows/reusable-linting.yaml@main
+    uses: kairos-io/kairos/.github/workflows/reusable-linting.yaml@d17464a24dd6eaba061042adff9fb29aa8236c5c  # v4.3.0
     with:
       yamldirs: "."
