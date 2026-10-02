@@ -10,7 +10,7 @@ on:
 
 jobs:
   e2e-linux:
-    runs-on: kvm
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -19,11 +19,19 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install dependencies and enable KVM access
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils dnsmasq iproute2 acl
-          sudo setfacl -m u:runner:rwx /dev/kvm
+          sudo apt-get install -y qemu-system-x86 qemu-utils dnsmasq iproute2 acl udev
+
+      - name: Grant access to /dev/kvm
+        run: |
+          echo "KERNEL==\"kvm\", GROUP=\"$(id -gn)\", MODE=\"0660\", OPTIONS+=\"static_node=kvm\"" | sudo tee /etc/udev/rules.d/99-kvm-access.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          test -w /dev/kvm
 
       - name: Build binary
         run: go build -o ./bin/kairos-lab ./cmd/kairos-lab
