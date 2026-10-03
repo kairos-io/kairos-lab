@@ -54,9 +54,7 @@ func setupAuroraBoot(stdin io.Reader, stdout io.Writer, autoYes bool, runtimeFla
 		return err
 	}
 	st.AuroraBoot.Runtime = rt
-	if !slices.Contains(st.Setup.InstalledByKairosLab, rt) {
-		st.Setup.PreExistingDeps = mergeUnique(st.Setup.PreExistingDeps, []string{rt})
-	}
+	recordPreExisting(st, []string{rt})
 	if err := store.Save(st); err != nil {
 		return err
 	}
