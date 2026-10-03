@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kairos-io/kairos-lab/internal/auroraboot"
+	"github.com/kairos-io/kairos-lab/internal/cleanup"
 	"github.com/kairos-io/kairos-lab/internal/platform"
 	"github.com/kairos-io/kairos-lab/internal/state"
 )
@@ -405,6 +406,84 @@ func TestAuroraBootStepInstallsARuntimeOnlyWhenNoneExists(t *testing.T) {
 	}
 	if st := e.load(t); slices.Contains(st.Setup.PreExistingDeps, "docker") {
 		t.Errorf("a re-run made the installed runtime pre-existing: %v", st.Setup.PreExistingDeps)
+	}
+}
+
+// The dependency check has the same rule as the runtime step above, and the
+// auroraboot shim made a second setup the normal path on Linux: the first run
+// stops after installing docker, tells the user to enable the service and join
+// the group, and asks for a re-run. By then every package the first run
+// installed is present, so a re-run that records whatever it finds would call
+// them pre-existing and cleanup would leave them on the machine for good.
+func TestASecondSetupKeepsInstalledDependenciesRemovable(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	if err := os.Remove(filepath.Join(e.bin, "ip")); err != nil {
+		t.Fatal(err)
+	}
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "apt"}
+	}
+	installPackages = func(_ string, pkgs []string, _ bool) error {
+		if !slices.Equal(pkgs, []string{"iproute2"}) {
+			t.Errorf("installed %v, want [iproute2]", pkgs)
+		}
+		e.write(t, "ip", "#!/bin/sh\nexit 0\n")
+		return nil
+	}
+	if out, err := e.setup("", "-yes"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+
+	installPackages = func(string, []string, bool) error {
+		t.Error("the second setup installed again")
+		return nil
+	}
+	if out, err := e.setup("", "-yes"); err != nil {
+		t.Fatalf("second setup: %v\n%s", err, out)
+	}
+
+	st := e.load(t)
+	if !slices.Contains(st.Setup.InstalledByKairosLab, "iproute2") {
+		t.Errorf("installed = %v, want iproute2 tracked", st.Setup.InstalledByKairosLab)
+	}
+	if slices.Contains(st.Setup.PreExistingDeps, "iproute2") {
+		t.Errorf("pre-existing = %v: a re-run made an installed dependency pre-existing", st.Setup.PreExistingDeps)
+	}
+	// The consequence the user sees: cleanup keeps everything it believes was
+	// already there.
+	remove := cleanup.DependenciesToRemove(st.Setup.PreExistingDeps, st.Setup.InstalledByKairosLab)
+	if !slices.Contains(remove, "iproute2") {
+		t.Errorf("cleanup would remove %v: iproute2 is no longer removable", remove)
+	}
+}
+
+// Anyone who ran setup twice before the fix already has the two lists
+// overlapping on disk, and no later run would have cleared it: the next setup
+// has to repair the state it loads, not only stop adding to it.
+func TestSetupRepairsADependencyRecordedBothWays(t *testing.T) {
+	e := newABEnv(t)
+	e.runtime(t, "docker")
+	detectPlatform = func() platform.Info {
+		return platform.Info{OS: "linux", Arch: "amd64", PackageManager: "apt"}
+	}
+	st := e.load(t)
+	st.Setup.InstalledByKairosLab = []string{"iproute2"}
+	st.Setup.PreExistingDeps = []string{"iproute2"}
+	if err := e.store.Save(st); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := e.setup("", "-yes"); err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+
+	st = e.load(t)
+	if slices.Contains(st.Setup.PreExistingDeps, "iproute2") {
+		t.Errorf("pre-existing = %v: the overlap survived a setup run", st.Setup.PreExistingDeps)
+	}
+	if remove := cleanup.DependenciesToRemove(st.Setup.PreExistingDeps, st.Setup.InstalledByKairosLab); !slices.Contains(remove, "iproute2") {
+		t.Errorf("cleanup would remove %v, want iproute2 back on the list", remove)
 	}
 }
 
