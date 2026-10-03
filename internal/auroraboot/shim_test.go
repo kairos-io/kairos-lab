@@ -30,10 +30,17 @@ context)
 	exit 0
 	;;
 run)
+	printf '\036' >>"$STUB_RECORD"
+	exit_code=${STUB_EXIT:-0}
+	prev=
 	for a in "$@"; do
 		printf '%s\0' "$a" >>"$STUB_RECORD"
+		if [ "$prev" = --entrypoint ] && [ "$a" = chown ]; then
+			exit_code=${STUB_CHOWN_EXIT:-0}
+		fi
+		prev=$a
 	done
-	exit "${STUB_EXIT:-0}"
+	exit "$exit_code"
 	;;
 esac
 exit 99
@@ -43,14 +50,19 @@ type shimResult struct {
 	stdout string
 	stderr string
 	exit   int
-	// argv is what the runtime received, starting with "run". It is nil when
-	// the runtime was never called.
+	// argv is what the runtime received on its FIRST run, starting with
+	// "run". It is nil when the runtime was never called.
 	argv []string
+	// runs is every run the shim made, in order. A shim that was asked to
+	// write a host path makes a second one to hand that path back to the
+	// user, so argv is runs[0] and the fixup is runs[1].
+	runs [][]string
 }
 
 // shimOpts carries the environment a shim run sees. Zero values are fine.
 type shimOpts struct {
 	stubExit    int
+	chownExit   int
 	dockerHost  string
 	contextHost string
 	infoSocket  string
@@ -123,6 +135,7 @@ func runShim(t *testing.T, goos, runtime string, opts shimOpts, cwd string, args
 		"HOME=" + tempDir(t),
 		"STUB_RECORD=" + record,
 		"STUB_EXIT=" + strconv.Itoa(opts.stubExit),
+		"STUB_CHOWN_EXIT=" + strconv.Itoa(opts.chownExit),
 		"STUB_CONTEXT_HOST=" + opts.contextHost,
 		"STUB_INFO_SOCKET=" + opts.infoSocket,
 	}
@@ -143,7 +156,17 @@ func runShim(t *testing.T, goos, runtime string, opts shimOpts, cwd string, args
 		t.Fatalf("running the shim: %v", err)
 	}
 	if b, rerr := os.ReadFile(record); rerr == nil {
-		res.argv = strings.Split(strings.TrimSuffix(string(b), "\x00"), "\x00")
+		// The stub writes \036 before each run's NUL-separated argv, so one
+		// record can hold more than one run.
+		for _, chunk := range strings.Split(string(b), "\x1e") {
+			if chunk == "" {
+				continue
+			}
+			res.runs = append(res.runs, strings.Split(strings.TrimSuffix(chunk, "\x00"), "\x00"))
+		}
+		if len(res.runs) > 0 {
+			res.argv = res.runs[0]
+		}
 	}
 	return res
 }
@@ -775,4 +798,136 @@ func TestShimNeverMountsADoubleSlashPath(t *testing.T) {
 	other := tempDir(t)
 	res := runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", other+"/out", "dir:"+other, "img")
 	noDouble("ordinary", res.argv)
+}
+
+// chownRun returns the ownership fixup run the shim made, or nil when it made
+// none. It is identified by the entrypoint, not by position, so a test that
+// gets the order wrong fails on the assertion rather than on a nil slice.
+func chownRun(runs [][]string) []string {
+	for _, r := range runs {
+		if hasSeq(r, "--entrypoint", "chown") {
+			return r
+		}
+	}
+	return nil
+}
+
+// mkOutput creates an output directory the way the container would, so the
+// shim has something to hand back. The stub runtime writes nothing.
+func mkOutput(t *testing.T, parts ...string) string {
+	t.Helper()
+	p := filepath.Join(parts...)
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestShimHandsTheOutputBackToTheUser(t *testing.T) {
+	cwd := tempDir(t)
+	build := mkOutput(t, cwd, "build")
+	res := runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", "./build", "img")
+	if res.exit != 0 {
+		t.Fatalf("exit = %d, stderr: %s", res.exit, res.stderr)
+	}
+	if len(res.runs) != 2 {
+		t.Fatalf("made %d runs, want the build and the ownership fixup: %q", len(res.runs), res.runs)
+	}
+	fix := chownRun(res.runs)
+	if fix == nil {
+		t.Fatalf("no ownership fixup run in %q", res.runs)
+	}
+	// It is the second run: the output does not exist until the build wrote it.
+	if chownRun(res.runs[:1]) != nil {
+		t.Errorf("the fixup ran before the build: %q", res.runs)
+	}
+	// The new owner comes from the current directory, which is the only
+	// spelling that is also right under a rootless runtime, where container
+	// root already IS the user.
+	for _, want := range [][]string{{"run", "--rm"}, {"-v", cwd + ":" + cwd}, {"--entrypoint", "chown"}, {ImageRef(), "-R", "--reference=" + cwd, "--", build}} {
+		if !hasSeq(fix, want...) {
+			t.Errorf("fixup argv %q is missing %q", fix, want)
+		}
+	}
+	for _, a := range fix {
+		if strings.HasPrefix(a, "--reference=") && a != "--reference="+cwd {
+			t.Errorf("fixup references %q, want the current directory %q", a, cwd)
+		}
+		if a == "-u" || a == "--user" {
+			t.Errorf("fixup names an explicit uid in %q", fix)
+		}
+	}
+}
+
+func TestShimOwnershipFixupMountsAnOutputOutsideTheCWD(t *testing.T) {
+	cwd := tempDir(t)
+	out := filepath.Join(tempDir(t), "iso")
+	res := runShim(t, "linux", "docker", shimOpts{}, cwd, "build-iso", "--output", out, "img")
+	fix := chownRun(res.runs)
+	if fix == nil {
+		t.Fatalf("no ownership fixup run in %q", res.runs)
+	}
+	if !hasSeq(fix, "-v", out+":"+out) {
+		t.Errorf("fixup argv %q does not mount %q", fix, out)
+	}
+	if fix[len(fix)-1] != out {
+		t.Errorf("fixup target = %q, want %q", fix[len(fix)-1], out)
+	}
+}
+
+func TestShimSkipsTheFixupWhenNothingWritesAHostPath(t *testing.T) {
+	cwd := tempDir(t)
+	// build-iso without --output writes inside the container, and the shim
+	// already warns about that; there is no host path to hand back.
+	for _, args := range [][]string{{"build-iso", "img"}, {"--help"}, {"pull"}} {
+		res := runShim(t, "linux", "docker", shimOpts{}, cwd, args...)
+		if r := chownRun(res.runs); r != nil {
+			t.Errorf("%q made an ownership fixup run %q, want none", args, r)
+		}
+		if len(res.runs) > 1 {
+			t.Errorf("%q made %d runs, want 1: %q", args, len(res.runs), res.runs)
+		}
+	}
+}
+
+func TestShimSkipsTheFixupWhenTheOutputWasNeverWritten(t *testing.T) {
+	cwd := tempDir(t)
+	// The build failed before creating ./build. Chowning a path that is not
+	// there would print a second error over the one the user already has.
+	res := runShim(t, "linux", "docker", shimOpts{stubExit: 1}, cwd, "build-iso", "--output", "./build", "img")
+	if res.exit != 1 {
+		t.Errorf("exit = %d, want 1", res.exit)
+	}
+	if r := chownRun(res.runs); r != nil {
+		t.Errorf("made an ownership fixup run %q for an output that does not exist", r)
+	}
+	if res.stderr != "" {
+		t.Errorf("stderr = %q, want nothing", res.stderr)
+	}
+}
+
+func TestShimFixesOwnershipAfterAFailedBuildAndKeepsItsStatus(t *testing.T) {
+	cwd := tempDir(t)
+	mkOutput(t, cwd, "o")
+	res := runShim(t, "linux", "docker", shimOpts{stubExit: 42}, cwd, "build-iso", "--output", "o", "img")
+	// A partial build leaves root-owned leftovers too, so the fixup runs,
+	// and it must not become the status the user sees.
+	if res.exit != 42 {
+		t.Errorf("exit = %d, want the build's 42; stderr: %s", res.exit, res.stderr)
+	}
+	if chownRun(res.runs) == nil {
+		t.Errorf("no ownership fixup run after a failed build: %q", res.runs)
+	}
+}
+
+func TestShimWarnsButSucceedsWhenTheFixupFails(t *testing.T) {
+	cwd := tempDir(t)
+	mkOutput(t, cwd, "o")
+	res := runShim(t, "linux", "docker", shimOpts{chownExit: 3}, cwd, "build-iso", "--output", "o", "img")
+	if res.exit != 0 {
+		t.Errorf("exit = %d, want the build's 0; the fixup must not fail the build", res.exit)
+	}
+	if !strings.Contains(res.stderr, "owned by root") {
+		t.Errorf("stderr = %q, want a warning that the output may still be owned by root", res.stderr)
+	}
 }
