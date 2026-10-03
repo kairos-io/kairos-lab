@@ -268,8 +268,8 @@ func TestBrewCaskCommands(t *testing.T) {
 	if err != nil || len(inst) != 1 || !slices.Equal(inst[0], []string{"brew", "install", "--cask", "docker-desktop"}) {
 		t.Errorf("cask install = %v, %v", inst, err)
 	}
-	un, err := uninstallCommand(BrewCask, []string{"docker-desktop"}, false)
-	if err != nil || !slices.Equal(un, []string{"brew", "uninstall", "--cask", "docker-desktop"}) {
+	un, err := uninstallCommands(BrewCask, []string{"docker-desktop"}, false)
+	if err != nil || len(un) != 1 || !slices.Equal(un[0], []string{"brew", "uninstall", "--cask", "docker-desktop"}) {
 		t.Errorf("cask uninstall = %v, %v", un, err)
 	}
 	// The formula path is unchanged.
@@ -277,8 +277,63 @@ func TestBrewCaskCommands(t *testing.T) {
 	if !slices.Equal(inst[0], []string{"brew", "install", "qemu"}) {
 		t.Errorf("formula install = %v", inst)
 	}
-	un, _ = uninstallCommand("brew", []string{"qemu"}, false)
-	if !slices.Equal(un, []string{"brew", "uninstall", "qemu"}) {
+	un, _ = uninstallCommands("brew", []string{"qemu"}, false)
+	if len(un) != 1 || !slices.Equal(un[0], []string{"brew", "uninstall", "qemu"}) {
 		t.Errorf("formula uninstall = %v", un)
+	}
+}
+
+// TestUninstallRemovesPulledInDependencies locks in that an uninstall also
+// clears what the install pulled in. Without it `apt-get remove docker.io`
+// leaves docker-cli behind and `docker` still runs after cleanup.
+func TestUninstallRemovesPulledInDependencies(t *testing.T) {
+	cases := []struct {
+		pm   string
+		want [][]string
+	}{
+		{"apt", [][]string{
+			{"sudo", "apt-get", "remove", "-y", "docker.io"},
+			{"sudo", "apt-get", "autoremove", "-y"},
+		}},
+		{"dnf", [][]string{{"sudo", "dnf", "remove", "-y", "--setopt=clean_requirements_on_remove=1", "docker.io"}}},
+		{"yum", [][]string{{"sudo", "yum", "remove", "-y", "--setopt=clean_requirements_on_remove=1", "docker.io"}}},
+		{"zypper", [][]string{{"sudo", "zypper", "--non-interactive", "remove", "--clean-deps", "docker.io"}}},
+		{"pacman", [][]string{{"sudo", "pacman", "-Rs", "--noconfirm", "docker.io"}}},
+		{"apk", [][]string{{"sudo", "apk", "del", "docker.io"}}},
+	}
+	for _, c := range cases {
+		got, err := uninstallCommands(c.pm, []string{"docker.io"}, true)
+		if err != nil {
+			t.Errorf("%s: %v", c.pm, err)
+			continue
+		}
+		if len(got) != len(c.want) {
+			t.Errorf("%s = %v, want %v", c.pm, got, c.want)
+			continue
+		}
+		for i := range got {
+			if !slices.Equal(got[i], c.want[i]) {
+				t.Errorf("%s command %d = %v, want %v", c.pm, i, got[i], c.want[i])
+			}
+		}
+	}
+	if _, err := uninstallCommands("nope", []string{"docker.io"}, false); err == nil {
+		t.Error("unsupported package manager accepted")
+	}
+}
+
+// TestUninstallSideEffectNamesOnlyTheUnscopedOne guards the cleanup plan: the
+// note has to appear for apt, whose autoremover reaches past the packages
+// being removed, and nowhere else.
+func TestUninstallSideEffectNamesOnlyTheUnscopedOne(t *testing.T) {
+	if note := UninstallSideEffect("apt"); note == "" {
+		t.Error("apt reports no side effect, but apt-get autoremove is not scoped to the removal")
+	} else if !strings.Contains(note, "autoremove") {
+		t.Errorf("apt note = %q, want it to name the command that runs", note)
+	}
+	for _, pm := range []string{"brew", BrewCask, "dnf", "yum", "zypper", "pacman", "apk", ""} {
+		if note := UninstallSideEffect(pm); note != "" {
+			t.Errorf("%s reports %q, but its cleanup is scoped to the removal", pm, note)
+		}
 	}
 }
