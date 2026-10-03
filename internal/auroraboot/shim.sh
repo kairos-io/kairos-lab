@@ -10,6 +10,9 @@
 # container as on the host, and the arguments are passed through unchanged.
 # Any other host path named in the arguments is mounted at its own path too.
 #
+# AuroraBoot runs as root inside the container, so after it exits the paths it
+# was asked to write are handed back to whoever ran the shim.
+#
 # Known limits: values given to --set are not scanned for paths, and
 # AURORABOOT_* environment variables are not passed into the container.
 
@@ -261,6 +264,25 @@ EOF
 	mounts=$mounts$1$nl
 }
 
+# add_output records host path $1 as something the container writes, so its
+# ownership can be handed back afterwards. Unlike add_mount this keeps paths
+# inside the current directory too: those need no -v of their own, but they are
+# exactly where build-iso --output ./build lands.
+add_output() {
+	case $1 in
+	*"$nl"*) return 0 ;;
+	esac
+	while IFS= read -r o; do
+		[ -n "$o" ] || continue
+		if is_under "$1" "$o"; then
+			return 0
+		fi
+	done <<EOF
+$outputs
+EOF
+	outputs=$outputs$1$nl
+}
+
 # add_path handles one host path named in the arguments. $1 is INPUT or
 # OUTPUT, $2 the value as written, $3 is "strict" for a path given to a flag
 # that is known to take one and "lenient" for any other token. A strict path
@@ -292,6 +314,9 @@ add_path() {
 		return 0
 	fi
 	if is_under "$p" "$cwd"; then
+		if [ "$1" = OUTPUT ]; then
+			add_output "$p"
+		fi
 		return 0
 	fi
 	if is_reserved "$a" || is_reserved "$p"; then
@@ -304,6 +329,9 @@ add_path() {
 		mkdir -p "$p" || die "cannot create $p"
 	fi
 	add_mount "$p"
+	if [ "$1" = OUTPUT ]; then
+		add_output "$p"
+	fi
 }
 
 # add_token handles a token that is not known to be a path: it may name a
@@ -364,6 +392,56 @@ scan_args() {
 	done
 }
 
+# give_back_outputs makes the paths the container wrote belong to whoever ran
+# the shim. AuroraBoot needs root inside the container, so under a rootful
+# runtime every file it creates on a bind mount is root-owned on the host, and
+# the user who was never asked for sudo cannot delete, move or overwrite the
+# ISO they just built (kairos-io/kairos#5139). The fix runs in a container
+# because that is the only root available without asking the host for sudo.
+#
+# The new owner is taken with --reference from the current directory instead of
+# from `id -u`, which is what makes one call correct on both kinds of runtime.
+# Under a rootful runtime the directory shows the host uid inside the container
+# and the output gets it. Under a rootless one it shows 0, because container
+# root IS the invoking user, and the chown is the no-op it should be. Naming
+# `id -u` would instead push rootless output into a subuid range nobody owns.
+give_back_outputs() {
+	[ -n "$outputs" ] || return 0
+	# Only the paths that are actually there. A build that failed before it
+	# wrote its output would otherwise turn a missing directory into a chown
+	# error and a warning, on top of the failure the user already has.
+	targets=
+	while IFS= read -r o; do
+		if [ -n "$o" ] && [ -e "$o" ]; then
+			targets=$targets$o$nl
+		fi
+	done <<EOF
+$outputs
+EOF
+	[ -n "$targets" ] || return 0
+	set -- run --rm -v "$cwd:$cwd"
+	while IFS= read -r o; do
+		if [ -n "$o" ] && ! is_under "$o" "$cwd"; then
+			set -- "$@" -v "$o:$o"
+		fi
+	done <<EOF
+$targets
+EOF
+	if [ "$os" = linux ]; then
+		set -- "$@" --security-opt label=disable
+	fi
+	set -- "$@" --entrypoint chown "$image" -R --reference="$cwd" --
+	while IFS= read -r o; do
+		if [ -n "$o" ]; then
+			set -- "$@" "$o"
+		fi
+	done <<EOF
+$targets
+EOF
+	"$runtime" "$@" >/dev/null ||
+		printf '%s\n' 'auroraboot: warning: could not hand the output back; it may still be owned by root' >&2
+}
+
 cwd=$(pwd -P) || die 'cannot resolve the current directory'
 logical=$(pwd)
 if is_reserved "$cwd" || is_reserved "$logical"; then
@@ -374,6 +452,7 @@ subcommand=$(find_subcommand "$@")
 warn_build_iso_without_output "$@"
 
 mounts=
+outputs=
 scan_args "$@"
 
 # The options are built by prepending to the arguments, last option first, so
@@ -405,4 +484,11 @@ if [ -t 0 ] && [ -t 1 ]; then
 	set -- -t "$@"
 fi
 
-exec "$runtime" run --rm -i "$@"
+# Not exec: the run has to be followed by give_back_outputs. The exit status
+# is carried over unchanged, so a failed build still exits the way a plain
+# `docker run` would, and the ownership is handed back after a failure too,
+# since a partial build leaves root-owned files behind just the same.
+"$runtime" run --rm -i "$@"
+status=$?
+give_back_outputs
+exit "$status"
