@@ -123,7 +123,7 @@ func TestBuildLinuxNetdevPerNetworkMode(t *testing.T) {
 	// guest a tap on a NetworkManager bridge, and only the bridge's own IPv4
 	// method differs, which is not configured here.
 	const tapNetdev = "tap,id=net0,ifname=kairoslab-tap0,script=no,downscript=no"
-	const userNetdev = "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080"
+	const userNetdev = "user,id=net0,hostfwd=tcp:" + DefaultUserModeHostBind + ":2222-:22,hostfwd=tcp:" + DefaultUserModeHostBind + ":8080-:8080"
 	for _, tc := range []struct {
 		name       string
 		mode       string
@@ -513,5 +513,62 @@ func TestBuildLinuxAMD64KeepsTheIDECD(t *testing.T) {
 	}
 	if strings.Contains(joined, "scsi") {
 		t.Errorf("amd64 should not gain a SCSI controller: %s", joined)
+	}
+}
+
+// TestUserModeForwardsNeverBindEveryInterface is the regression test for
+// kairos-io/kairos#5053.
+//
+// An empty host address in a QEMU hostfwd rule is INADDR_ANY, so
+// "hostfwd=tcp::2222-:22" published a live Kairos guest's sshd -- and an
+// installer ISO answers it with a documented default login -- on every
+// interface of the host. This builds the netdev the way the affected callers
+// do and asserts the shape that is never safe, rather than a single expected
+// string, so a future caller that reintroduces an empty bind by some other
+// route fails here too.
+//
+// It is GOOS-free on purpose: userModeNetdevArg is what both builders call,
+// and the bug was in neither of them.
+func TestUserModeForwardsNeverBindEveryInterface(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  StartConfig
+	}{
+		// The index-0 config, which is where the bug was: no ports and no
+		// bind set, because index 0 took every default it could.
+		{"nothing set at all", StartConfig{}},
+		// Ports set, bind left unset: the shape a caller gets when it knows
+		// about the port fields and not the bind one.
+		{"ports set, bind unset", StartConfig{SSHPort: 2222, HTTPPort: 8080}},
+		// Whitespace is not an address. netDeviceArg in this same file
+		// already had to learn that " " slips past a bare == "" check.
+		{"whitespace bind", StartConfig{UserModeHostBind: " "}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			netdev := userModeNetdevArg(tc.cfg)
+			// "tcp::" is a hostfwd rule with no host address, which is the
+			// bug verbatim.
+			if strings.Contains(netdev, "tcp::") {
+				t.Errorf("forwards bind every host interface (INADDR_ANY): %q", netdev)
+			}
+			for _, want := range []string{
+				"hostfwd=tcp:" + DefaultUserModeHostBind + ":2222-:22",
+				"hostfwd=tcp:" + DefaultUserModeHostBind + ":8080-:8080",
+			} {
+				if !strings.Contains(netdev, want) {
+					t.Errorf("missing %q in %q", want, netdev)
+				}
+			}
+		})
+	}
+}
+
+// A caller that does name an address still gets it. Without this, deleting
+// the field and hardcoding the default would keep the test above green.
+func TestUserModeForwardsHonourAnExplicitBind(t *testing.T) {
+	netdev := userModeNetdevArg(StartConfig{SSHPort: 2223, HTTPPort: 8081, UserModeHostBind: "192.0.2.7"})
+	const want = "user,id=net0,hostfwd=tcp:192.0.2.7:2223-:22,hostfwd=tcp:192.0.2.7:8081-:8080"
+	if netdev != want {
+		t.Errorf("netdev = %q, want %q", netdev, want)
 	}
 }
