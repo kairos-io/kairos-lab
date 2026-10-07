@@ -109,25 +109,23 @@ func linuxNetworkPreflight(st *state.State, runtimeDir, mode, bridge, tapDevice,
 		// was not deleted. Which of them issued anything is not knowable from
 		// the joined error, so the message names the gates instead of
 		// listing the steps as though they had all run.
-		// A refusal is not a failed teardown, and the two must not be
-		// answered the same way. cleanupNMConnections refuses a name it was
-		// handed before it issues anything, so nothing was touched and the
-		// host is as it was; what is wrong is the stored configuration, and
-		// no later step of this start makes it right. Reading it as a
-		// teardown failure got it wrong in both directions: the message
-		// below would tell a shared user that "every step after the one
-		// above was still attempted" and that "the host's networking has
-		// changed" when no command ran, and the bridged path -- which drops
-		// the error because it rewrites every connection this teardown
-		// deletes -- would carry on into `nmcli connection modify <name>`
-		// over the name just refused, against what may be the host's own
-		// profile. Neither mode may proceed past a name this tool will not
-		// touch, so the refusal is intercepted here, ahead of the split.
+		// A refusal is not a failed teardown. cleanupNMConnections refuses a
+		// name before it issues anything, so nothing was touched and no later
+		// step of this start makes the stored name right. Both modes must
+		// stop on it: shared would otherwise report it in the words of the
+		// partial teardown below, and bridged drops cleanupErr and would
+		// carry on into `nmcli connection modify` over the refused name. So
+		// it is intercepted here, ahead of the split.
+		//
+		// The message stays generic about WHY the name was refused: the
+		// wrapped error already names the reason, and there are three of them
+		// (a name of the wrong shape, a device of the wrong kind, and a stat
+		// that could not answer).
 		var refusal storedNameRefusal
 		if errors.As(cleanupErr, &refusal) {
 			return fmt.Errorf("%s networking cannot start with this stored network configuration: %w. "+
-				"Nothing was changed on the host: this refusal comes before the cleanup issues any command, so no connection was deleted and no interface was removed. "+
-				"The name above was read from the state file in this config directory, and it names a device on this host that is not the kind of device kairos-lab creates -- deleting it would take that device, and whatever runs over it, off the network. "+
+				"Nothing was changed on the host: the refusal comes before the cleanup issues any command, so no connection was deleted and no interface was removed. "+
+				"The name it refused was read from the state file in this config directory. "+
 				"Correct or remove that name in the state file and start again, or start in a fresh config directory",
 				mode, cleanupErr)
 		}
@@ -917,13 +915,10 @@ func cleanupNMConnections(bridgeConn, tapDevice, tapConn string, siblingLive boo
 	// from a bridge name that has already passed this same check and an
 	// integer index, never a string read fresh from state.json.
 	//
-	// Two checks per name, because the name alone does not say enough. This
-	// comment used to claim that validateStoredInterfaceName was what stopped
-	// a stored name of "eth0" turning into `sudo nmcli connection delete eth0`
-	// and `sudo ip link delete eth0`. It was not: that rule is a charset and
-	// a length, and "eth0" satisfies both (kairos-io/kairos#5051).
-	// refuseForeignStoredDevice is the check that actually stops it, by
-	// looking at the device the name resolves to rather than at the name.
+	// Two checks per name, because the shape of a name does not say enough:
+	// "eth0" is a valid name, and deleting it takes the host off the network
+	// (kairos-io/kairos#5051). refuseForeignStoredDevice is what stops that,
+	// by looking at the device the name resolves to rather than at the name.
 	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
 		return refuseStoredName(err)
 	}
@@ -1372,11 +1367,7 @@ func netDeviceExists(name string) (bool, error) {
 // joined failure means the teardown ran and some of it did not work, so the
 // host's networking has changed in a way nobody has a full account of. A
 // refusal means nothing ran at all: the host is exactly as it was, and what
-// is wrong is the stored configuration. linuxNetworkPreflight used to read
-// both as the first, which made it describe a refusal to a shared start in
-// the words of a partial teardown -- and, on the bridged path, drop the
-// refusal entirely and carry on into `nmcli connection modify` over the very
-// name that was just refused.
+// is wrong is the stored configuration.
 //
 // The wrapped error is returned unchanged by Error, so the marker costs the
 // message nothing; it is read with errors.As, never printed.
@@ -1396,37 +1387,22 @@ func refuseStoredName(err error) error {
 // device of the wrong KIND on this host: something is there under that name,
 // and it is not the kind of device the caller says kairos-lab builds.
 //
-// What this does NOT establish is ownership. A device of the right kind
-// passes whoever made it, so a stored bridge name of "docker0", "virbr0" or a
-// hypervisor host's own "br0" still reaches the teardown. Closing that needs
-// a signal state.json cannot vouch for -- an NM profile property set at
-// creation, or a marker on the bridge -- and it cannot be a name rule:
-// bridged mode exists precisely so a user can name a bridge the host already
-// has, and CreatedByKairosLab lives in the same untrusted file. The narrower
-// case of libvirt's virbr0 inherited from the dropped `--network virbr` mode
-// is handled a layer up, in managedBridgeName. What is closed here is the one
-// kairos-io/kairos#5051 reports: a name that resolves to a device which is
-// not a bridge at all, which is what every physical NIC on the host is.
-//
-// validateStoredInterfaceName, which runs just before this, is a rule about
-// the SHAPE of a name: it rejects a name that would be read as an option, walk
-// out of a directory or carry an escape sequence into the terminal. It has no
-// opinion about what the name refers to, so it accepts "eth0", "bond0" and
-// every other real interface name -- see the note on it. This is the other
-// half: a rule about the DEVICE the name resolves to, which is the only thing
-// that separates a bridge kairos-lab made from the host's own NIC.
+// It pairs with validateStoredInterfaceName, which runs just before it and is
+// a rule about the SHAPE of a name. That rule accepts "eth0", "bond0" and
+// every other real interface name, so this is the other half: a rule about the
+// DEVICE the name resolves to.
 //
 // Three answers and not two, because "no such device" is not evidence of a
 // foreign one. An interrupted setup routinely leaves a NetworkManager profile
 // behind with no device of that name left to go with it, and the stale cleanup
 // exists to remove exactly that, so a name that resolves to nothing has to
-// pass. What is refused is the narrow, destructive case: the device is there
-// and it is the wrong kind of device.
+// pass. A stat that cannot answer refuses: the commands behind this guard run
+// under sudo and delete, so an unanswered question is not a yes.
 //
-// A stat that fails for any other reason refuses too. That is the fail-closed
-// direction: the commands behind this guard run under sudo and delete, so a
-// host whose /sys cannot answer "what kind of device is this" is a host where
-// the question has not been answered, not one where the answer was yes.
+// What this does NOT establish is ownership. A device of the right kind passes
+// whoever made it, so a stored bridge name of "docker0", "virbr0" or a host's
+// own "br0" still reaches the teardown. That gap is tracked in
+// kairos-io/kairos#5288; closing it needs a signal state.json cannot forge.
 func refuseForeignStoredDevice(field, name string, ours func(string) bool, want string) error {
 	exists, err := netDeviceExists(name)
 	if err != nil {
