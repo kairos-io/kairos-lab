@@ -62,7 +62,7 @@ func TestStaleCleanupStillTearsDownItsOwnBridge(t *testing.T) {
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName] = true
 	h.links[DefaultBridgeName] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 
 	if err := CleanupStaleNetworkResources(storedState(DefaultBridgeName)); err != nil {
 		t.Fatalf("the stale cleanup refused its own bridge: %v", err)
@@ -102,7 +102,7 @@ func TestCleanupRefusesAHostNICAsTheTap(t *testing.T) {
 	seedHostNIC(h)
 	h.conns[DefaultBridgeName] = true
 	h.links[DefaultBridgeName] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 
 	err := cleanupNMConnections(DefaultBridgeName, hostNIC, "", false)
 	if err == nil {
@@ -122,7 +122,7 @@ func TestCleanupStillDeletesItsOwnTap(t *testing.T) {
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName] = true
 	h.links[DefaultBridgeName] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.links[DefaultTapName] = true
 	// Said out loud rather than left to the fake's default, which answers
 	// "is this a tun/tap device" from whether the name parses as a generated
@@ -183,7 +183,7 @@ func TestCleanupRefusesWhenTheTapStatCannotAnswer(t *testing.T) {
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName] = true
 	h.links[DefaultBridgeName] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.invisibleBridges[DefaultTapName] = fs.ErrPermission
 
 	err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, "", false)
