@@ -300,6 +300,12 @@ func prepareLinuxBridgeWithNM(bridge, tap, tapConn, uplink string) error {
 	if err := sudo("nmcli", "connection", "up", bridgeConn); err != nil {
 		return err
 	}
+	// The bridge device exists from the activation above, which is the
+	// earliest `ip link set <bridge> alias` can reach it. See
+	// markBridgeAsOurs for why a failure here stops the start.
+	if err := markBridgeAsOurs(bridge, bridgeConn); err != nil {
+		return err
+	}
 	if err := sudo("nmcli", "connection", "up", uplinkConn); err != nil {
 		return err
 	}
@@ -468,6 +474,13 @@ func prepareLinuxSharedWithNM(bridge, tap, tapConn string, siblingLive bool) err
 	// so a refused run never puts a guest on the bridge.
 	if err := refuseForeignBridgePort(bridge, bridgeConn, tapConn, tap, tapNotYetAttached, siblingLive); err != nil {
 		return err
+	}
+	// Marked only once the port assertion above has passed: that check is
+	// what establishes this bridge is the one this start built, and a mark
+	// written before it would vouch for a bridge the next line may refuse.
+	// See markBridgeAsOurs for why a failure here stops the start.
+	if err := markBridgeAsOurs(bridge, bridgeConn); err != nil {
+		return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
 	}
 	if err := sudo("nmcli", "connection", "up", tapConn); err != nil {
 		return revertAfterSharedWritten(bridgeConn, tapConn, siblingLive, err)
@@ -919,10 +932,17 @@ func cleanupNMConnections(bridgeConn, tapDevice, tapConn string, siblingLive boo
 	// "eth0" is a valid name, and deleting it takes the host off the network
 	// (kairos-io/kairos#5051). refuseForeignStoredDevice is what stops that,
 	// by looking at the device the name resolves to rather than at the name.
+	//
+	// The bridge gets a third question on top of those two, and it is the one
+	// about OWNERSHIP: "docker0", "virbr0" and a hypervisor host's own "br0"
+	// are all real Linux bridges, so the kind check passes them and the
+	// teardown took the containers or guests behind them off the network
+	// (kairos-io/kairos#5288). refuseForeignStoredBridge asks instead whether
+	// this bridge carries a mark kairos-lab put on it at creation.
 	if err := validateStoredInterfaceName("bridge name", bridgeConn); err != nil {
 		return refuseStoredName(err)
 	}
-	if err := refuseForeignStoredDevice("bridge name", bridgeConn, isLinuxBridge, "a Linux bridge"); err != nil {
+	if err := refuseForeignStoredBridge("bridge name", bridgeConn); err != nil {
 		return refuseStoredName(err)
 	}
 	tap := tapDevice
@@ -1400,9 +1420,10 @@ func refuseStoredName(err error) error {
 // under sudo and delete, so an unanswered question is not a yes.
 //
 // What this does NOT establish is ownership. A device of the right kind passes
-// whoever made it, so a stored bridge name of "docker0", "virbr0" or a host's
-// own "br0" still reaches the teardown. That gap is tracked in
-// kairos-io/kairos#5288; closing it needs a signal state.json cannot forge.
+// whoever made it. For the bridge -- the name whose deletion takes a whole
+// host network down -- refuseForeignStoredBridge below asks that second
+// question; this one is left to the tap, where the kind check is the whole
+// guard for the reason isTapDevice gives.
 func refuseForeignStoredDevice(field, name string, ours func(string) bool, want string) error {
 	exists, err := netDeviceExists(name)
 	if err != nil {
@@ -1540,4 +1561,165 @@ func uidForUser(user string) (string, error) {
 		}
 	}
 	return uid, nil
+}
+
+// The two marks kairos-lab puts on a bridge it creates, and reads back before
+// it will delete one.
+//
+// kairos-io/kairos#5288: the kind check refuseForeignStoredDevice makes asks
+// what a name resolves to, never who made it, so "docker0", "virbr0" and a
+// hypervisor host's own "br0" all pass it and reach `sudo ip link delete`.
+// Nothing inside state.json can close that: the file is 0644, so a flag in it
+// vouching for the name beside it vouches for whatever that name was changed
+// to. The mark has to be set on the host at creation and read back from the
+// host at teardown.
+//
+// Two marks rather than one, because each covers the other's hole:
+//
+//   - The device alias is on the DEVICE, which is the thing `ip link delete`
+//     destroys, and it survives the NetworkManager profile being removed --
+//     the half-cleaned host the stale cleanup exists for. It does not survive
+//     a reboot: the bridge link is gone and NetworkManager rebuilds it from
+//     the keyfile, which carries no alias.
+//   - The user.data item is in the KEYFILE, so it does survive a reboot, and
+//     it is the one that answers after a bridged run whose `autoconnect yes`
+//     brought the bridge back by itself. It says nothing about a device whose
+//     profile has been deleted.
+//
+// A bridge is ours when EITHER answers yes, so the pair covers a reboot and a
+// deleted profile both. Neither is on docker0, virbr0 or a host br0: Docker
+// and libvirt build their bridges directly and NetworkManager has no profile
+// for them at all, and a br0 the host's admin made has a profile without this
+// item in it.
+//
+// The key is a valid NetworkManager user data key: libnm requires one '.' and
+// allows letters, digits and '-' (nm_setting_user_check_key).
+const (
+	bridgeOwnerAlias     = "kairos-lab"
+	bridgeOwnerMarkKey   = "kairos-lab.created"
+	bridgeOwnerMarkValue = "1"
+)
+
+// markBridgeAsOurs puts both marks on a bridge this run has just brought up.
+//
+// It runs on every start and not only on the one that creates the bridge, so
+// a bridge built by a kairos-lab older than this change is marked by the next
+// start over it, and a mark a reboot dropped is put back.
+//
+// A failure here fails the start. The alternative is a VM running on a bridge
+// no later teardown will agree to remove, which is a trap the user cannot see
+// until they try to clean up.
+func markBridgeAsOurs(bridge, bridgeConn string) error {
+	if err := sudo("ip", "link", "set", bridge, "alias", bridgeOwnerAlias); err != nil {
+		return err
+	}
+	// `+user.data` adds this item to whatever the profile already carries,
+	// where a bare `user.data` would replace the whole dictionary. The
+	// bridged path reuses a profile of this name when it finds one, so the
+	// dictionary is not necessarily this tool's to overwrite.
+	return sudo("nmcli", "connection", "modify", bridgeConn, "+user.data", bridgeOwnerMarkKey+"="+bridgeOwnerMarkValue)
+}
+
+// netDeviceIfalias reads a device's alias, the string `ip link set <dev> alias`
+// writes. The bool is whether the read answered at all: a device with no alias
+// set reads back as empty, and an unreadable /sys reads back as nothing known.
+// Neither is a mark, so both get the same treatment from the only caller.
+var netDeviceIfalias = func(name string) (string, bool) {
+	b, err := os.ReadFile(filepath.Join(sysClassNet, name, "ifalias"))
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(b)), true
+}
+
+// nmConnectionUserData returns the raw `nmcli -g user.data connection show`
+// output for a profile. Parsing it is userDataHasItem's, for the reason
+// netDevicePath gives about the device stat: the seam holds the subprocess and
+// nothing a caller depends on, so the decision stays in code a test executes.
+//
+// No sudo. user.data is not a secret, so an unprivileged nmcli reads it, and a
+// teardown that has not yet decided it may delete anything should not be
+// asking the user for a password.
+var nmConnectionUserData = func(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	if _, err := exec.LookPath("nmcli"); err != nil {
+		return "", false
+	}
+	out, err := exec.Command("nmcli", "-g", "user.data", "connection", "show", name).Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
+
+// userDataHasItem reports whether nmcli's rendering of a user.data dictionary
+// carries this key with this value.
+//
+// nmcli prints the dictionary as items separated by commas, each one a key and
+// a value around an '='. How much whitespace it puts around the '=' has
+// differed between versions, so both sides are trimmed rather than matched
+// exactly. The separator is safe to split on: nmcli escapes a comma that is
+// part of a value, and neither this key nor this value contains one.
+func userDataHasItem(out, key, value string) bool {
+	for _, field := range strings.FieldsFunc(out, func(r rune) bool { return r == ',' || r == '\n' }) {
+		k, v, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(k) == key && strings.TrimSpace(v) == value {
+			return true
+		}
+	}
+	return false
+}
+
+// bridgeCarriesOurMark reports whether this bridge is one kairos-lab built,
+// by either of the two marks markBridgeAsOurs puts on it.
+func bridgeCarriesOurMark(bridge string) bool {
+	if alias, ok := netDeviceIfalias(bridge); ok && alias == bridgeOwnerAlias {
+		return true
+	}
+	data, ok := nmConnectionUserData(bridge)
+	return ok && userDataHasItem(data, bridgeOwnerMarkKey, bridgeOwnerMarkValue)
+}
+
+// refuseForeignStoredBridge is refuseForeignStoredDevice plus the ownership
+// question, for the one name where the kind check is not enough.
+//
+// The three answers it shares with refuseForeignStoredDevice are unchanged and
+// are made in the same order, so the cases that function's doc comment argues
+// through still hold: a stat that cannot answer refuses, a name that resolves
+// to no device passes -- the leftover profile from an interrupted setup, which
+// the stale cleanup exists to remove -- and a device of the wrong kind is
+// refused in the words kairos-io/kairos#5051 gave it.
+//
+// The fourth answer is the new one. A Linux bridge with neither mark on it is
+// a bridge this tool did not build, and the commands behind this guard are
+// `nmcli connection delete` and `ip link delete`.
+//
+// A bridge kairos-lab built before this change carries no mark either, and is
+// refused with everything else. That is the honest reading -- nothing on the
+// host distinguishes it from the host's own br0 -- and the message names the
+// two ways out, the first of which is simply to start a VM again, since
+// markBridgeAsOurs runs on every start.
+func refuseForeignStoredBridge(field, name string) error {
+	exists, err := netDeviceExists(name)
+	if err != nil {
+		return fmt.Errorf("invalid %s %q in stored configuration: cannot tell what kind of device this is: %w", field, name, err)
+	}
+	if !exists {
+		return nil
+	}
+	if !isLinuxBridge(name) {
+		return fmt.Errorf("invalid %s %q in stored configuration: %s is a device on this host and is not a Linux bridge, so this teardown will not delete it", field, name, name)
+	}
+	if bridgeCarriesOurMark(name) {
+		return nil
+	}
+	return fmt.Errorf("invalid %s %q in stored configuration: %s is a Linux bridge on this host that kairos-lab did not create, so this teardown will not delete it. "+
+		"A bridge kairos-lab builds carries the %q device alias and the %s=%s NetworkManager user data, and this one carries neither. "+
+		"If kairos-lab built it before this version, `kairos-lab start` marks it and the teardown then accepts it; otherwise remove that name from the state file, or delete the bridge by hand",
+		field, name, name, bridgeOwnerAlias, bridgeOwnerMarkKey, bridgeOwnerMarkValue)
 }

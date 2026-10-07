@@ -33,6 +33,7 @@ import (
 	"io/fs"
 	"os"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -109,6 +110,19 @@ type fakeHost struct {
 	// passes condition 1 is modelled as a real, self-owned tap device by
 	// default, which is what an ordinary kairos-lab-created tap is.
 	foreignOwnedTaps map[string]bool
+	// aliases is the device alias each `ip link set <dev> alias <v>` left on
+	// a device, and is what netDeviceIfalias reads back. A device absent from
+	// it has no alias, which is what every bridge on the host has until
+	// markBridgeAsOurs runs over it -- including a bridge a test seeds into
+	// `bridges` directly. Ownership is modelled as the mark and not as
+	// membership of a table, so a test that wants its own bridge torn down
+	// has to seed the mark too: seedOurBridge is the one way to do it.
+	aliases map[string]string
+	// userData is the NetworkManager user.data dictionary of each profile,
+	// keyed by connection name, as `nmcli connection modify <c> +user.data
+	// k=v` built it. nmConnectionUserData renders it back the way nmcli
+	// prints it, so the parse in userDataHasItem runs for real.
+	userData map[string]map[string]string
 	// slaveLinksCalls counts how many times the port list was read. The
 	// number is a claim internal/app's consent paragraph makes out loud, so
 	// it is pinned rather than described.
@@ -146,6 +160,8 @@ func newFakeHost(t *testing.T) *fakeHost {
 		notRealTapDevices: map[string]bool{},
 		realTapDevices:    map[string]bool{},
 		foreignOwnedTaps:  map[string]bool{},
+		aliases:           map[string]string{},
+		userData:          map[string]map[string]string{},
 	}
 
 	origSudo := sudo
@@ -159,6 +175,8 @@ func newFakeHost(t *testing.T) *fakeHost {
 	origDelay := staleCleanupSettleDelay
 	origTunFlags := tapSysfsTunFlagsReadable
 	origOwnerUID := tapSysfsOwnerUID
+	origIfalias := netDeviceIfalias
+	origUserData := nmConnectionUserData
 	t.Cleanup(func() {
 		sudo = origSudo
 		networkManagerActive = origNMActive
@@ -171,6 +189,8 @@ func newFakeHost(t *testing.T) *fakeHost {
 		staleCleanupSettleDelay = origDelay
 		tapSysfsTunFlagsReadable = origTunFlags
 		tapSysfsOwnerUID = origOwnerUID
+		netDeviceIfalias = origIfalias
+		nmConnectionUserData = origUserData
 	})
 
 	sudo = h.run
@@ -240,6 +260,30 @@ func newFakeHost(t *testing.T) *fakeHost {
 			return "", false
 		}
 		return want, true
+	}
+
+	// The two ownership marks. Both answer "nothing known" for a device or a
+	// profile the fake has no entry for, which is what an unmarked bridge and
+	// an nmcli that cannot answer both look like, and is the answer
+	// bridgeCarriesOurMark must not read as a yes.
+	netDeviceIfalias = func(name string) (string, bool) {
+		alias, ok := h.aliases[name]
+		return alias, ok
+	}
+	// Rendered the way nmcli prints a user.data dictionary -- `k = v` items
+	// separated by commas -- so userDataHasItem's parse is exercised rather
+	// than bypassed by handing the test's own map straight back.
+	nmConnectionUserData = func(name string) (string, bool) {
+		data, ok := h.userData[name]
+		if !ok {
+			return "", false
+		}
+		items := make([]string, 0, len(data))
+		for k, v := range data {
+			items = append(items, k+" = "+v)
+		}
+		sort.Strings(items)
+		return strings.Join(items, ", "), true
 	}
 
 	// Both variables empty keeps tapOwnerUID on its os.Getuid() branch, so the
@@ -356,6 +400,16 @@ func (h *fakeHost) apply(argv []string) {
 		h.deactivate(argv[3])
 		delete(h.conns, argv[3])
 		delete(h.profiles, argv[3])
+		delete(h.userData, argv[3])
+	case argv[0] == "nmcli" && argv[1] == "connection" && argv[2] == "modify" && len(argv) >= 6 && argv[4] == "+user.data":
+		k, v, ok := strings.Cut(argv[5], "=")
+		if !ok {
+			return
+		}
+		if h.userData[argv[3]] == nil {
+			h.userData[argv[3]] = map[string]string{}
+		}
+		h.userData[argv[3]][k] = v
 	case argv[0] == "nmcli" && argv[1] == "connection" && argv[2] == "down":
 		h.deactivate(argv[3])
 	case argv[0] == "nmcli" && argv[1] == "connection" && argv[2] == "up":
@@ -364,6 +418,12 @@ func (h *fakeHost) apply(argv []string) {
 		delete(h.links, argv[3])
 		delete(h.bridges, argv[3])
 		delete(h.slaves, argv[3])
+		// The alias is an attribute of the device, so it goes with it. This
+		// is also what a reboot does to it, which is the hole the user.data
+		// mark covers.
+		delete(h.aliases, argv[3])
+	case argv[0] == "ip" && argv[1] == "link" && argv[2] == "set" && len(argv) >= 6 && argv[4] == "alias":
+		h.aliases[argv[3]] = argv[5]
 	case argv[0] == "nmcli" && argv[1] == "connection" && argv[2] == "add":
 		conn := valueAfter(argv, "con-name")
 		if conn == "" {
@@ -383,6 +443,18 @@ func (h *fakeHost) apply(argv []string) {
 			h.activate(conn)
 		}
 	}
+}
+
+// seedOurBridge seeds a bridge kairos-lab built: the device, its "bridge"
+// entry under /sys and the device alias markBridgeAsOurs puts on it. It is how
+// a test says "this bridge is mine" without running a whole start, and it
+// exists so that saying so is one call rather than three lines a test can get
+// two thirds right. A bridge seeded without it is a bridge the host already
+// had, which is what kairos-io/kairos#5288 is about.
+func (h *fakeHost) seedOurBridge(name string) {
+	h.links[name] = true
+	h.bridges[name] = true
+	h.aliases[name] = bridgeOwnerAlias
 }
 
 // lines renders the recorded commands one per line, in order, so a whole
@@ -433,6 +505,8 @@ func sharedSequence(uid string) []string {
 		"nmcli connection add type tun ifname kairoslab-tap0 con-name kairoslab0-tap mode tap owner " + uid + " master kairoslab0 slave-type bridge autoconnect no",
 		"nmcli connection modify kairoslab0-tap connection.interface-name kairoslab-tap0 tun.mode tap tun.owner " + uid + " master kairoslab0 slave-type bridge connection.autoconnect no",
 		"nmcli connection up kairoslab0",
+		"ip link set kairoslab0 alias kairos-lab",
+		"nmcli connection modify kairoslab0 +user.data kairos-lab.created=1",
 		"nmcli connection up kairoslab0-tap",
 	}
 }
@@ -449,6 +523,8 @@ func bridgedSequence(uid string) []string {
 		"nmcli connection add type tun ifname kairoslab-tap0 con-name kairoslab0-tap mode tap owner " + uid + " master kairoslab0 slave-type bridge autoconnect yes",
 		"nmcli connection modify kairoslab0-tap connection.interface-name kairoslab-tap0 tun.mode tap tun.owner " + uid + " master kairoslab0 slave-type bridge connection.autoconnect yes",
 		"nmcli connection up kairoslab0",
+		"ip link set kairoslab0 alias kairos-lab",
+		"nmcli connection modify kairoslab0 +user.data kairos-lab.created=1",
 		"nmcli connection up kairoslab0-uplink",
 		"nmcli connection up kairoslab0-tap",
 	}
@@ -582,7 +658,7 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 		h.failCmd = func(argv []string) error {
@@ -611,7 +687,7 @@ func TestPrepareLinuxSharedRefusalDescribesOnlyWhatItKnows(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		h.failCmd = func(argv []string) error {
 			if strings.Join(argv, " ") == "nmcli device connect eth0" {
@@ -782,9 +858,8 @@ func TestPrepareLinuxSharedRefusesAnInterfaceEnslavedWhenTheBridgeComesUp(t *tes
 			// is never brought up: no guest is put on a bridge this run is
 			// abandoning.
 			uid := testUID(t)
-			shared := sharedSequence(uid)
 			want := append([]string{}, tt.prefix...)
-			want = append(want, shared[:len(shared)-1]...)
+			want = append(want, sharedSequenceThroughBridgeUp(uid)...)
 			want = append(want, refusalTail()...)
 			assertSequence(t, h.lines(), want)
 
@@ -807,7 +882,7 @@ func TestPrepareLinuxSharedRefusesAnInterfaceEnslavedWhenTheBridgeComesUp(t *tes
 // about to be applied to that bridge.
 func TestPrepareLinuxSharedRefusesAnInterfaceAlreadyEnslavedBeforeTheBridgeComesUp(t *testing.T) {
 	h := newFakeHost(t)
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.invisibleLinks[DefaultBridgeName] = true
 	h.slaves[DefaultBridgeName] = []string{"eth0"}
 	st := &state.State{}
@@ -903,7 +978,7 @@ func TestPrepareLinuxSharedRefusesWhenThePortListCannotBeRead(t *testing.T) {
 	h := newFakeHost(t)
 	// The same host as the test above -- a leftover bridge with eth0 on it --
 	// except that nothing here can read the port list.
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.invisibleLinks[DefaultBridgeName] = true
 	h.slaves[DefaultBridgeName] = []string{"eth0"}
 	h.slaveLinksErr = fmt.Errorf(`exit status 2: %q`, `ip: either "dev" is duplicate, or "kairoslab0" is garbage`)
@@ -975,8 +1050,7 @@ func TestPrepareLinuxSharedRefusesACleanHostThatCannotAnswer(t *testing.T) {
 	// passes because no bridge of that name exists yet, and the second one is
 	// where the unreadable list is fatal. The tap is never activated.
 	uid := testUID(t)
-	shared := sharedSequence(uid)
-	want := append([]string{}, shared[:len(shared)-1]...)
+	want := append([]string{}, sharedSequenceThroughBridgeUp(uid)...)
 	want = append(want, refusalTail()...)
 	assertSequence(t, h.lines(), want)
 }
@@ -998,7 +1072,7 @@ func TestPrepareLinuxSharedRefusesAHostNICStoredAsTheTapName(t *testing.T) {
 	// since the escape was through both of them.
 	t.Run("already on the bridge", func(t *testing.T) {
 		h := newFakeHost(t)
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.invisibleLinks[DefaultBridgeName] = true
 		h.slaves[DefaultBridgeName] = []string{"eth0"}
 		st := &state.State{}
@@ -1360,6 +1434,8 @@ func TestPrepareLinuxBridgeSurvivesAStaleUplinkThatWillNotGo(t *testing.T) {
 		"nmcli connection add type tun ifname kairoslab-tap0 con-name kairoslab0-tap mode tap owner " + uid + " master kairoslab0 slave-type bridge autoconnect yes",
 		"nmcli connection modify kairoslab0-tap connection.interface-name kairoslab-tap0 tun.mode tap tun.owner " + uid + " master kairoslab0 slave-type bridge connection.autoconnect yes",
 		"nmcli connection up kairoslab0",
+		"ip link set kairoslab0 alias kairos-lab",
+		"nmcli connection modify kairoslab0 +user.data kairos-lab.created=1",
 		"nmcli connection up kairoslab0-uplink",
 		"nmcli connection up kairoslab0-tap",
 	}
@@ -1597,7 +1673,7 @@ func TestStalenessPredicateCoversEveryResource(t *testing.T) {
 		name string
 		seed func(*fakeHost)
 	}{
-		{"bridge link", func(h *fakeHost) { h.bridges[DefaultBridgeName] = true }},
+		{"bridge link", func(h *fakeHost) { h.seedOurBridge(DefaultBridgeName) }},
 		{"bridge connection", func(h *fakeHost) { h.conns[DefaultBridgeName] = true }},
 		{"uplink connection", func(h *fakeHost) { h.conns[DefaultBridgeName+"-uplink"] = true }},
 		{"tap connection", func(h *fakeHost) { h.conns[DefaultBridgeName+"-tap"] = true }},
@@ -1707,7 +1783,7 @@ func TestCleanupNMConnectionsStillRemovesAValidBridge(t *testing.T) {
 	h := newFakeHost(t)
 	h.conns[DefaultBridgeName] = true
 	h.conns[DefaultBridgeName+"-tap"] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 
 	if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 		t.Fatalf("cleanupNMConnections(%q) = %v, want nil", DefaultBridgeName, err)
@@ -1742,7 +1818,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		// The tap is listed first, as the kernel would list it, so returning
 		// the first line instead of the first non-tap line is visible here.
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
@@ -1764,7 +1840,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 
@@ -1791,7 +1867,7 @@ func TestCleanupNMConnectionsReconnectsAnEnslavedHostNIC(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "captap0"}
 
 		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
@@ -1831,7 +1907,7 @@ func TestCleanupNMConnectionsDoesNotReconnectOverASurvivingUplinkProfile(t *test
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		nmConnectionExists = func(string) bool { return false }
@@ -1867,7 +1943,7 @@ func TestCleanupNMConnectionsDoesNotReconnectOverASurvivingUplinkProfile(t *test
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		h.failCmd = func(argv []string) error {
 			if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-uplink" {
@@ -1927,7 +2003,7 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItDeclinesToReconnect(t *testing.
 	// No connection of ours anywhere, which is the state that declines: the
 	// bridge and its port outlived a NetworkManager restart that took the
 	// keyfiles with it.
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.slaves[DefaultBridgeName] = []string{DefaultTapName, hostile}
 
 	var err error
@@ -1978,7 +2054,7 @@ func TestCleanupNMConnectionsIssuesNoDeleteForAConnectionItCannotSee(t *testing.
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 		h.failCmd = failUnknownConnectionDeletes(h)
@@ -2006,7 +2082,7 @@ func TestCleanupNMConnectionsIssuesNoDeleteForAConnectionItCannotSee(t *testing.
 	// run in a refusal naming three connections that were never there.
 	t.Run("a shared start over a leftover bridge device", func(t *testing.T) {
 		h := newFakeHost(t)
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.failCmd = failUnknownConnectionDeletes(h)
 
 		if err := PrepareLinuxShared(&state.State{}, t.TempDir(), 0, false); err != nil {
@@ -2028,7 +2104,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
 		h.conns[DefaultBridgeName+"-uplink"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName, "eth0"}
 		h.failCmd = func([]string) error { return fmt.Errorf("exit status 1") }
@@ -2075,7 +2151,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.failCmd = func(argv []string) error {
 			if strings.Join(argv, " ") == "nmcli connection delete kairoslab0-tap" {
@@ -2105,7 +2181,7 @@ func TestCleanupNMConnectionsReportsEveryFailure(t *testing.T) {
 	t.Run("nothing fails", func(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 
 		if err := cleanupNMConnections(DefaultBridgeName, DefaultTapName, DefaultBridgeName+"-tap", false); err != nil {
 			t.Fatalf("a teardown that did everything asked of it returned %v, want nil", err)
@@ -2227,7 +2303,7 @@ func TestPrepareLinuxSharedRefusesWhenTheBridgeStatCannotAnswer(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newFakeHost(t)
-			h.bridges[DefaultBridgeName] = true
+			h.seedOurBridge(DefaultBridgeName)
 			h.invisibleLinks[DefaultBridgeName] = true
 			h.slaves[DefaultBridgeName] = []string{"eth0"}
 			h.invisibleBridges[DefaultBridgeName] = tt.statErr
@@ -2525,7 +2601,7 @@ func TestCleanupNMConnectionsQuotesTheInterfaceItReconnects(t *testing.T) {
 	// The reconnect runs for an interface whose uplink connection this
 	// teardown deleted, so that connection is part of the fixture.
 	h.conns[DefaultBridgeName+"-uplink"] = true
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.links[DefaultTapName] = true
 	h.slaves[DefaultBridgeName] = []string{DefaultTapName, hostile}
 	h.failCmd = func(argv []string) error {
@@ -2635,7 +2711,7 @@ func TestPrepareLinuxSharedPortListReadCount(t *testing.T) {
 	// take every one of them away.
 	t.Run("an unreadable stat no longer skips them", func(t *testing.T) {
 		h := newFakeHost(t)
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.invisibleLinks[DefaultBridgeName] = true
 		h.invisibleBridges[DefaultBridgeName] = &fs.PathError{
 			Op:   "stat",
@@ -2681,7 +2757,7 @@ func TestCleanupLinuxBridgeRecordsWhenTheTeardownWasAttempted(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 
@@ -2703,7 +2779,7 @@ func TestCleanupLinuxBridgeRecordsWhenTheTeardownWasAttempted(t *testing.T) {
 	t.Run("a teardown that failed", func(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.failCmd = func(argv []string) error { return fmt.Errorf("exit status 10") }
 
 		st := staleSharedState()
@@ -2728,7 +2804,7 @@ func TestCleanupLinuxBridgeRecordsWhenTheTeardownWasAttempted(t *testing.T) {
 		h := newFakeHost(t)
 		h.conns[DefaultBridgeName] = true
 		h.conns[DefaultBridgeName+"-tap"] = true
-		h.bridges[DefaultBridgeName] = true
+		h.seedOurBridge(DefaultBridgeName)
 		h.links[DefaultTapName] = true
 		h.slaves[DefaultBridgeName] = []string{DefaultTapName}
 
@@ -2761,4 +2837,23 @@ func TestCleanupLinuxBridgeRecordsWhenTheTeardownWasAttempted(t *testing.T) {
 			t.Errorf("LastCleanupAttemptAt = %q for a network no teardown was attempted on", st.Network.LastCleanupAttemptAt)
 		}
 	})
+}
+
+// sharedSequenceThroughBridgeUp is the shared sequence up to and including the
+// bridge activation and no further.
+//
+// It is the prefix a run refused by the port assertion that follows that
+// activation issues, and it is named rather than sliced off the end of
+// sharedSequence because what sits between the bridge coming up and the tap
+// coming up has grown: markBridgeAsOurs puts two commands there, both of them
+// behind the same assertion, so "everything but the last line" stopped meaning
+// "everything before the refusal" the moment the mark was added.
+func sharedSequenceThroughBridgeUp(uid string) []string {
+	full := sharedSequence(uid)
+	for i, line := range full {
+		if line == "nmcli connection up "+DefaultBridgeName {
+			return full[:i+1]
+		}
+	}
+	return full
 }
