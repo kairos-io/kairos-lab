@@ -236,3 +236,38 @@ func TestPreflightRefusesAHostNICInEveryMode(t *testing.T) {
 		})
 	}
 }
+
+// TestPreflightRefusalDoesNotInventAReason pins what the preflight message is
+// allowed to say about WHY a stored name was refused: nothing of its own.
+//
+// cleanupNMConnections refuses for three different reasons -- a name of the
+// wrong shape, a device of the wrong kind, and a stat that could not answer --
+// and they all arrive at the same `errors.As` branch. A preflight that spells
+// one of them out in its own prose is wrong for the other two: it would tell a
+// user whose /sys could not be read that their name refers to the wrong kind
+// of device, and send them to correct a name that is fine.
+//
+// So the reason has to come from the wrapped error, which names it, and this
+// drives the stat-error reason through the preflight to check that it does.
+func TestPreflightRefusalDoesNotInventAReason(t *testing.T) {
+	h := newFakeHost(t)
+	h.conns[DefaultBridgeName] = true
+	h.invisibleBridges[DefaultBridgeName] = fs.ErrPermission
+
+	st := storedState(DefaultBridgeName)
+	err := linuxNetworkPreflight(st, t.TempDir(), "shared", DefaultBridgeName, DefaultTapName, TapConnNameForIndex(DefaultBridgeName, 0), false)
+	if err == nil {
+		t.Fatal("the preflight started over a stored bridge name whose device stat failed, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "cannot tell what kind of device this is") {
+		t.Errorf("the refusal does not carry the reason the teardown gave: %v", err)
+	}
+	// The reason here is "unknown kind", so the message must not assert a
+	// known-wrong kind, which is what it used to do for every refusal.
+	if strings.Contains(err.Error(), "not the kind of device") {
+		t.Errorf("the preflight states a reason of its own that contradicts the wrapped one: %v", err)
+	}
+	for _, argv := range h.commands {
+		t.Errorf("the preflight still issued a command over the refused name: %v", argv)
+	}
+}
