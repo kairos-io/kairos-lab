@@ -13,7 +13,7 @@ const (
 	// "latest" and never a floating minor such as "v0.27", so a setup today
 	// and a setup next month run the same AuroraBoot.
 	// renovate: datasource=docker depName=quay.io/kairos/auroraboot
-	ImageTag = "v0.27.1"
+	ImageTag = "v0.28.0"
 )
 
 // ImageRef is the full reference setup pulls and the shim runs.
