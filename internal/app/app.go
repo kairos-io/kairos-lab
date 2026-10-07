@@ -130,7 +130,7 @@ func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.
 	required := deps.Required(p)
 	present := deps.PresentNames(required)
 	missing := deps.Missing(required)
-	st.Setup.PreExistingDeps = mergeUnique(st.Setup.PreExistingDeps, present)
+	recordPreExisting(st, present)
 
 	if len(missing) > 0 {
 		if p.PackageManager == "" {
@@ -2670,6 +2670,25 @@ func mergeUnique(a, b []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// recordPreExisting marks dependencies as ones the machine already had, which
+// is what keeps cleanup from removing them.
+//
+// A dependency kairos-lab installed itself is present on every later run, so
+// it has to be excluded by name: without that, a second setup would record it
+// as pre-existing and cleanup would then leave it installed forever. The same
+// pass drops anything an earlier run already recorded both ways, so the two
+// lists stay disjoint and installed wins.
+func recordPreExisting(st *state.State, names []string) {
+	var kept []string
+	for _, n := range mergeUnique(st.Setup.PreExistingDeps, names) {
+		if slices.Contains(st.Setup.InstalledByKairosLab, n) {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	st.Setup.PreExistingDeps = kept
 }
 
 func defaultMemoryMB() int {
