@@ -83,6 +83,41 @@ func TestRunAcceptsSubcommandsWithoutPositionalArguments(t *testing.T) {
 	}
 }
 
+// The e2e lifecycle test drives the CLI as a subprocess, under a build tag
+// `go test ./...` never compiles and a workflow that only runs on
+// workflow_dispatch. So nothing checked the verbs and flags it names, and it
+// drifted onto two that do not exist: a `stop` subcommand, and `-url` on
+// start, which is `-iso` and takes a path. Whoever dispatched the workflow got
+// "unknown command: stop" out of the test rather than out of the product
+// (kairos-io/kairos#5056).
+//
+// `go vet -tags e2e ./...` in CI does not cover this: both were live strings,
+// so the broken file type-checked. This is the check that does, and it runs on
+// every PR. Each vector stops at requireSetup on a fresh config dir, which is
+// the point -- reaching that gate means the verb dispatched and every flag
+// parsed.
+//
+// `setup -yes`, the one other vector the lifecycle uses, is not here: it is
+// the verb that completes setup, so it has no requireSetup gate to stop at and
+// would install dependencies on the machine running the unit tests.
+func TestRunAcceptsTheArgumentsTheE2ELifecycleUses(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "-iso", "/tmp/kairos.iso", "-display", "serial", "-yes"},
+		{"status"},
+		{"reset", "-yes"},
+		{"cleanup", "-yes"},
+	} {
+		t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+		t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+
+		var stdout, stderr bytes.Buffer
+		err := Run(args, strings.NewReader(""), &stdout, &stderr, "test")
+		if !errors.Is(err, errSetupRequired) {
+			t.Fatalf("%v: got %v, want %v", args, err, errSetupRequired)
+		}
+	}
+}
+
 // Each of these is a stored value that forges a plan row and then erases the
 // real row printed after it: a plausible value, a newline, a row shaped like
 // the ones the plan emits, then CSI 2K (erase line) and a carriage return.
