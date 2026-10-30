@@ -53,24 +53,51 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 	if err != nil {
 		return err
 	}
+	// A subcommand's flag set is built with flag.ContinueOnError, so fs.Parse
+	// answers -h and --help by printing the usage and returning flag.ErrHelp.
+	// That is a help request that was served, not a failure, but it used to
+	// travel up here unchanged and out through main, which prints "error:
+	// flag: help requested" and exits 1. So `kairos-lab start -h` failed
+	// while the top-level `kairos-lab -h` below succeeded, and a `set -e`
+	// script or CI step that asked a subcommand for its flags died on the
+	// answer (kairos-io/kairos#5055).
+	//
+	// Translating it once here, rather than in each run* function, is what
+	// keeps the two help paths agreeing as subcommands are added.
+	if err := dispatch(args, stdin, stdout, stderr, store, version); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store, version string) error {
 	switch args[0] {
 	case "setup":
 		return runSetup(args[1:], stdin, stdout, stderr, store)
 	case "download":
+		if err := helpForFlaglessCommand(args[1:], stderr); err != nil {
+			return err
+		}
 		return runDownload(args[1:], stdin, stdout, store)
 	case "start":
 		return runStart(args[1:], stdin, stdout, stderr, store)
 	case "status":
 		// status builds no flag set, so it has no NArg to check; it used to
 		// ignore anything after the verb outright. See rejectPositionalArgs.
+		if err := helpForFlaglessCommand(args[1:], stderr); err != nil {
+			return err
+		}
 		if len(args) > 1 {
 			return fmt.Errorf("unexpected argument %q: status takes no arguments", args[1])
 		}
 		return runStatus(stdout, store)
 	case "reset":
-		return runReset(args[1:], stdin, stdout, store)
+		return runReset(args[1:], stdin, stdout, stderr, store)
 	case "cleanup":
-		return runCleanup(args[1:], stdin, stdout, store)
+		return runCleanup(args[1:], stdin, stdout, stderr, store)
 	case "version", "-v", "--version":
 		writeLine(stdout, version)
 		return nil
@@ -81,6 +108,45 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer, version strin
 		printUsage(stderr)
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
+}
+
+// helpForFlaglessCommand answers -h and --help for the subcommands that build
+// no flag set, so that asking any subcommand for help is served rather than
+// rejected.
+//
+// status and download declare no flags, so there is no flag set to print and
+// no flag.ErrHelp to translate: both commands treat anything after the verb as
+// a stray argument, which made `kairos-lab download -h` exit 1 for the same
+// reason `start -h` did. What they have to describe is the command list, so
+// this prints the top-level usage, the same text and the same exit status the
+// top-level `kairos-lab -h` gives.
+//
+// It returns flag.ErrHelp rather than printing and reporting success, so that
+// Run's one translation covers this path too.
+func helpForFlaglessCommand(args []string, stderr io.Writer) error {
+	if len(args) == 0 || (args[0] != "-h" && args[0] != "--help") {
+		return nil
+	}
+	printUsage(stderr)
+	return flag.ErrHelp
+}
+
+// newFlagSet builds a subcommand's flag set, writing its usage and its parse
+// errors to the stderr writer Run was handed.
+//
+// Without the SetOutput, flag.FlagSet.Output() falls through to the process's
+// own os.Stderr, so a caller that passes its own writer -- a test, or anything
+// embedding this package -- could see neither the usage nor the reason a parse
+// failed (kairos-io/kairos#5055). Every subcommand goes through here so that a
+// new one cannot be added without it.
+//
+// ContinueOnError is what lets Run decide what a parse result means, rather
+// than flag.ExitOnError calling os.Exit(2) out from under it. It is also why
+// -h arrives as the flag.ErrHelp that Run translates to success.
+func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	return fs
 }
 
 // rejectPositionalArgs fails a subcommand that was handed a positional
@@ -103,8 +169,8 @@ func rejectPositionalArgs(fs *flag.FlagSet, hint string) error {
 	return fmt.Errorf("unexpected argument %q: %s takes flags only", fs.Arg(0), fs.Name())
 }
 
-func runSetup(args []string, stdin io.Reader, stdout, _ io.Writer, store *state.Store) error {
-	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
+func runSetup(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
+	fs := newFlagSet("setup", stderr)
 	autoYes := fs.Bool("yes", false, "auto-confirm installs and sudo operations")
 	noAuroraBoot := fs.Bool("no-auroraboot", false, "do not provide the auroraboot command")
 	runtimeFlag := fs.String("runtime", "", "container runtime for the auroraboot command: docker or podman (default: the first one that works, else docker)")
@@ -407,7 +473,7 @@ var firmwareHostPlatform = func() (string, string) { return runtime.GOOS, runtim
 var hasStaleNetworkResources = vm.HasStaleNetworkResources
 
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
-	fs := flag.NewFlagSet("start", flag.ContinueOnError)
+	fs := newFlagSet("start", stderr)
 	isoPath := fs.String("iso", "", "path to ISO file")
 	diskName := fs.String("name", "", "disk name (creates new if doesn't exist)")
 	diskSize := fs.String("disk-size", "60G", "disk image size for new disks")
@@ -1850,8 +1916,8 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 	return nil
 }
 
-func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Store) error {
-	fs := flag.NewFlagSet("reset", flag.ContinueOnError)
+func runReset(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
+	fs := newFlagSet("reset", stderr)
 	dryRun := fs.Bool("dry-run", false, "show what would be removed")
 	autoYes := fs.Bool("yes", false, "auto-confirm destructive operations")
 	diskToRemove := fs.String("disk", "", "remove specific disk by name (default: all)")
@@ -2065,8 +2131,8 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 	return nil
 }
 
-func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.Store) error {
-	fs := flag.NewFlagSet("cleanup", flag.ContinueOnError)
+func runCleanup(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
+	fs := newFlagSet("cleanup", stderr)
 	autoYes := fs.Bool("yes", false, "auto-confirm destructive operations")
 	dryRun := fs.Bool("dry-run", false, "show what would be removed")
 	if err := fs.Parse(args); err != nil {
