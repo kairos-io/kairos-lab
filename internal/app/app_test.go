@@ -3434,8 +3434,8 @@ func TestUserModeBlockNamesThePortsQEMUIsToldToForward(t *testing.T) {
 		t.Fatalf("no user-mode netdev on the command line:\n%q", args)
 	}
 	for _, want := range []string{
-		"hostfwd=tcp::" + userModeSSHPort + "-:22",
-		"hostfwd=tcp::" + webUIPort + "-:8080",
+		"hostfwd=tcp:" + vm.DefaultUserModeHostBind + ":" + userModeSSHPort + "-:22",
+		"hostfwd=tcp:" + vm.DefaultUserModeHostBind + ":" + webUIPort + "-:8080",
 	} {
 		if !strings.Contains(netdev, want) {
 			t.Errorf("the block names a port QEMU does not forward: %q is not in %q", want, netdev)
@@ -4728,9 +4728,9 @@ func TestStartAllocatesTheNextFreeIndexForASecondLiveVM(t *testing.T) {
 	}
 	// User-mode ports: index 0 keeps the fixed 2222/8080, index 1 gets
 	// 2223/8081. The recorded QEMU command line is where this is externally
-	// observable.
-	if !slices.Contains(a.QemuArgs, "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080") {
-		t.Errorf("vm-a's user-mode netdev is not the unchanged index-0 default:\n%q", a.QemuArgs)
+	// observable. Both bind 127.0.0.1.
+	if !slices.Contains(a.QemuArgs, "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:8080-:8080") {
+		t.Errorf("vm-a's user-mode netdev is not 2222/8080 bound to 127.0.0.1:\n%q", a.QemuArgs)
 	}
 	if !slices.Contains(b.QemuArgs, "user,id=net0,hostfwd=tcp:127.0.0.1:2223-:22,hostfwd=tcp:127.0.0.1:8081-:8080") {
 		t.Errorf("vm-b's user-mode netdev is not 2223/8081 bound to 127.0.0.1:\n%q", b.QemuArgs)
@@ -5404,5 +5404,57 @@ func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
 	})
 	if !strings.Contains(out, "  vm ip address: none\n") {
 		t.Errorf("status did not report user mode's address as none:\n%s", out)
+	}
+}
+
+// TestUserModePortsBindLoopbackAtEveryIndex is the internal/app half of
+// kairos-io/kairos#5053.
+//
+// userModePortsForIndex used to special-case index 0 and hand internal/vm an
+// empty bind, which QEMU reads as INADDR_ANY. Index 0 is the index every
+// single-VM run uses, so the exposure was the default one. Every index binds
+// loopback now, and index 0 is no longer a special case of anything.
+func TestUserModePortsBindLoopbackAtEveryIndex(t *testing.T) {
+	seenSSH := map[int]int{}
+	seenHTTP := map[int]int{}
+	for index := 0; index < 4; index++ {
+		sshPort, httpPort, hostBind := userModePortsForIndex(index)
+		if hostBind != vm.DefaultUserModeHostBind {
+			t.Errorf("index %d binds %q, want %q: an empty bind is INADDR_ANY and publishes the guest's sshd on every host interface",
+				index, hostBind, vm.DefaultUserModeHostBind)
+		}
+		if want := 2222 + index; sshPort != want {
+			t.Errorf("index %d ssh port = %d, want %d", index, sshPort, want)
+		}
+		if want := 8080 + index; httpPort != want {
+			t.Errorf("index %d http port = %d, want %d", index, httpPort, want)
+		}
+		// Two VMs in one config dir must never contend for a host port.
+		if prev, dup := seenSSH[sshPort]; dup {
+			t.Errorf("index %d reuses ssh port %d, already taken by index %d", index, sshPort, prev)
+		}
+		if prev, dup := seenHTTP[httpPort]; dup {
+			t.Errorf("index %d reuses http port %d, already taken by index %d", index, httpPort, prev)
+		}
+		seenSSH[sshPort], seenHTTP[httpPort] = index, index
+	}
+}
+
+// The start block and the status line both tell the user the forwards are on
+// localhost. That sentence is only true because the bind is loopback, and
+// nothing else in the suite ties the two together: this is what fails if a
+// later change re-widens the bind and leaves the text alone.
+func TestUserModeTextMatchesTheAddressTheForwardsActuallyBind(t *testing.T) {
+	if _, _, hostBind := userModePortsForIndex(0); hostBind != "127.0.0.1" {
+		t.Fatalf("index 0 binds %q; the printed text below says localhost", hostBind)
+	}
+	block := userModeBlock()
+	for _, want := range []string{
+		"http://localhost:" + webUIPort,
+		"ssh -p " + userModeSSHPort + " kairos@localhost",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("the start block does not say %q:\n%s", want, block)
+		}
 	}
 }

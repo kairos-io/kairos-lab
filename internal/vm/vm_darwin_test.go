@@ -64,7 +64,7 @@ func TestBuildMacOSUserModeNeedsNoBridgeIface(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(args, " "), "hostfwd=tcp::2222-:22") {
+	if !strings.Contains(strings.Join(args, " "), "hostfwd=tcp:"+DefaultUserModeHostBind+":2222-:22") {
 		t.Fatalf("expected the user-mode port forwards: %v", args)
 	}
 }
@@ -213,7 +213,7 @@ func TestBuildMacOSNetdevPerNetworkMode(t *testing.T) {
 	if runtime.GOARCH != "arm64" {
 		t.Skip("macOS support is Apple Silicon only")
 	}
-	const userNetdev = "user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:8080"
+	const userNetdev = "user,id=net0,hostfwd=tcp:" + DefaultUserModeHostBind + ":2222-:22,hostfwd=tcp:" + DefaultUserModeHostBind + ":8080-:8080"
 	for _, tc := range []struct {
 		name       string
 		mode       string
