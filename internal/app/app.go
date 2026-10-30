@@ -1051,7 +1051,7 @@ func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *s
 		// reports the guest's own view of itself, 10.0.2.15 behind the NAT,
 		// which is not an address anything on this host can connect to. The
 		// way in is the forwarded ports named here.
-		writeLine(stdout, userModeBlock())
+		writeLine(stdout, userModeBlock(sshPort, httpPort))
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
@@ -1337,6 +1337,32 @@ func vmUpBlock(res vm.IPResult) string {
 	}, "\n")
 }
 
+// userModeReachLines is how a user-mode VM is reached, as the two lines that
+// say it: a URL a browser opens and a command a shell runs, both built from
+// the host ports of the VM in question.
+//
+// It is one function with two callers, start's block and status's rows,
+// because they had drifted into saying different things about the same VM.
+// status printed "ssh localhost:2222, http localhost:8080": ssh reads
+// "localhost:2222" as a host name and never looks at the port, the login was
+// missing, and "http localhost:8080" is not a URL, while start's block
+// printed forms that work. Neither is derivable from the other, so keeping
+// them in step meant remembering to, and nothing did.
+//
+// The ports are parameters rather than the webUIPort/userModeSSHPort
+// constants for the other half of the same bug: since multi-VM support a VM
+// at index N is forwarded 2222+N and 8080+N, and the block still named the
+// constants, so the second user-mode VM was told to ssh into the first one.
+// The caller passes the ports of the VM it is talking about -- start the ones
+// on the command line it is about to run, status the ones
+// userModePortsForIndex gives for that record's index.
+func userModeReachLines(sshPort, httpPort int) []string {
+	return []string{
+		fmt.Sprintf("  WebUI:  http://localhost:%d", httpPort),
+		fmt.Sprintf("  SSH:    ssh -p %d kairos@localhost", sshPort),
+	}
+}
+
 // userModeBlock is the same shape for the one mode that has no address to
 // look up.
 //
@@ -1350,15 +1376,14 @@ func vmUpBlock(res vm.IPResult) string {
 // repeated here because a user who chose user mode directly never sees that
 // error, and the difference -- no address on your network, so no second VM
 // can reach this one -- is the whole reason the other two modes exist.
-func userModeBlock() string {
-	return strings.Join([]string{
-		"user mode: the guest sits behind QEMU's user-mode NAT.",
-		"  WebUI:  http://localhost:" + webUIPort,
-		"  SSH:    ssh -p " + userModeSSHPort + " kairos@localhost",
+func userModeBlock(sshPort, httpPort int) string {
+	rows := []string{"user mode: the guest sits behind QEMU's user-mode NAT."}
+	rows = append(rows, userModeReachLines(sshPort, httpPort)...)
+	return strings.Join(append(rows,
 		"  Note:   those two forwarded ports are the only way in. The guest",
 		"          has no address on your network, so this mode supports a",
 		"          single VM and cannot form a cluster.",
-	}, "\n")
+	), "\n")
 }
 
 // ipPollFacts is everything the diagnostic below is allowed to say: the mode
@@ -1801,8 +1826,17 @@ func runStatus(stdout io.Writer, store *state.Store) error {
 		}
 		writef(stdout, "  vm ip address: %s%s\n", emptyAsNone(ipAddr), linkLocalAddressNote(ipAddr))
 		if v.NetworkMode == "user" {
+			// Derived from the index rather than read from v.SSHPort and
+			// v.HTTPPort for the reason quarantineInvalidVMs gives for not
+			// trusting either field: state.json is writable by anything
+			// running as the user, and internal/vm derives the ports it
+			// actually forwards from the index at every point that matters.
+			// A status row built from the stored copy could name a port no
+			// VM is on.
 			sshPort, httpPort, _ := userModePortsForIndex(v.Index)
-			writef(stdout, "  user mode forwards: ssh localhost:%d, http localhost:%d\n", sshPort, httpPort)
+			for _, line := range userModeReachLines(sshPort, httpPort) {
+				writef(stdout, "%s\n", line)
+			}
 		}
 		writef(stdout, "  vm running: %t\n", running)
 		if running {
