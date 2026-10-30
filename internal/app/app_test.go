@@ -5406,3 +5406,44 @@ func TestStatusDoesNotAskTheHostInUserMode(t *testing.T) {
 		t.Errorf("status did not report user mode's address as none:\n%s", out)
 	}
 }
+
+// The cleanup plan is the last thing the user sees before consenting, so it
+// has to name a removal that reaches past the rows it lists. apt's autoremover
+// is the one that does: it removes every package apt has marked as an unused
+// automatic dependency, not only the dependencies of what is on the plan.
+// Without this line the user consents to "docker" and gets apt's whole orphan
+// sweep. Scoped package managers must not print it, or the warning stops
+// meaning anything.
+func TestCleanupPlanNamesAnUnscopedDependencyRemoval(t *testing.T) {
+	for _, c := range []struct {
+		pm       string
+		wantNote bool
+	}{
+		{"apt", true},
+		{"pacman", false},
+	} {
+		t.Run(c.pm, func(t *testing.T) {
+			t.Setenv("KAIROS_LAB_CONFIG_DIR", t.TempDir())
+			t.Setenv("KAIROS_LAB_CACHE_DIR", t.TempDir())
+			seedInjectedState(t, func(st *state.State) {
+				st.Platform.PackageManager = c.pm
+				st.Setup.InstalledByKairosLab = []string{"docker"}
+			})
+
+			var stdout, stderr bytes.Buffer
+			if err := Run([]string{"cleanup", "-dry-run"}, strings.NewReader(""), &stdout, &stderr, "test"); err != nil {
+				t.Fatalf("cleanup -dry-run: %v", err)
+			}
+			out := stdout.String()
+			// The note is only meaningful next to a removal, so assert the
+			// plan really has one; otherwise both branches pass for the
+			// wrong reason.
+			if !strings.Contains(out, "Will uninstall dependencies:") {
+				t.Fatalf("the plan lists no removal, so the note is untested:\n%s", out)
+			}
+			if got := strings.Contains(out, "autoremove"); got != c.wantNote {
+				t.Errorf("note present = %v, want %v; plan:\n%s", got, c.wantNote, out)
+			}
+		})
+	}
+}

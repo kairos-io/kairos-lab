@@ -2123,6 +2123,14 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 	printListWithReasons(stdout, "Will skip directories", dirsToSkip)
 	printAuroraBootPlan(stdout, st.AuroraBoot, abPlan)
 	printList(stdout, "Will uninstall dependencies", pkgRemovals)
+	// Uninstalling also removes what each dependency pulled in, or the binary
+	// survives the cleanup. On apt that second pass is not scoped to the rows
+	// above, so it is named here, while the user can still say no.
+	if len(pkgRemovals) > 0 {
+		if note := deps.UninstallSideEffect(pm); note != "" {
+			writef(stdout, "note: %s\n", note)
+		}
+	}
 	if len(caskRemovals) > 0 {
 		printList(stdout, "Will uninstall dependencies (Homebrew cask)", caskRemovals)
 	}
