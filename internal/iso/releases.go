@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -163,7 +164,7 @@ func GetK3sVersions(options []ISOOption) []string {
 		}
 	}
 	sort.Slice(versions, func(i, j int) bool {
-		return versions[i] > versions[j]
+		return compareK8sVersions(versions[i], versions[j]) > 0
 	})
 	return versions
 }
@@ -184,4 +185,71 @@ func FindCore(options []ISOOption) *ISOOption {
 		}
 	}
 	return nil
+}
+
+var (
+	// k8sVersionPattern splits a version the way a release names it,
+	// "k3sv1.35.8+k3s1" or "k0sv1.36.4+k0s.0", into the three numbers of the
+	// Kubernetes version and the build suffix of the distribution.
+	k8sVersionPattern = regexp.MustCompile(`^[a-z0-9]*v(\d+)\.(\d+)\.(\d+)\+(.+)$`)
+	// buildNumberPattern takes the build number off that suffix: the "1" of
+	// "k3s1", the "0" of "k0s.0". The distribution name carries a digit of its
+	// own, so the build number is the run of digits the suffix ends with, not
+	// every digit in it.
+	buildNumberPattern = regexp.MustCompile(`\d+$`)
+)
+
+// parseK8sVersion returns the numbers that order a version, and whether the
+// string had the shape a release publishes.
+func parseK8sVersion(version string) ([4]int, bool) {
+	matches := k8sVersionPattern.FindStringSubmatch(version)
+	if matches == nil {
+		return [4]int{}, false
+	}
+	build := buildNumberPattern.FindString(matches[4])
+	if build == "" {
+		return [4]int{}, false
+	}
+
+	var parts [4]int
+	for i, field := range [4]string{matches[1], matches[2], matches[3], build} {
+		n, err := strconv.Atoi(field)
+		if err != nil {
+			return [4]int{}, false
+		}
+		parts[i] = n
+	}
+	return parts, true
+}
+
+// compareK8sVersions orders two versions by number instead of by character, so
+// v1.10.0 is newer than v1.9.0 and +k3s10 is newer than +k3s2. It returns a
+// negative number when a is older than b, a positive one when it is newer, and
+// zero when they are the same version.
+//
+// A version this cannot read counts as older than any it can, so a name the
+// asset pattern lets through can never take the "(latest)" marker from a real
+// one. Names that compare equal by number, and pairs neither of which can be
+// read, fall back to character order, which keeps the list the picker prints
+// stable across runs of the same release.
+func compareK8sVersions(a, b string) int {
+	partsA, okA := parseK8sVersion(a)
+	partsB, okB := parseK8sVersion(b)
+	switch {
+	case okA && !okB:
+		return 1
+	case !okA && okB:
+		return -1
+	case !okA && !okB:
+		return strings.Compare(a, b)
+	}
+	for i := range partsA {
+		switch {
+		case partsA[i] < partsB[i]:
+			return -1
+		case partsA[i] > partsB[i]:
+			return 1
+		}
+	}
+	return strings.Compare(a, b)
 }
