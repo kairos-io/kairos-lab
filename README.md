@@ -98,8 +98,8 @@ or podman. See [`setup`](#setup) for what it installs and how to opt out.
 ```
 
 Interactive selection of:
-- Image type: `core` (base OS) or `standard` (with K3s)
-- K3s version (if standard)
+- Image type: `core` (base OS) or `standard` (with Kubernetes)
+- Kubernetes distribution and version, k3s or k0s (if standard)
 
 The ISO is saved to the cache directory and tracked for cleanup.
 
@@ -198,7 +198,7 @@ once the pinned image includes that change.
 Downloads a Kairos ISO with interactive selection:
 - Fetches latest release from GitHub
 - Filters by your architecture (amd64/arm64)
-- Prompts for core vs standard, K3s version
+- Prompts for core vs standard, then the Kubernetes distribution and version
 
 ### `start`
 

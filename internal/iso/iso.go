@@ -351,6 +351,23 @@ func humanSize(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+// printKubernetesChoices lists the Kubernetes images on offer. GetKubernetesOptions
+// returns them newest first within a distribution, so the first entry of each
+// distribution is that distribution's latest.
+func printKubernetesChoices(stdout io.Writer, options []KubernetesOption) {
+	_, _ = fmt.Fprintln(stdout, "\nSelect Kubernetes version:")
+	seen := make(map[string]bool)
+	for i, k := range options {
+		label := k.Label()
+		if !seen[k.Distro] {
+			seen[k.Distro] = true
+			label += " (latest)"
+		}
+		_, _ = fmt.Fprintf(stdout, "  [%d] %s\n", i+1, label)
+	}
+	_, _ = fmt.Fprintf(stdout, "Choice [1-%d]: ", len(options))
+}
+
 func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 	_, _ = fmt.Fprintln(stdout, "No ISO specified. Fetching latest Kairos releases...")
 
@@ -368,7 +385,7 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 
 	_, _ = fmt.Fprintf(stdout, "\nKairos %s - Select image type:\n", release.TagName)
 	_, _ = fmt.Fprintln(stdout, "  [1] core     - Base OS only (no Kubernetes)")
-	_, _ = fmt.Fprintln(stdout, "  [2] standard - Includes K3s Kubernetes")
+	_, _ = fmt.Fprintln(stdout, "  [2] standard - Includes Kubernetes (k3s or k0s)")
 	_, _ = fmt.Fprint(stdout, "Choice [1-2]: ")
 
 	reader := bufio.NewReader(stdin)
@@ -397,20 +414,12 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 		return nil, fmt.Errorf("no standard ISO found")
 	}
 
-	k3sVersions := GetK3sVersions(standardOptions)
-	if len(k3sVersions) == 0 {
-		return nil, fmt.Errorf("no K3s versions found")
+	k8sOptions := GetKubernetesOptions(standardOptions)
+	if len(k8sOptions) == 0 {
+		return nil, fmt.Errorf("no Kubernetes versions found")
 	}
 
-	_, _ = fmt.Fprintln(stdout, "\nSelect K3s version:")
-	for i, v := range k3sVersions {
-		label := v
-		if i == 0 {
-			label += " (latest)"
-		}
-		_, _ = fmt.Fprintf(stdout, "  [%d] %s\n", i+1, label)
-	}
-	_, _ = fmt.Fprintf(stdout, "Choice [1-%d]: ", len(k3sVersions))
+	printKubernetesChoices(stdout, k8sOptions)
 
 	line, err = reader.ReadString('\n')
 	if err != nil {
@@ -418,11 +427,11 @@ func interactivePicker(stdin io.Reader, stdout io.Writer) (*ISOOption, error) {
 	}
 	choice = strings.TrimSpace(line)
 	idx, err := strconv.Atoi(choice)
-	if err != nil || idx < 1 || idx > len(k3sVersions) {
+	if err != nil || idx < 1 || idx > len(k8sOptions) {
 		return nil, fmt.Errorf("invalid choice: %s", choice)
 	}
 
-	selected := FindByK3sVersion(standardOptions, k3sVersions[idx-1])
+	selected := FindByKubernetes(standardOptions, k8sOptions[idx-1])
 	if selected == nil {
 		return nil, fmt.Errorf("ISO not found for selected version")
 	}
