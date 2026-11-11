@@ -51,12 +51,29 @@ type StartConfig struct {
 	// as it did.
 	SSHPort  int
 	HTTPPort int
-	// UserModeHostBind is the address user-mode's forwarded ports bind: ""
-	// (INADDR_ANY, today's behaviour, unchanged) at index 0, since index 0
-	// must not change what it already exposes, and "127.0.0.1" at every index
-	// above it, which is new surface with no compatibility constraint to keep.
+	// UserModeHostBind is the address user-mode's forwarded ports bind.
+	// Empty means DefaultUserModeHostBind, so a caller that never set the
+	// field publishes the guest's sshd on loopback rather than on every
+	// interface the host has.
 	UserModeHostBind string
 }
+
+// DefaultUserModeHostBind is the host address user-mode's forwarded ports
+// bind when the caller names none.
+//
+// It is loopback because an empty host address in a QEMU hostfwd rule is
+// INADDR_ANY, and the forwards carry a Kairos guest's sshd and WebUI. A live
+// installer ISO answers on both with a published default login, so binding
+// them to every interface hands the guest to anything that can reach the
+// host: the LAN, a cafe's Wi-Fi, another VM on the same bridge. Nothing in
+// kairos-lab asks for that, and everything it prints -- the start block, the
+// status line, the macOS privilege error -- tells the user the ports are on
+// localhost.
+//
+// The default lives here rather than only at the call site so the safe
+// answer is the one a zero-valued StartConfig gets. A caller that wants a
+// different bind still sets the field.
+const DefaultUserModeHostBind = "127.0.0.1"
 
 // netDeviceArg builds the -device value for the guest NIC.
 //
@@ -79,11 +96,14 @@ type StartConfig struct {
 // The address is emitted in CanonicalMAC's zero-padded form, which is what
 // QEMU's parser wants -- never NormalizeMAC's zero-stripped comparison form.
 // userModeNetdevArg builds the -netdev value for user-mode networking.
-// SSHPort/HTTPPort default to 2222/8080 when unset (a StartConfig built
-// before these fields existed keeps today's exact command line), and
-// UserModeHostBind prefixes both forwards -- "" reproduces today's
-// INADDR_ANY bind at index 0, and "127.0.0.1" is what internal/app sets for
-// every index above it.
+// SSHPort/HTTPPort default to 2222/8080 when unset, and UserModeHostBind
+// prefixes both forwards, defaulting to DefaultUserModeHostBind.
+//
+// All three defaults are applied here and not only by the caller, because an
+// unset port is a port QEMU would reject and an unset bind is a bind QEMU
+// would read as INADDR_ANY. The port defaults keep a StartConfig built before
+// those fields existed on today's command line; the bind default keeps one
+// off every host interface. See DefaultUserModeHostBind.
 func userModeNetdevArg(cfg StartConfig) string {
 	sshPort := cfg.SSHPort
 	if sshPort == 0 {
@@ -94,6 +114,9 @@ func userModeNetdevArg(cfg StartConfig) string {
 		httpPort = 8080
 	}
 	bind := cfg.UserModeHostBind
+	if strings.TrimSpace(bind) == "" {
+		bind = DefaultUserModeHostBind
+	}
 	return fmt.Sprintf("user,id=net0,hostfwd=tcp:%s:%d-:22,hostfwd=tcp:%s:%d-:8080", bind, sshPort, bind, httpPort)
 }
 
