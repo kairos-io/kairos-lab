@@ -27,11 +27,27 @@ func Uninstall(pm string, packages []string, useSudo bool) error {
 	if len(packages) == 0 {
 		return nil
 	}
-	cmd, err := uninstallCommand(pm, packages, useSudo)
+	commands, err := uninstallCommands(pm, packages, useSudo)
 	if err != nil {
 		return err
 	}
-	return run(cmd[0], cmd[1:]...)
+	for _, c := range commands {
+		if err := run(c[0], c[1:]...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UninstallSideEffect names a dependency cleanup that reaches past the
+// packages being removed, so the cleanup plan can say so before the user
+// confirms it. It is empty for a package manager whose cleanup is scoped to
+// the removal, which is all of them except apt.
+func UninstallSideEffect(pm string) string {
+	if pm == "apt" {
+		return "apt-get autoremove runs afterwards; it removes every package apt has marked as an unused automatic dependency, not only the ones above"
+	}
+	return ""
 }
 
 func installCommands(pm string, pkgs []string, useSudo bool) ([][]string, error) {
@@ -62,26 +78,52 @@ func installCommands(pm string, pkgs []string, useSudo bool) ([][]string, error)
 	}
 }
 
-func uninstallCommand(pm string, pkgs []string, useSudo bool) ([]string, error) {
+// uninstallCommands removes the named packages AND the dependencies that
+// installing them pulled in, which nothing else needs now. Removing only what
+// is named leaves the dependency behind, and on apt that dependency can be the
+// binary itself: `apt-get remove docker.io` keeps docker-cli, containerd, runc
+// and docker-buildx, so `docker` is still on PATH after cleanup, and the next
+// setup finds it and records docker as pre-existing.
+//
+// Every manager but apt can scope the cleanup to the removal, so that is what
+// they are told to do. apt has no scoped form: its autoremover is a separate
+// pass over everything marked automatic. It is run as its own command rather
+// than folded into `apt-get autoremove <pkgs>` because older apt refuses
+// package arguments there, and UninstallSideEffect puts the wider reach into
+// the cleanup plan before the user confirms it.
+//
+// brew is left alone on purpose. The only cask setup installs is
+// docker-desktop and casks carry no dependencies, so the bug above cannot
+// happen; `brew autoremove` is global like apt's, with nothing to gain here.
+func uninstallCommands(pm string, pkgs []string, useSudo bool) ([][]string, error) {
 	pre := []string{}
 	if useSudo {
 		pre = append(pre, "sudo")
 	}
+	one := func(args ...string) [][]string {
+		return [][]string{append(append([]string{}, pre...), append(args, pkgs...)...)}
+	}
 	switch pm {
 	case "brew":
-		return append(pre, append([]string{"brew", "uninstall"}, pkgs...)...), nil
+		return one("brew", "uninstall"), nil
 	case BrewCask:
-		return append(pre, append([]string{"brew", "uninstall", "--cask"}, pkgs...)...), nil
+		return one("brew", "uninstall", "--cask"), nil
 	case "apt":
-		return append(pre, append([]string{"apt-get", "remove", "-y"}, pkgs...)...), nil
+		return [][]string{
+			append(append([]string{}, pre...), append([]string{"apt-get", "remove", "-y"}, pkgs...)...),
+			append(append([]string{}, pre...), "apt-get", "autoremove", "-y"),
+		}, nil
 	case "dnf", "yum":
-		return append(pre, append([]string{pm, "remove", "-y"}, pkgs...)...), nil
+		// Fedora turns clean_requirements_on_remove on by default and RHEL
+		// does not, so it is set here instead of being relied on.
+		return one(pm, "remove", "-y", "--setopt=clean_requirements_on_remove=1"), nil
 	case "zypper":
-		return append(pre, append([]string{"zypper", "--non-interactive", "remove"}, pkgs...)...), nil
+		return one("zypper", "--non-interactive", "remove", "--clean-deps"), nil
 	case "pacman":
-		return append(pre, append([]string{"pacman", "-R", "--noconfirm"}, pkgs...)...), nil
+		return one("pacman", "-Rs", "--noconfirm"), nil
 	case "apk":
-		return append(pre, append([]string{"apk", "del"}, pkgs...)...), nil
+		// apk del already removes dependencies nothing else needs.
+		return one("apk", "del"), nil
 	default:
 		return nil, fmt.Errorf("unsupported package manager: %s", pm)
 	}
