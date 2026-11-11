@@ -406,6 +406,26 @@ var firmwareHostPlatform = func() (string, string) { return runtime.GOOS, runtim
 // two branches came to disagree about which bridge they are talking about.
 var hasStaleNetworkResources = vm.HasStaleNetworkResources
 
+// cleanupStaleNetworkResources and cleanupLinuxBridge are the two teardown
+// calls that hasStaleNetworkResources' branch selects between, behind seams
+// of the same kind and for a blunter reason than the branch problem above:
+// without them a `go test ./internal/app/` on a developer's own machine runs
+// `sudo nmcli connection delete` and `sudo ip link delete` against that
+// machine's real network (kairos-io/kairos#5059).
+//
+// Both take st and act on the names recorded in it, so a host that has used
+// kairos-lab answers the probe with "yes, those profiles exist" and the
+// teardown below then removes them. CI answers "no" and stays green, which
+// is why the suite never showed it.
+//
+// They are vm.CleanupStaleNetworkResources and vm.CleanupLinuxBridge
+// themselves rather than closures around them, for the reason spelled out on
+// isWiFiIface: the tests pin the seam's identity, and a closure would let the
+// wiring drift away from what a real run calls while the pin still passed.
+var cleanupStaleNetworkResources = vm.CleanupStaleNetworkResources
+
+var cleanupLinuxBridge = vm.CleanupLinuxBridge
+
 func runStart(args []string, stdin io.Reader, stdout, stderr io.Writer, store *state.Store) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	isoPath := fs.String("iso", "", "path to ISO file")
@@ -2029,14 +2049,14 @@ func runReset(args []string, stdin io.Reader, stdout io.Writer, store *state.Sto
 		// this reset is still using it, in which case none of them do.
 		for i, v := range vmsToRemove {
 			last := i == len(vmsToRemove)-1
-			if err := vm.CleanupLinuxBridge(st, v, siblingLive || !last); err != nil {
+			if err := cleanupLinuxBridge(st, v, siblingLive || !last); err != nil {
 				writef(stdout, "warning: bridge cleanup failed for vm %q: %v\n", v.Name, err)
 				networkCleanupErr = err
 			}
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale network resources...")
-		if err := vm.CleanupStaleNetworkResources(st); err != nil {
+		if err := cleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
@@ -2205,7 +2225,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 			// by a sequence this binary does not otherwise produce. Fall
 			// back to index 0, which is what a single-VM host always
 			// cleaned up.
-			if err := vm.CleanupLinuxBridge(st, state.VM{}, false); err != nil {
+			if err := cleanupLinuxBridge(st, state.VM{}, false); err != nil {
 				writef(stdout, "warning: bridge cleanup failed: %v\n", err)
 				networkCleanupErr = err
 			}
@@ -2216,7 +2236,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 			// same pattern.
 			for i, v := range st.VMs {
 				last := i == len(st.VMs)-1
-				if err := vm.CleanupLinuxBridge(st, v, !last); err != nil {
+				if err := cleanupLinuxBridge(st, v, !last); err != nil {
 					writef(stdout, "warning: bridge cleanup failed for vm %q: %v\n", v.Name, err)
 					networkCleanupErr = err
 				}
@@ -2224,7 +2244,7 @@ func runCleanup(args []string, stdin io.Reader, stdout io.Writer, store *state.S
 		}
 	} else if hasStaleNetwork {
 		writeLine(stdout, "Cleaning up stale network resources...")
-		if err := vm.CleanupStaleNetworkResources(st); err != nil {
+		if err := cleanupStaleNetworkResources(st); err != nil {
 			writef(stdout, "warning: stale network cleanup failed: %v\n", err)
 			networkCleanupErr = err
 		}
