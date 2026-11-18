@@ -23,7 +23,7 @@ import (
 func TestPrepareLinuxSharedJoinsALiveSiblingsBridgeWithoutTearingItDown(t *testing.T) {
 	h := newFakeHost(t)
 	// VM1 (index 0) already has the bridge and its own tap live on it.
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.conns[DefaultBridgeName] = true
 	h.conns[DefaultBridgeName+"-tap"] = true
 	h.links[DefaultTapName] = true
@@ -69,7 +69,7 @@ func TestPrepareLinuxSharedJoinsALiveSiblingsBridgeWithoutTearingItDown(t *testi
 // no-op.
 func TestPrepareLinuxSharedJoinsALiveSiblingsBridgeReproducesHazardAWhenUnfixed(t *testing.T) {
 	h := newFakeHost(t)
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.conns[DefaultBridgeName] = true
 	h.conns[DefaultBridgeName+"-tap"] = true
 	h.links[DefaultTapName] = true
@@ -96,7 +96,7 @@ func TestPrepareLinuxSharedJoinsALiveSiblingsBridgeReproducesHazardAWhenUnfixed(
 // connection -- at all.
 func TestPrepareLinuxSharedDoesNotRepointASiblingsTapConnection(t *testing.T) {
 	h := newFakeHost(t)
-	h.bridges[DefaultBridgeName] = true
+	h.seedOurBridge(DefaultBridgeName)
 	h.conns[DefaultBridgeName] = true
 	h.conns[DefaultBridgeName+"-tap"] = true
 	h.links[DefaultTapName] = true
