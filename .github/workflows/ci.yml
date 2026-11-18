@@ -23,3 +23,10 @@ jobs:
         run: go test ./...
       - name: Build CLI
         run: go build ./cmd/kairos-lab
+      # test/e2e carries the e2e build tag, so `go test ./...` above never
+      # compiles it and the E2E Linux workflow runs on workflow_dispatch only.
+      # That let the lifecycle test drift out of compiling against the rest of
+      # the tree unnoticed (kairos-io/kairos#5056). This step type-checks it on
+      # every PR.
+      - name: Vet the e2e build tag
+        run: go vet -tags e2e ./...
